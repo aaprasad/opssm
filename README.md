@@ -3,7 +3,7 @@
 # Setup
 ## Clone Repo
 ```bash
-git clone [URL]
+git clone https://github.com/aaprasad/opssm.git
 ```
 ## Install Dependencies
 ```bash
