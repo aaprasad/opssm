@@ -1,0 +1,19 @@
+name: opSSM
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  conda:
+    - python=3.11
+    - lightning
+    - pytorch-lightning
+    - pip
+    - pip:
+      - torch
+      - torchvision
+      - torchaudio
+      - neuraloperator
