@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opssm"
+version = "0.1.0"
+description = "Neural mesh-free Zakai filter (Neural Operators for Continuous State-Space Modeling)"
+requires-python = ">=3.10"
+dependencies = ["torch", "torchsde", "lightning", "hydra-core", "matplotlib", "numpy"]
+
+[tool.setuptools.packages.find]
+include = ["opssm*"]

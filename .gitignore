@@ -1,3 +1,14 @@
-run/ckpt
-run/logs
 .DS_Store
+__pycache__/
+*.pyc
+*.pth
+*.pt
+*.egg-info/
+dump/
+outputs/
+multirun/
+# external vendored deps + superseded exploratory layout (latent-SDE work lives on archive/latent-sde;
+# the original neural_zakai_* scripts are preserved in commit debe06b as a regression baseline)
+src/
+paper/
+run/

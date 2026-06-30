@@ -1,0 +1,7 @@
+# @package _global_
+# Stage 4: high-D EM -- learn f, g, and the Stiefel observation map C,d from a 10-D linear sensor.
+defaults:
+  - override /data: doublewell_highd
+model:
+  learn_obs: true
+  data_size: 10

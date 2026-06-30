@@ -1,0 +1,4 @@
+# @package _global_
+# Stage 3: 1-D EM -- learn drift f and diffusion g from direct noisy obs.
+defaults:
+  - override /data: doublewell

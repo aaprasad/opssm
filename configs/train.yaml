@@ -1,0 +1,18 @@
+defaults:
+  - data: doublewell
+  - model: operator
+  - experiment: em_1d
+  - _self_
+
+trainer:
+  max_steps: 14000
+  val_check_interval: 2000
+  check_val_every_n_epoch: null
+  accelerator: auto
+  devices: 1
+  logger: false
+  enable_checkpointing: false
+  num_sanity_val_steps: 0
+
+seed: 0
+train_dir: ./dump/nzf

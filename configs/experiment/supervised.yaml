@@ -1,0 +1,5 @@
+# @package _global_
+# Stage 1 sanity: fit the operator to the exact grid filter (known dynamics, no M-step).
+model:
+  loss: supervised
+  learn_dynamics: false
