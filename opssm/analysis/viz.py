@@ -129,53 +129,91 @@ def vis_learn(model, drift_net, xs_val, mask_val, filt_val, z_grid, ts, a, img_p
 
 @torch.no_grad()
 def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val, z_grid, ts,
-              a, sigma, C_cur, d_cur, C_true, d_true, learn_obs, img_path, n_traj=2, s_scale=1.0):
-    zg = z_grid.cpu().numpy(); ts_np = ts.cpu().numpy()
+              a, sigma, C_cur, d_cur, C_true, d_true, learn_obs, img_path, n_traj=2, s_scale=1.0,
+              g_scalar=None):
+    """High-D Duncker panels with UNCERTAINTY BANDS everywhere and the drift/diffusion shown over the
+    DATA REGIME only (the range the inferred latent actually visits). The drift/diffusion bands are the
+    empirical +/-2 SE per z-bin -- wide where the latent rarely goes (cf. Duncker's GP uncertainty);
+    the latent/recon panels carry the posterior +/-2 std; a data-density panel shows where the estimates
+    are actually constrained."""
+    import numpy as np
+    zg = z_grid.cpu().numpy(); ts_np = ts.cpu().numpy(); dt = float(ts[1] - ts[0])
     log_pi = model.log_posterior(y_val, mask_val, z_grid)
     pi = log_pi.exp()
-    m_op = (pi * z_grid).sum(-1)                                 # (T,B)
+    m_op = (pi * z_grid).sum(-1)                                          # (T,B)
     s_op = (pi * z_grid ** 2).sum(-1).sub(m_op ** 2).clamp_min(0).sqrt()
     ex_m = (filt_val * z_grid).sum(-1)
-    recon = s_scale * C_cur * m_op[..., None] + d_cur            # (T,B,D)
+    ex_s = (filt_val * z_grid ** 2).sum(-1).sub(ex_m ** 2).clamp_min(0).sqrt()
+    recon = s_scale * C_cur * m_op[..., None] + d_cur                     # (T,B,D)
     nd = min(2, y_val.shape[-1])
 
+    # ---- empirical drift / diffusion with data-density (+/-2 SE) uncertainty ----
+    zc = m_op[:-1].reshape(-1)
+    dz = ((m_op[1:] - m_op[:-1]) / dt).reshape(-1)
+    ft = 0.5 * (drift_net.net(m_op[:-1].reshape(-1, 1)) + drift_net.net(m_op[1:].reshape(-1, 1))).squeeze(-1)
+    r2dt = (dz - ft) ** 2 * dt                                            # per-sample g^2 target
+    zc = zc.cpu().numpy(); dz = dz.cpu().numpy(); r2dt = r2dt.cpu().numpy()
+    lo, hi = -1.5, 1.5                                                    # fixed data-regime window (Duncker axes)
+    nb = 22; bins = np.linspace(lo, hi, nb + 1); ctr = 0.5 * (bins[:-1] + bins[1:])
+    idx = np.clip(np.digitize(zc, bins) - 1, 0, nb - 1)
+    f_emp = np.full(nb, np.nan); f_se = np.full(nb, np.nan)
+    g2_emp = np.full(nb, np.nan); g2_se = np.full(nb, np.nan); dens = np.zeros(nb)
+    for b in range(nb):
+        msk = idx == b; n = int(msk.sum()); dens[b] = n
+        if n >= 5:
+            f_emp[b] = dz[msk].mean(); f_se[b] = dz[msk].std() / np.sqrt(n)
+            g2_emp[b] = r2dt[msk].mean(); g2_se[b] = g2_emp[b] * np.sqrt(2.0 / n)
+    inr = (zg >= lo) & (zg <= hi)
+
     fig, axes = plt.subplots(2, 4, figsize=(20, 8))
-    for j in range(n_traj):                                     # A: obs + reconstruction
+    for j in range(n_traj):                                              # A: obs + recon + predictive band
         ax = axes[0, j]
         for dim in range(nd):
-            ax.plot(ts_np, y_val[:, j, dim].cpu().numpy(), ".", ms=3, alpha=0.35, color=f"C{dim}")
-            ax.plot(ts_np, recon[:, j, dim].cpu().numpy(), "-", lw=2, color=f"C{dim}",
-                    label=f"$y_{dim}$" if j == 0 else None)
+            rc = recon[:, j, dim].cpu().numpy()
+            rc_sd = (s_scale * abs(float(C_cur[dim])) * s_op[:, j]).cpu().numpy()   # latent unc. -> obs space
+            ax.plot(ts_np, y_val[:, j, dim].cpu().numpy(), ".", ms=3, alpha=0.3, color=f"C{dim}")
+            ax.plot(ts_np, rc, "-", lw=2, color=f"C{dim}", label=f"$y_{dim}$" if j == 0 else None)
+            ax.fill_between(ts_np, rc - 2 * rc_sd, rc + 2 * rc_sd, color=f"C{dim}", alpha=0.15)
         ax.set_title(f"obs + recon, traj {j}"); ax.set_xlabel("$t$")
         if j == 0:
             ax.legend(fontsize=8)
-    for j in range(n_traj):                                     # B: latent posterior vs true
+    for j in range(n_traj):                                              # B: latent + operator & exact bands
         ax = axes[1, j]
         ax.plot(ts_np, z_val_true[:, j].cpu().numpy(), "k-", lw=2, label="true $z$")
-        ax.plot(ts_np, ex_m[:, j].cpu().numpy(), "C7-", lw=1.2, label="exact mean")
-        ax.plot(ts_np, m_op[:, j].cpu().numpy(), "r--", lw=2, label="operator mean")
-        ax.fill_between(ts_np, (m_op[:, j] - 2 * s_op[:, j]).cpu().numpy(),
-                        (m_op[:, j] + 2 * s_op[:, j]).cpu().numpy(), color="r", alpha=0.2)
-        ax.set_title(f"latent $z$, traj {j}"); ax.set_xlabel("$t$")
+        exm = ex_m[:, j].cpu().numpy(); exs = ex_s[:, j].cpu().numpy()
+        ax.plot(ts_np, exm, "C7-", lw=1.2, label="exact mean")
+        ax.fill_between(ts_np, exm - 2 * exs, exm + 2 * exs, color="C7", alpha=0.18)
+        mo = m_op[:, j].cpu().numpy(); so = s_op[:, j].cpu().numpy()
+        ax.plot(ts_np, mo, "r--", lw=2, label="operator mean")
+        ax.fill_between(ts_np, mo - 2 * so, mo + 2 * so, color="r", alpha=0.2)
+        ax.set_ylim(-1.7, 1.7); ax.set_title(f"latent $z$, traj {j}"); ax.set_xlabel("$t$")
         if j == 0:
             ax.legend(fontsize=8)
-    ax = axes[0, 2]                                            # C: drift
-    ax.plot(zg, (a * (z_grid - z_grid ** 3)).cpu().numpy(), "k-", lw=2, label="true $a(z-z^3)$")
-    ax.plot(zg, drift_net.drift(z_grid)[0].cpu().numpy(), "C2--", lw=2, label=r"learned $f_\theta$")
-    ax.set_ylim(-4, 4); ax.set_xlim(-2.5, 2.5); ax.set_xlabel("$z$"); ax.set_ylabel("$f(z)$")
-    ax.set_title("learned drift"); ax.legend(fontsize=8)
-    ax = axes[1, 2]                                            # diffusion
+    ax = axes[0, 2]                                                      # C: drift over data regime + band
+    ax.plot(zg[inr], (a * (z_grid - z_grid ** 3)).cpu().numpy()[inr], "k-", lw=2, label="true $a(z-z^3)$")
+    ax.plot(zg[inr], drift_net.drift(z_grid)[0].cpu().numpy()[inr], "C2--", lw=2, label=r"learned $f_\theta$")
+    ax.fill_between(ctr, f_emp - 2 * f_se, f_emp + 2 * f_se, color="C1", alpha=0.25, label=r"empirical $\pm2$SE")
+    ax.plot(ctr, f_emp, "C1.", ms=4)
+    ax.set_xlim(lo, hi); ax.set_ylim(-1.5, 1.5); ax.set_xlabel("$z$"); ax.set_ylabel("$f(z)$")
+    ax.set_title("learned drift (data regime)"); ax.legend(fontsize=8)
+    ax = axes[1, 2]                                                      # diffusion in g (not g^2): natural scale
+    g_emp = np.sqrt(np.clip(g2_emp, 0.0, None))                         # g = sqrt(g^2)
+    g_emp_se = g2_se / (2.0 * np.clip(g_emp, 1e-3, None))               # delta method: SE(g)=SE(g^2)/(2g)
     if diff_net is not None:
-        ax.plot(zg, diff_net._g2(z_grid.unsqueeze(-1)).squeeze(-1).cpu().numpy(),
-                "C0-", lw=2, label=r"learned $g^2(z)$")
-    ax.axhline(sigma ** 2, ls="--", c="k", lw=2, label=fr"true $\sigma^2={sigma ** 2:.3f}$")
-    ax.set_ylim(0, max(0.6, sigma ** 2 * 2)); ax.set_xlabel("$z$"); ax.set_ylabel("$g^2(z)$")
-    ax.set_title("learned diffusion"); ax.legend(fontsize=8)
-    ax = axes[0, 3]                                            # D: obs map (unit C direction)
+        gc = np.sqrt(np.clip(diff_net._g2(z_grid.unsqueeze(-1)).squeeze(-1).cpu().numpy(), 0.0, None))
+        ax.plot(zg[inr], gc[inr], "C0-", lw=2, label=r"learned $g(z)$")
+    elif g_scalar is not None:
+        ax.axhline(g_scalar, color="C0", lw=2, label=fr"learned $g={g_scalar:.3f}$")
+    ax.fill_between(ctr, g_emp - 2 * g_emp_se, g_emp + 2 * g_emp_se, color="C1", alpha=0.25, label=r"empirical $\pm2$SE")
+    ax.plot(ctr, g_emp, "C1.", ms=4)
+    ax.axhline(sigma, ls="--", c="k", lw=2, label=fr"true $\sigma={sigma:.3f}$")
+    ax.set_xlim(lo, hi); ax.set_ylim(0, 1.0); ax.set_xlabel("$z$"); ax.set_ylabel("$g(z)$")
+    ax.set_title("learned diffusion (data regime)"); ax.legend(fontsize=8)
+    ax = axes[0, 3]                                                      # D: obs map (unit C direction)
     if learn_obs:
         C_true_u = C_true / C_true.norm()
         cos = float(C_cur @ C_true_u)
-        flip = 1.0 if cos >= 0 else -1.0                       # align the sign gauge
+        flip = 1.0 if cos >= 0 else -1.0                                 # align the sign gauge
         ax.plot(C_true_u.cpu().numpy(), (flip * C_cur).cpu().numpy(), "C0o", label="$C$ dir")
         lim = float(C_true_u.abs().max()) * 1.2
         ax.plot([-lim, lim], [-lim, lim], "k:", lw=1)
@@ -184,5 +222,8 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
     else:
         ax.text(0.5, 0.5, "C, d fixed (known)", ha="center", va="center", transform=ax.transAxes)
         ax.set_title("observation map $C, d$")
-    axes[1, 3].axis("off")
+    ax = axes[1, 3]                                                      # data density -> where estimates are constrained
+    ax.bar(ctr, dens, width=(hi - lo) / nb, color="gray", alpha=0.5)
+    ax.set_xlim(lo, hi); ax.set_xlabel("$z$"); ax.set_ylabel("count")
+    ax.set_title("latent occupancy (data density)")
     plt.tight_layout(); plt.savefig(img_path); plt.close()

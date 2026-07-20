@@ -50,7 +50,8 @@ class ZakaiFilterModule(pl.LightningModule):
                  n_scoll=4, n_tcoll=24, n_colloc=128, chunk_size=16, near_std=0.3, broad_std=1.6,
                  warmup=2000, m_every=2000, m_inner=400, reg_lambda=3e-4, reg_lambda_g=3e-3,
                  g_init=1.0, learn_dynamics=True, learn_g=True, g_net=False, learn_obs=False,
-                 pca_init=True, c_stable_tol=0.05, loss="zakai", train_dir="./dump/nzf"):
+                 pca_init=True, c_stable_tol=0.05, meshfree_mean=True, n_mean=256,
+                 loss="zakai", train_dir="./dump/nzf"):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
@@ -151,11 +152,15 @@ class ZakaiFilterModule(pl.LightningModule):
                     learn_g=h.learn_g, g_net=h.g_net, reg_lambda=h.reg_lambda,
                     reg_lambda_g=h.reg_lambda_g, m_inner=h.m_inner,
                     learn_obs=h.learn_obs, c_stable_tol=h.c_stable_tol,
-                    C_cur=self.C_cur, d_cur=self.d_cur, s_scale=self.s_scale)
+                    C_cur=self.C_cur, d_cur=self.d_cur, s_scale=self.s_scale,
+                    meshfree_mean=h.meshfree_mean, n_mean=h.n_mean,
+                    near_std=h.near_std, broad_std=h.broad_std)
         if out["g_cur"] is not None:
             self.g_cur = out["g_cur"]
         if h.learn_obs:
             self.C_cur, self.d_cur = out["C_cur"], out["d_cur"]
+        if out.get("ess") is not None:
+            self.log("ess", out["ess"], prog_bar=True)                  # SNIS health diagnostic
 
     # -- validation: KL vs the exact filter, drift L2, C cos, + a figure -------------------------
     @torch.no_grad()
@@ -163,10 +168,19 @@ class ZakaiFilterModule(pl.LightningModule):
         h = self.hparams
         dm = self.trainer.datamodule
         x, mask, filt = batch
-        kl = kl_target_pred(filt, self.model.log_posterior(x, mask, self.z_grid)).item()
-        f_err = (self.drift_net.drift(self.z_grid)[0][self.supp]
-                 - self.f_true_grid[self.supp]).pow(2).mean().sqrt().item()
-        logs = {"kl": kl, "drift_l2": f_err, "g": float(self.g_cur)}
+        log_pi = self.model.log_posterior(x, mask, self.z_grid)
+        kl = kl_target_pred(filt, log_pi).item()
+        # drift error over the DATA REGIME only -- the range the inferred latent actually visits.
+        # Evaluating on a fixed [-2,2] is dominated by the tails (|z|>1.5) where there is no data and
+        # the regression must extrapolate; that penalizes coverage, not fit.
+        m_op = (log_pi.exp() * self.z_grid).sum(-1)                   # (T,B) inferred latent
+        lo, hi = m_op.quantile(0.01), m_op.quantile(0.99)
+        supp = (self.z_grid >= lo) & (self.z_grid <= hi)
+        f_err = (self.drift_net.drift(self.z_grid)[0][supp]
+                 - self.f_true_grid[supp]).pow(2).mean().sqrt().item()
+        f_err_full = (self.drift_net.drift(self.z_grid)[0][self.supp]
+                      - self.f_true_grid[self.supp]).pow(2).mean().sqrt().item()
+        logs = {"kl": kl, "drift_l2": f_err, "drift_l2_ext": f_err_full, "g": float(self.g_cur)}
         if h.learn_obs and dm.C_true is not None:
             logs["c_cos"] = abs(float(self.C_cur @ (dm.C_true / dm.C_true.norm())))
         self.log_dict(logs, prog_bar=True)
@@ -175,7 +189,7 @@ class ZakaiFilterModule(pl.LightningModule):
         if h.learn_obs:
             viz.vis_highd(self.model, self.drift_net, self.diff_net, x, mask, dm.z_val_true, filt,
                           self.z_grid, dm.ts, self.a, self.sigma, self.C_cur, self.d_cur,
-                          dm.C_true, dm.d_true, True, img, s_scale=self.s_scale)
+                          dm.C_true, dm.d_true, True, img, s_scale=self.s_scale, g_scalar=self.g_cur)
         else:
             viz.vis_learn(self.model, self.drift_net, x, mask, filt, self.z_grid, dm.ts, self.a,
                           img, diff_net=self.diff_net, sigma=self.sigma)

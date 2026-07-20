@@ -21,14 +21,53 @@ the drift gate is written once. The fits are the strong "complete-data" channel:
     C      = unit direction of cross-cov(y, z_hat)   (orthogonal Procrustes; scale s fixed)
 """
 
+import math
+
 import torch
+
+from opssm.models.obs import zhat_from_obs
 
 
 @torch.no_grad()
 def posterior_mean(model, x, mask, z_grid):
-    """E[z_t | obs_{0:t}] from the operator's grid log-posterior -> (T, B)."""
+    """E[z_t | obs_{0:t}] from the operator's grid log-posterior -> (T, B). Grid quadrature
+    (O(Nz) per step); see posterior_mean_fixed for the mesh-free replacement."""
     log_pi = model.log_posterior(x, mask, z_grid)
     return (log_pi.exp() * z_grid).sum(-1)
+
+
+@torch.no_grad()
+def posterior_mean_fixed(model, x, mask, center, n_samples, near_std, broad_std):
+    """DETERMINISTIC mesh-free MEAN via FIXED-NODE importance sampling: the proposal nodes are drawn
+    ONCE (fixed seed) and reused every M-step, shared across t. So z_hat = sum_k w_k z_k is a smooth
+    deterministic function of the operator -- the grid's deterministic mean, but with data-following
+    nodes instead of a uniform grid. No fresh per-M-step randomness => no readout noise => the diffusion
+    estimator g^2 = Var[dz]/dt stays stable (the SNIS blowup was the fresh per-step sampling noise;
+    fixing the nodes removes it while keeping the MEAN, unlike the mode). Returns (z_hat (T,B), ess_frac)."""
+    T, B = center.shape
+    dev = center.device
+    gen = torch.Generator(device=dev).manual_seed(0)                 # FIXED nodes -> deterministic readout
+    obs = mask[..., 0]
+    c = center * obs
+    near_sd = (near_std * obs + broad_std * (1.0 - obs)).unsqueeze(-1)
+    Kn = n_samples // 2
+    Kb = n_samples - Kn
+    eps_n = torch.randn(1, B, Kn, device=dev, generator=gen)         # shared across t (CRN) + fixed seed
+    eps_b = torch.randn(1, B, Kb, device=dev, generator=gen)
+    near = c.unsqueeze(-1) + near_sd * eps_n
+    broad = (broad_std * eps_b).expand(T, B, Kb)
+    z = torch.cat([near, broad], dim=-1)                            # (T,B,K)
+    c2 = math.log(2.0) + 0.5 * math.log(2 * math.pi)
+    lqn = -0.5 * ((z - c.unsqueeze(-1)) / near_sd) ** 2 - near_sd.log() - c2
+    lqb = -0.5 * (z / broad_std) ** 2 - math.log(broad_std) - c2
+    log_q = torch.logaddexp(lqn, lqb)
+    ctx = model.context(x, mask)
+    b0 = model.coeffs(ctx, torch.zeros(1, device=dev))[:, :, 0]      # (T,B,p) at s=0
+    tau = model.trunk(z.unsqueeze(-1))                              # (T,B,K,p)
+    ell = torch.einsum("tbp,tbkp->tbk", b0, tau) + model.bias       # (T,B,K)
+    w = torch.softmax(ell - log_q, dim=-1)                          # SNIS weights
+    ess = 1.0 / (w.pow(2).sum(-1) * z.shape[-1])                    # (T,B) fraction
+    return (w * z).sum(-1), float(ess.mean())                       # (T,B), scalar
 
 
 def fit_drift(drift_net, dr_opt, zc, dz, z_reg, hr, reg_lambda, m_inner):
@@ -87,12 +126,18 @@ def fit_obs_map_stiefel(z_hat, y, s_scale, C_cur):
 
 def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg, hr, *,
           learn_g, g_net, reg_lambda, reg_lambda_g, m_inner,
-          learn_obs=False, c_stable_tol=0.05, C_cur=None, d_cur=None, s_scale=1.0):
+          learn_obs=False, c_stable_tol=0.05, C_cur=None, d_cur=None, s_scale=1.0,
+          meshfree_mean=False, n_mean=256, near_std=0.3, broad_std=1.6):
     """One EM M-step. Order: posterior-mean increments -> (high-D) Stiefel obs-map + cstab ->
     drift GATED on `cstab < c_stable_tol` -> diffusion. In 1-D (learn_obs=False) cstab==0, so the
-    gate is always open and this reduces to the plain f,g M-step. Returns updated
-    {g_cur, C_cur, d_cur, cstab}."""
-    z_hat = posterior_mean(model, x, mask, z_grid)                     # (T, B)
+    gate is always open and this reduces to the plain f,g M-step. `meshfree_mean` replaces the grid
+    E[z|y] with the SNIS estimate (no z_grid). Returns updated {g_cur, C_cur, d_cur, cstab}."""
+    ess = None
+    if meshfree_mean:                                                 # grid-free E[z|y] via deterministic fixed-node mean
+        center = (zhat_from_obs(x, C_cur, d_cur) / s_scale) if learn_obs else x[..., 0]
+        z_hat, ess = posterior_mean_fixed(model, x, mask, center, n_mean, near_std, broad_std)
+    else:
+        z_hat = posterior_mean(model, x, mask, z_grid)                # (T, B)
     m = mask[..., 0]
     valid = (m[:-1] * m[1:]).bool()                                   # data-anchored increments
     zc = z_hat[:-1][valid]
@@ -108,4 +153,4 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
     if learn_g:
         g_cur = fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,
                               g_net, reg_lambda_g, m_inner)
-    return dict(g_cur=g_cur, C_cur=C_cur, d_cur=d_cur, cstab=cstab)
+    return dict(g_cur=g_cur, C_cur=C_cur, d_cur=d_cur, cstab=cstab, ess=ess)

@@ -25,5 +25,8 @@ g_net: false
 learn_obs: false
 pca_init: true
 c_stable_tol: 0.05
+meshfree_mean: true       # M-step E[z|y]: true = deterministic mesh-free fixed-node IS (default; scales to
+                          #   high-D latent, drift/sensor good, g mildly over-estimated); false = grid quadrature
+n_mean: 256               # fixed-node sample count when meshfree_mean=true
 loss: zakai
 train_dir: ${train_dir}

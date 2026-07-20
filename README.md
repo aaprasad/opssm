@@ -45,13 +45,44 @@ path — 1-D is the degenerate `cstab≡0` case of the high-D *sensor-before-dyn
 Each dynamical system is a submodule under `data/` providing the trio `sde.py` (generative model),
 `oracle.py` (ground-truth filter), `datamodule.py`. `lorenz/` and `vanderpol/` slot in next.
 
-## Known limitation (open)
-The self-supervised Zakai recursion is **over-dispersed**: the operator's posterior *mean* tracks the exact
-filter, but its *width* is ~3× too wide (KL plateaus ~0.5 on the dense 1-D case). We traced this to the
-stiffness of representing a sharp post-update's fast Fokker–Planck evolution with the time-in-branch DeepONet;
-the bootstrap *target* is correct (its width matches the exact filter), so it's a representational/optimization
-limit, not a wrong objective. The dynamics/sensor recovery is unaffected (it uses the mean). See
-`analysis/diagnostics.py` (`recursion_width_diag`).
+## Mesh-free M-step readout (what we did)
+The M-step needs `E[z_t | y]` to fit `f, g, C, d`. The **default is a deterministic mesh-free readout**
+(`meshfree_mean=true`, `posterior_mean_fixed` in `models/mstep.py`): fixed-node importance sampling — the
+proposal nodes are drawn *once* and reused every M-step — so `ẑ` is a smooth *deterministic* function of the
+operator, at `O(K)` cost independent of the latent dimension. The `O(N^d)` grid quadrature (`meshfree_mean=false`)
+stays available and is exact for a low-D latent. Findings (full account in the design notes):
+- A **stochastic** readout (fresh importance samples each M-step) **diverges**: `g² = Var[Δẑ]/dt` is a
+  *variance* amplified by `1/dt`, so readout noise feeds a runaway feedback with the over-dispersion. The grid
+  (deterministic) is stable → **determinism is necessary**, and fixing the nodes supplies it while keeping the
+  dimension-agnostic `O(K)` cost.
+- With the fixed-node readout, **drift and sensor recover well** (data-regime drift L2 ≈ 0.2, `c_cos → 1`);
+  **`g` is over-estimated** (≈ 0.79 vs true 0.6 in high-D — *the grid has this too*, so it's the estimator, not
+  the readout).
+- Ruled out: gradient **mode**-finding (under-converges; mode ≠ mean) and **Gauss–Hermite** quadrature
+  (`O(n^d)`, doesn't scale).
+
+## Known limitations (open)
+1. **Posterior over-dispersion** — the operator posterior is ~3× too wide (mean right, width wrong; KL plateaus
+   ~0.5 on the dense 1-D case). Traced to the stiffness of representing a sharp post-update's fast Fokker–Planck
+   evolution with the time-in-branch DeepONet; the bootstrap *target*'s width matches the exact filter, so it's
+   a representational/optimization limit, not a wrong objective. Dynamics/sensor recovery is unaffected (it uses
+   the mean). See `analysis/diagnostics.py` (`recursion_width_diag`).
+2. **Diffusion over-estimation** — `g ≈ 0.79` vs `σ = 0.6` in high-D. `g² = Var[Δẑ]/dt` is a *variance*
+   estimator, so it absorbs the over-dispersion / mean-path roughness as if it were diffusion. The principled
+   fix is a **square-then-average** estimator over *joint* posterior path samples, which needs the
+   cross-covariance of consecutive states — a smoother or path-MCMC — not the per-time marginals the operator
+   provides (independent-marginal sampling over-estimates ~100× since consecutive states are near-perfectly
+   correlated). Tied to (1).
+
+## Next directions
+- **Diffusion `g`:** build a joint / path sampler (path-MCMC, or a smoother for the cross-covariance) to enable
+  the correct `square-then-average` `g` estimator. MCMC-over-the-path is the natural vehicle and is unusually
+  parallel here (the operator's marginals are time-independent; DEER can parallelize the within-chain steps).
+- **Over-dispersion** — the shared root of both open issues: richer within-interval time features (`√s` /
+  Fourier), or decoupling the filtering head from the FP initial condition.
+- **High-D latent** (`lorenz/`, `vanderpol/`) — where the mesh-free readout actually earns its keep (the grid
+  dies at `O(N^d)`) and where the joint-sample `g` fix becomes necessary rather than optional. Slots in via the
+  `data/` submodule trio.
 ```bash
 # legacy setup (conda)
 conda env create -n opssm -f environment.yml && conda activate opssm
