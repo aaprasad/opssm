@@ -51,7 +51,7 @@ class ZakaiFilterModule(pl.LightningModule):
                  warmup=2000, m_every=2000, m_inner=400, reg_lambda=3e-4, reg_lambda_g=3e-3,
                  g_init=1.0, learn_dynamics=True, learn_g=True, g_net=False, learn_obs=False,
                  pca_init=True, c_stable_tol=0.05, meshfree_mean=True, n_mean=256,
-                 loss="zakai", train_dir="./dump/nzf"):
+                 res_mode="rel", loss="zakai", train_dir="./dump/nzf"):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
@@ -135,7 +135,7 @@ class ZakaiFilterModule(pl.LightningModule):
         res, jump, ic, _ = accumulate_pinn_grads(                 # does its own chunked backward
             self.model, x, mask, self.s_coll, drift, diffusion, _log_prior, self.noise_std,
             self.dt, h.n_colloc, h.near_std, h.broad_std, h.n_tcoll, h.chunk_size,
-            decode=decode, center=center)
+            res_mode=h.res_mode, decode=decode, center=center)
         opt.step()
         self.lr_schedulers().step()
         self.log_dict({"res": res, "jump": jump, "ic": ic}, prog_bar=True)

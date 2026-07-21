@@ -56,7 +56,7 @@ def sample_collocation(xs, mask, n_colloc, near_std, broad_std, center=None):
 
 
 def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_prior,
-                    noise_std, dt, n_tcoll=None, res_post=0.0, decode=None):
+                    noise_std, dt, n_tcoll=None, res_post=0.0, res_mode="l2", decode=None):
     """MESH-FREE continuous-time Zakai PINN -- no grid, no time-stepping, no Euler.
     Collocation points z_col (T,B,K) are SAMPLED from the proposal (log_q its log-density);
     the normalizer Z and evidence c are self-normalized importance-sampling (SNIS) estimates
@@ -117,6 +117,16 @@ def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_pri
     else:                                                            # constant scalar g
         rhs = -(df + f * dz_ell) + 0.5 * sigma ** 2 * (dz_ell ** 2 + d2z_ell)
     res2 = (ds_ell / dt - rhs) ** 2                                   # (Ts,B,Ns,K)
+    # SCALE-INVARIANT residual (over-dispersion fix): in LOG space the FP terms scale as ~1/sigma^2,
+    # so for a SHARP density the L2 residual EXPLODES at collocation samples far from the mode
+    # (d_z ell ~ z/sigma^2). Minimizing that absolute magnitude biases the operator WIDE. Measuring
+    # the residual RELATIVE to the local FP magnitude (or log-compressing it) removes the tail blow-up
+    # while keeping a broad proposal for coverage. "l2" = original absolute residual.
+    if res_mode == "rel":                                             # relative to local FP scale
+        scale = rhs.detach() ** 2 + (ds_ell / dt).detach() ** 2 + 1.0
+        res2 = res2 / scale
+    elif res_mode == "log1p":                                         # log-compress large residuals
+        res2 = torch.log1p(res2)
     if res_post > 0:
         # weight the FP residual by the posterior mass: enforce the physics WHERE THE DENSITY
         # IS (the modes) rather than uniformly over the broad proposal -- targets the gap
@@ -131,7 +141,8 @@ def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_pri
 
 def accumulate_pinn_grads(model, xs, mask, s_coll, drift, sigma, log_prior, noise_std, dt,
                           n_colloc, near_std, broad_std, n_tcoll, chunk_size,
-                          w_nll=0.0, num_steps=1, res_post=0.0, decode=None, center=None):
+                          w_nll=0.0, num_steps=1, res_post=0.0, res_mode="l2",
+                          decode=None, center=None):
     """MEMORY-CAPPED forward+backward of the mesh-free Zakai PINN loss. The recursion is
     per-trajectory and the residual is per-point, both INDEPENDENT across the batch, so we
     split the batch into chunks of `chunk_size`, run pinn_zakai_loss + backward per chunk
@@ -151,7 +162,7 @@ def accumulate_pinn_grads(model, xs, mask, s_coll, drift, sigma, log_prior, nois
                                           center=ctr)
         res, jump, ic, nll = pinn_zakai_loss(
             model, xs[:, sl], mask[:, sl], z_col, log_q, s_coll, drift, sigma, log_prior,
-            noise_std, dt, n_tcoll=n_tcoll, res_post=res_post, decode=decode)
+            noise_std, dt, n_tcoll=n_tcoll, res_post=res_post, res_mode=res_mode, decode=decode)
         (bw * (res + jump + ic + w_nll * nll / num_steps)).backward()
         for i, v in enumerate((res, jump, ic, nll)):
             agg[i] += bw * v.item()

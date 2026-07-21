@@ -61,25 +61,39 @@ stays available and is exact for a low-D latent. Findings (full account in the d
 - Ruled out: gradient **mode**-finding (under-converges; mode ≠ mean) and **Gauss–Hermite** quadrature
   (`O(n^d)`, doesn't scale).
 
+## Over-dispersion fix — scale-invariant FP residual (what we did)
+The operator posterior was ~3–5× too wide (mean right, width wrong). We traced this to a **conditioning
+pathology of the L2 Fokker–Planck residual**, not the DeepONet or the objective's minimum: in log space the FP
+terms scale as `1/σ²`, so for a *sharp* density the absolute residual `(∂ℓ/∂t − rhs)²` explodes at collocation
+samples far from the mode (gradient norm ~7800 vs ~200 normalized), and minimizing that magnitude drives the
+operator **wide**. Diagnosed by continuing a *perfect* narrow start (supervised, std 0.089) on the Zakai loss with
+*true* dynamics: it blows up to std 0.7 — the objective actively pushes away from the exact filter — and an
+ablation shows the FP residual **spreads** while the likelihood update **sharpens**, with the residual winning.
+**Fix:** `res_mode="rel"` (default) measures the residual *relative to the local FP magnitude*
+(`res2 / (rhs² + (∂ℓ/∂t)² + 1)`), removing the tail blow-up while keeping the broad proposal for coverage. In the
+full 1-D EM (8k steps) this **halves the over-dispersion KL (0.67 → 0.35)**, brings **`g` closer to true
+(0.633 → 0.608, σ=0.6)**, and **preserves drift recovery** (data-regime L2 0.069 → 0.064). Full account and the
+ruled-out alternatives (`res_post`, proposal tightening, Fourier time features) in `notes/overdispersion.md`.
+
 ## Known limitations (open)
-1. **Posterior over-dispersion** — the operator posterior is ~3× too wide (mean right, width wrong; KL plateaus
-   ~0.5 on the dense 1-D case). Traced to the stiffness of representing a sharp post-update's fast Fokker–Planck
-   evolution with the time-in-branch DeepONet; the bootstrap *target*'s width matches the exact filter, so it's
-   a representational/optimization limit, not a wrong objective. Dynamics/sensor recovery is unaffected (it uses
-   the mean). See `analysis/diagnostics.py` (`recursion_width_diag`).
-2. **Diffusion over-estimation** — `g ≈ 0.79` vs `σ = 0.6` in high-D. `g² = Var[Δẑ]/dt` is a *variance*
-   estimator, so it absorbs the over-dispersion / mean-path roughness as if it were diffusion. The principled
-   fix is a **square-then-average** estimator over *joint* posterior path samples, which needs the
-   cross-covariance of consecutive states — a smoother or path-MCMC — not the per-time marginals the operator
-   provides (independent-marginal sampling over-estimates ~100× since consecutive states are near-perfectly
-   correlated). Tied to (1).
+1. **Residual over-dispersion (partly open)** — `res_mode="rel"` cuts the operator over-width from ~3–5× to ~2×
+   (KL 0.67 → 0.35); the remaining ~2× is a genuine *equilibrium* of the rel-residual↔likelihood balance (a
+   narrow start relaxes back up to it), not a resolution artefact. Closing it likely needs a residual↔jump
+   **weight** balance (down-weighting the residual sharpens the equilibrium; too far collapses it). See
+   `notes/overdispersion.md`.
+2. **Diffusion over-estimation** — improved with the rel fix (`g ≈ 0.61` vs `σ = 0.6` in 1-D) but still biased in
+   high-D. `g² = Var[Δẑ]/dt` is a *variance* estimator, so it absorbs residual over-dispersion / mean-path
+   roughness as if it were diffusion. The principled fix is a **square-then-average** estimator over *joint*
+   posterior path samples, which needs the cross-covariance of consecutive states — a smoother or path-MCMC —
+   not the per-time marginals the operator provides (independent-marginal sampling over-estimates ~100× since
+   consecutive states are near-perfectly correlated). Tied to (1).
 
 ## Next directions
 - **Diffusion `g`:** build a joint / path sampler (path-MCMC, or a smoother for the cross-covariance) to enable
   the correct `square-then-average` `g` estimator. MCMC-over-the-path is the natural vehicle and is unusually
   parallel here (the operator's marginals are time-independent; DEER can parallelize the within-chain steps).
-- **Over-dispersion** — the shared root of both open issues: richer within-interval time features (`√s` /
-  Fourier), or decoupling the filtering head from the FP initial condition.
+- **Close the residual over-dispersion equilibrium** — tune the residual↔jump loss weight (rel makes this stable
+  where the raw L2 residual made it a runaway); a narrow start currently relaxes to ~2× the exact width.
 - **High-D latent** (`lorenz/`, `vanderpol/`) — where the mesh-free readout actually earns its keep (the grid
   dies at `O(N^d)`) and where the joint-sample `g` fix becomes necessary rather than optional. Slots in via the
   `data/` submodule trio.
