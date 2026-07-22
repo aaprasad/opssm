@@ -5,3 +5,6 @@ defaults:
 model:
   learn_obs: true
   data_size: 10
+  w_res: 0.4          # high-D sweet spot (vs the 1-D default 0.2): a higher-D sensor makes the true
+                      #   posterior sharper, so less residual down-weighting is needed. Sweep {0.2,0.3,0.4,0.6}:
+                      #   KL 0.42->0.356 saturating at 0.4; g stays ~0.6 (creeps over past 0.4). See notes.

@@ -109,5 +109,25 @@ now **split into on-data / off-data** (`drift_l2` / `drift_l2_off`) so the in-re
 divergence. `g=0.52` is *under* 0.6 but close to what the exact filter's own mean path yields (~0.58); the proper
 `g` fix is the joint-sample estimator (open), not `w_res`.
 
-**Default: `res_mode=rel`, `w_res=0.2`** — the closest match to the exact filter (KL 0.67 → 0.055, ~6×), with the
-drift still recovering in-regime. `w_res=0.4` is the more conservative balance (KL 0.13, drift/g nearest to rel).
+**1-D default: `res_mode=rel`, `w_res=0.2`** — the closest match to the exact filter (KL 0.67 → 0.055, ~6×), with
+the drift still recovering in-regime.
+
+## `w_res` is dimension-dependent (high-D wants a higher weight)
+
+The optimal `w_res` **rises with latent-observability**: a higher-D sensor (here 10-D, `y = Cz + d + ε`) is 10
+independent measurements of the same scalar `z`, so the *true* posterior is much sharper than the 1-D direct-obs
+case — and a sharper target needs *less* residual down-weighting to reach. High-D sweep (`experiment=em_highd`,
+14k, `C cos → 1.0` throughout):
+
+| `w_res` | KL | drift_l2 (on-data) | g (σ=0.6) |
+|---|---|---|---|
+| 0.2 | 0.420 | 0.380 | 0.585 |
+| 0.3 | 0.374 | 0.387 | 0.597 |
+| **0.4** | **0.356** | 0.374 | 0.610 |
+| 0.6 | 0.356 | 0.360 | 0.632 |
+
+KL falls 0.42 → 0.356 and then **saturates at `w_res=0.4`** (0.6 is identical); `g` is on-target near 0.4 and
+starts over-shooting past it. So **high-D default `w_res=0.4`** (`configs/experiment/em_highd.yaml`), vs 1-D's 0.2.
+Note the high-D drift stays ~0.36–0.39 for *all* `w_res` (much softer than 1-D's ~0.13) — the drift floor there is
+set by the latent-readout noise (`C⁺(y−d)`) and the sensor-before-dynamics curriculum, not by `w_res`; sensor
+(`C cos=1.0`) and `g` (~0.6) are both excellent regardless.
