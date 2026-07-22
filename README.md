@@ -69,31 +69,30 @@ samples far from the mode (gradient norm ~7800 vs ~200 normalized), and minimizi
 operator **wide**. Diagnosed by continuing a *perfect* narrow start (supervised, std 0.089) on the Zakai loss with
 *true* dynamics: it blows up to std 0.7 — the objective actively pushes away from the exact filter — and an
 ablation shows the FP residual **spreads** while the likelihood update **sharpens**, with the residual winning.
-**Fix:** `res_mode="rel"` (default) measures the residual *relative to the local FP magnitude*
-(`res2 / (rhs² + (∂ℓ/∂t)² + 1)`), removing the tail blow-up while keeping the broad proposal for coverage. In the
-full 1-D EM (8k steps) this **halves the over-dispersion KL (0.67 → 0.35)**, brings **`g` closer to true
-(0.633 → 0.608, σ=0.6)**, and **preserves drift recovery** (data-regime L2 0.069 → 0.064). Full account and the
-ruled-out alternatives (`res_post`, proposal tightening, Fourier time features) in `notes/overdispersion.md`.
+**Fix:** two knobs, tuned together. (1) `res_mode="rel"` (default) measures the residual *relative to the local
+FP magnitude* (`res2 / (rhs² + (∂ℓ/∂t)² + 1)`), removing the tail blow-up while keeping the broad proposal for
+coverage — this moves the stable width from ~3–5× down to ~2× (KL 0.67 → 0.35). (2) `w_res` (default `0.2`)
+down-weights the FP residual against the jump/ic recursion: the residual *spreads* and the likelihood update
+*sharpens*, so a smaller weight slides the balance to the exact width (`rel` makes this knob **stable** — the raw
+L2 residual made it a runaway). Together, full 1-D EM (8k) reaches **KL 0.67 → 0.055 (~6×, near-exact)**. The
+residual also couples the operator to the learned `f, g`, so `w_res` trades posterior width against dynamics — at
+`w_res=0.2` the drift still fits well **in-regime** (its error is in the off-data tail; the drift metric is now
+split into on-data / off-data), and `g≈0.52` (close to the exact filter's own mean-path value ~0.58). `w_res=0.4`
+is the conservative balance (KL 0.13, drift/g nearest to rel). Full account + ruled-out alternatives (`res_post`,
+proposal tightening, Fourier time features) in `notes/overdispersion.md`.
 
 ## Known limitations (open)
-1. **Residual over-dispersion (partly open)** — `res_mode="rel"` cuts the operator over-width from ~3–5× to ~2×
-   (KL 0.67 → 0.35); the remaining ~2× is a genuine *equilibrium* of the rel-residual↔likelihood balance (a
-   narrow start relaxes back up to it), not a resolution artefact. Closing it likely needs a residual↔jump
-   **weight** balance (down-weighting the residual sharpens the equilibrium; too far collapses it). See
-   `notes/overdispersion.md`.
-2. **Diffusion over-estimation** — improved with the rel fix (`g ≈ 0.61` vs `σ = 0.6` in 1-D) but still biased in
-   high-D. `g² = Var[Δẑ]/dt` is a *variance* estimator, so it absorbs residual over-dispersion / mean-path
-   roughness as if it were diffusion. The principled fix is a **square-then-average** estimator over *joint*
-   posterior path samples, which needs the cross-covariance of consecutive states — a smoother or path-MCMC —
-   not the per-time marginals the operator provides (independent-marginal sampling over-estimates ~100× since
-   consecutive states are near-perfectly correlated). Tied to (1).
+1. **Diffusion `g` estimator** — `g² = Var[Δẑ]/dt` is a *variance* estimator over the per-time posterior marginals,
+   so it absorbs mean-path roughness as if it were diffusion and reads slightly low/high depending on the filter
+   width (≈0.52 at `w_res=0.2`, vs σ=0.6). The principled fix is a **square-then-average** estimator over *joint*
+   posterior path samples, which needs the cross-covariance of consecutive states — a smoother or path-MCMC — not
+   the per-time marginals the operator provides (independent-marginal sampling over-estimates ~100× since
+   consecutive states are near-perfectly correlated).
 
 ## Next directions
 - **Diffusion `g`:** build a joint / path sampler (path-MCMC, or a smoother for the cross-covariance) to enable
   the correct `square-then-average` `g` estimator. MCMC-over-the-path is the natural vehicle and is unusually
   parallel here (the operator's marginals are time-independent; DEER can parallelize the within-chain steps).
-- **Close the residual over-dispersion equilibrium** — tune the residual↔jump loss weight (rel makes this stable
-  where the raw L2 residual made it a runaway); a narrow start currently relaxes to ~2× the exact width.
 - **High-D latent** (`lorenz/`, `vanderpol/`) — where the mesh-free readout actually earns its keep (the grid
   dies at `O(N^d)`) and where the joint-sample `g` fix becomes necessary rather than optional. Slots in via the
   `data/` submodule trio.

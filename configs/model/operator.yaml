@@ -31,5 +31,11 @@ n_mean: 256               # fixed-node sample count when meshfree_mean=true
 res_mode: rel             # FP residual reduction: "rel" = scale-invariant (residual / local FP magnitude)
                           #   -- fixes over-dispersion by removing the sharp-density tail blow-up of the
                           #   absolute "l2" residual (which biases the operator WIDE); "log1p" = log-compress
+w_res: 0.2                # weight on the FP residual vs the jump/ic recursion. The residual SPREADS and the
+                          #   likelihood update SHARPENS, so w_res<1 sharpens the posterior toward the exact
+                          #   filter's width (w_res=0 collapses to a spike). 0.2 = best filter match (1-D EM
+                          #   KL 0.35->0.055, near-exact) with drift still fitting well IN-REGIME; g slightly
+                          #   under. 0.4 = more conservative balance (KL 0.13, drift/g closest to rel). rel+w_res
+                          #   tuned together; see notes/overdispersion.md.
 loss: zakai
 train_dir: ${train_dir}

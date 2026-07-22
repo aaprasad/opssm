@@ -141,7 +141,7 @@ def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_pri
 
 def accumulate_pinn_grads(model, xs, mask, s_coll, drift, sigma, log_prior, noise_std, dt,
                           n_colloc, near_std, broad_std, n_tcoll, chunk_size,
-                          w_nll=0.0, num_steps=1, res_post=0.0, res_mode="l2",
+                          w_nll=0.0, num_steps=1, res_post=0.0, res_mode="l2", w_res=1.0,
                           decode=None, center=None):
     """MEMORY-CAPPED forward+backward of the mesh-free Zakai PINN loss. The recursion is
     per-trajectory and the residual is per-point, both INDEPENDENT across the batch, so we
@@ -163,7 +163,10 @@ def accumulate_pinn_grads(model, xs, mask, s_coll, drift, sigma, log_prior, nois
         res, jump, ic, nll = pinn_zakai_loss(
             model, xs[:, sl], mask[:, sl], z_col, log_q, s_coll, drift, sigma, log_prior,
             noise_std, dt, n_tcoll=n_tcoll, res_post=res_post, res_mode=res_mode, decode=decode)
-        (bw * (res + jump + ic + w_nll * nll / num_steps)).backward()
+        # w_res down-weights the FP RESIDUAL relative to the jump/ic recursion: the residual SPREADS
+        # and the likelihood update (jump) SHARPENS, so w_res<1 sharpens the balance toward the exact
+        # filter (w_res=0 collapses to a spike -- keep it > 0 to still enforce the FP dynamics).
+        (bw * (w_res * res + jump + ic + w_nll * nll / num_steps)).backward()
         for i, v in enumerate((res, jump, ic, nll)):
             agg[i] += bw * v.item()
     return agg

@@ -68,6 +68,28 @@ def vis_operator(model, xs_val, mask_val, filt_val, z_grid, ts, img_path, n_traj
 
 
 @torch.no_grad()
+def _posterior3d(ax, z, ts, filt_j, pi_j, lo, hi, title):
+    """3D posterior evolution p(z, t) as a WATERFALL of per-time density profiles: the EXACT filter
+    as light dashed curves, the OPERATOR as solid curves, over the data-regime z. Over-dispersion
+    reads as the solid operator curve sitting lower/broader than the dashed exact one. `ax` is a
+    pre-made 3D axis; filt_j / pi_j are (T, Nz) numpy densities for one traj."""
+    import numpy as np
+    T = len(ts)
+    ti = np.arange(0, T, max(1, T // 28))                   # subsample time for legibility
+    inr = (z >= lo - 0.3) & (z <= hi + 0.3)                 # focus z on where there is mass
+    zc = z[inr]
+    for t in ti:
+        tt = np.full_like(zc, ts[t])
+        ax.plot(zc, tt, filt_j[t, inr], color="0.62", ls="--", lw=0.8)   # exact: light dashed
+        ax.plot(zc, tt, pi_j[t, inr], color="C3", ls="-", lw=1.1)        # operator: solid
+    ax.plot([], [], [], color="C3", ls="-", label="operator")
+    ax.plot([], [], [], color="0.62", ls="--", label="exact")
+    ax.set_xlabel("$z$"); ax.set_ylabel("$t$"); ax.set_zlabel("$p$")
+    ax.set_title(title, fontsize=10); ax.legend(fontsize=8, loc="upper left")
+    ax.view_init(elev=32, azim=-58)
+    return ax
+
+
 def vis_learn(model, drift_net, xs_val, mask_val, filt_val, z_grid, ts, a, img_path, n_traj=2,
         diff_net=None, sigma=None):
     z = z_grid.cpu().numpy()
@@ -76,6 +98,12 @@ def vis_learn(model, drift_net, xs_val, mask_val, filt_val, z_grid, ts, a, img_p
     f_true = (a * (z_grid - z_grid ** 3)).cpu().numpy()
     log_pi = model.log_posterior(xs_val, mask_val, z_grid)
     pi = log_pi.exp().cpu().numpy()
+    # DATA REGIME: the range the inferred latent actually visits (operator posterior mean's 1-99
+    # percentile) -- the SAME support the drift_l2 metric scores on. Outside it there is no data,
+    # so the drift is unconstrained and naturally diverges; shading/limiting to it keeps the figure
+    # honest about where the fit is being judged.
+    m_op_all = (log_pi.exp() * z_grid).sum(-1)
+    lo, hi = float(m_op_all.quantile(0.01)), float(m_op_all.quantile(0.99))
     filt = filt_val.cpu().numpy()
     mean = (filt_val * z_grid).sum(-1)
     var = (filt_val * z_grid ** 2).sum(-1) - mean ** 2
@@ -84,16 +112,22 @@ def vis_learn(model, drift_net, xs_val, mask_val, filt_val, z_grid, ts, a, img_p
     gap = ~obs
 
     has_g = diff_net is not None
+    off = 2 if has_g else 1
     n_cols = n_traj + 2 + (1 if has_g else 0)
-    fig, axes = plt.subplots(1, n_cols, figsize=(6 * n_cols, 4.5))
+    post_idx = set(range(off, off + n_traj))                # posterior panels rendered in 3D
+    fig = plt.figure(figsize=(6 * n_cols, 4.8))
+    gs = fig.add_gridspec(1, n_cols)
+    axes = [fig.add_subplot(gs[0, k], projection="3d") if k in post_idx else fig.add_subplot(gs[0, k])
+            for k in range(n_cols)]
     # learned drift vs truth
     ax = axes[0]
     ax.plot(z, f_true, "k-", lw=2, label="true $a(z-z^3)$")
     ax.plot(z, f_learned, "C2--", lw=2, label=r"learned $f_\theta$")
-    ax.axvspan(-2, 2, color="C2", alpha=0.06, label="support")
+    ax.axvspan(lo, hi, color="C2", alpha=0.12, label="data regime")
+    mrg = 0.3
+    ax.set_xlim(lo - mrg, hi + mrg)                          # focus on where there is data
     ax.set_xlabel("$z$"); ax.set_ylabel("$f(z)$"); ax.set_ylim(-4, 4)
     ax.set_title("learned drift"); ax.legend(fontsize=9)
-    off = 1
     # learned diffusion g^2(z) vs the true constant (when a DiffusionNet is given)
     if has_g:
         ax = axes[1]
@@ -101,19 +135,14 @@ def vis_learn(model, drift_net, xs_val, mask_val, filt_val, z_grid, ts, a, img_p
         ax.plot(z, g2, "C0-", lw=2, label=r"learned $g^2(z)$")
         if sigma is not None:
             ax.axhline(sigma ** 2, ls="--", c="k", lw=2, label=fr"true $\sigma^2={sigma ** 2:.3f}$")
-        ax.axvspan(-2, 2, color="C2", alpha=0.06)
+        ax.axvspan(lo, hi, color="C2", alpha=0.12)
         ax.set_xlabel("$z$"); ax.set_ylabel("$g^2(z)$")
-        ax.set_ylim(0, max(0.6, float(g2.max()) * 1.2))
+        ax.set_ylim(0, max(0.6, float(g2.max()) * 1.2)); ax.set_xlim(lo - 0.3, hi + 0.3)
         ax.set_title("learned diffusion"); ax.legend(fontsize=9)
-        off = 2
-    # posterior snapshots in the gap
+    # posterior EVOLUTION p(z,t): exact filter surface vs operator wireframe (3D), one per traj
     for j in range(n_traj):
-        tj = int(t_star[j]); ax = axes[off + j]
-        ax.plot(z, filt[tj, j], "k-", lw=2, label="exact filter")
-        ax.plot(z, pi[tj, j], "C3--", lw=2, label="operator")
-        ax.set_xlabel("$z$"); ax.set_title(f"posterior traj {j}, $t={tj}$ (gap)")
-        if j == 0:
-            ax.legend(fontsize=9)
+        _posterior3d(axes[off + j], z, ts_np, filt[:, j], pi[:, j], lo, hi,
+                     f"posterior $p(z,t)$ traj {j}")
     # mean +/- 2 std over time, traj 0
     j = 0; ax = axes[-1]
     m_op = (log_pi[:, j].exp() * z_grid).sum(-1).cpu().numpy()
@@ -165,7 +194,13 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
             g2_emp[b] = r2dt[msk].mean(); g2_se[b] = g2_emp[b] * np.sqrt(2.0 / n)
     inr = (zg >= lo) & (zg <= hi)
 
-    fig, axes = plt.subplots(2, 4, figsize=(20, 8))
+    fig = plt.figure(figsize=(25, 8))
+    gsp = fig.add_gridspec(2, 5)
+    axes = np.empty((2, 4), dtype=object)
+    for r in range(2):
+        for c in range(4):
+            axes[r, c] = fig.add_subplot(gsp[r, c])
+    ax3d = fig.add_subplot(gsp[:, 4], projection="3d")                   # tall 3D posterior p(z,t) panel
     for j in range(n_traj):                                              # A: obs + recon + predictive band
         ax = axes[0, j]
         for dim in range(nd):
@@ -226,4 +261,7 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
     ax.bar(ctr, dens, width=(hi - lo) / nb, color="gray", alpha=0.5)
     ax.set_xlim(lo, hi); ax.set_xlabel("$z$"); ax.set_ylabel("count")
     ax.set_title("latent occupancy (data density)")
+    # E: 3D posterior evolution p(z,t) -- exact filter surface vs operator wireframe (traj 0)
+    _posterior3d(ax3d, zg, ts_np, filt_val[:, 0].cpu().numpy(), pi[:, 0].cpu().numpy(),
+                 lo, hi, "posterior $p(z,t)$ traj 0")
     plt.tight_layout(); plt.savefig(img_path); plt.close()

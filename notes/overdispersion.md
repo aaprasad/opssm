@@ -80,6 +80,34 @@ threaded through `losses.pinn_zakai_loss` / `accumulate_pinn_grads`).
 — the over-estimation shrinks, since it was downstream of the over-width), and **preserves drift recovery**
 (0.069 → 0.064, slightly better). No downside — wired as the default.
 
-Closing the last ~2× (0.19 → 0.089) is future work — likely a residual↔jump **weight** balance (down-weighting
-the residual sharpens the equilibrium; too far collapses it, per the ablation), not a normalisation or proposal
-change.
+## Closing the last ~2×: residual↔jump weight (`w_res`)
+
+The rel equilibrium (~0.19, still ~2× the exact 0.089) is where the residual's *spread* balances the jump's
+*sharpen*. Down-weighting the residual (`w_res` on the residual term, jump/ic kept at 1) slides that balance
+toward the exact width — cleanly, because `rel` made it stable (the raw L2 residual made this knob a runaway).
+Isolated (true dynamics, random init):
+
+| `w_res` | std_op (exact 0.089) | KL |
+|---|---|---|
+| 1.0 | 0.186 | 0.35 |
+| 0.4 | 0.130 | 0.108 |
+| 0.2 | 0.116 | 0.070 |
+| 0 (no residual) | 0.028 (collapse) | — |
+
+**Full-EM trade-off** (`experiment=em_1d`, 8k, rel + `w_res`) — the residual also couples the operator to the
+learned `f, g`, so pushing `w_res` low trades posterior width against dynamics recovery:
+
+| `w_res` | KL | drift_l2 (on-data) | g (σ=0.6) |
+|---|---|---|---|
+| 1.0 | 0.35 | 0.064 | 0.608 |
+| 0.4 | 0.128 | 0.094 | 0.564 |
+| **0.2** | **0.055** | 0.13* | 0.520 |
+
+*The `w_res=0.2` drift *looks worse by the old metric* but fits the true cubic **well in-regime** — the error is
+concentrated in the off-data tail (|z| ≳ 1.4) where the regression extrapolates unconstrained. The drift metric is
+now **split into on-data / off-data** (`drift_l2` / `drift_l2_off`) so the in-regime fit isn't masked by tail
+divergence. `g=0.52` is *under* 0.6 but close to what the exact filter's own mean path yields (~0.58); the proper
+`g` fix is the joint-sample estimator (open), not `w_res`.
+
+**Default: `res_mode=rel`, `w_res=0.2`** — the closest match to the exact filter (KL 0.67 → 0.055, ~6×), with the
+drift still recovering in-regime. `w_res=0.4` is the more conservative balance (KL 0.13, drift/g nearest to rel).

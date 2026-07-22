@@ -51,7 +51,7 @@ class ZakaiFilterModule(pl.LightningModule):
                  warmup=2000, m_every=2000, m_inner=400, reg_lambda=3e-4, reg_lambda_g=3e-3,
                  g_init=1.0, learn_dynamics=True, learn_g=True, g_net=False, learn_obs=False,
                  pca_init=True, c_stable_tol=0.05, meshfree_mean=True, n_mean=256,
-                 res_mode="rel", loss="zakai", train_dir="./dump/nzf"):
+                 res_mode="rel", w_res=0.2, loss="zakai", train_dir="./dump/nzf"):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
@@ -135,7 +135,7 @@ class ZakaiFilterModule(pl.LightningModule):
         res, jump, ic, _ = accumulate_pinn_grads(                 # does its own chunked backward
             self.model, x, mask, self.s_coll, drift, diffusion, _log_prior, self.noise_std,
             self.dt, h.n_colloc, h.near_std, h.broad_std, h.n_tcoll, h.chunk_size,
-            res_mode=h.res_mode, decode=decode, center=center)
+            res_mode=h.res_mode, w_res=h.w_res, decode=decode, center=center)
         opt.step()
         self.lr_schedulers().step()
         self.log_dict({"res": res, "jump": jump, "ic": ic}, prog_bar=True)
@@ -173,14 +173,19 @@ class ZakaiFilterModule(pl.LightningModule):
         # drift error over the DATA REGIME only -- the range the inferred latent actually visits.
         # Evaluating on a fixed [-2,2] is dominated by the tails (|z|>1.5) where there is no data and
         # the regression must extrapolate; that penalizes coverage, not fit.
+        # SPLIT the drift RMSE into ON-DATA (inside the range the latent visits, m_op's 1-99
+        # percentile) and OFF-DATA (|z|<=2 but outside that range -- where the regression must
+        # extrapolate with no data to constrain it, so the drift naturally peels off the truth).
+        # Reporting them separately keeps the on-data fit from being masked by off-data divergence.
         m_op = (log_pi.exp() * self.z_grid).sum(-1)                   # (T,B) inferred latent
         lo, hi = m_op.quantile(0.01), m_op.quantile(0.99)
-        supp = (self.z_grid >= lo) & (self.z_grid <= hi)
-        f_err = (self.drift_net.drift(self.z_grid)[0][supp]
-                 - self.f_true_grid[supp]).pow(2).mean().sqrt().item()
-        f_err_full = (self.drift_net.drift(self.z_grid)[0][self.supp]
-                      - self.f_true_grid[self.supp]).pow(2).mean().sqrt().item()
-        logs = {"kl": kl, "drift_l2": f_err, "drift_l2_ext": f_err_full, "g": float(self.g_cur)}
+        on = (self.z_grid >= lo) & (self.z_grid <= hi)                # data regime
+        off = self.supp & ~on                                        # |z|<=2 but outside the data regime
+        fd = self.drift_net.drift(self.z_grid)[0]
+        f_err = (fd[on] - self.f_true_grid[on]).pow(2).mean().sqrt().item()
+        f_err_off = ((fd[off] - self.f_true_grid[off]).pow(2).mean().sqrt().item()
+                     if bool(off.any()) else float("nan"))
+        logs = {"kl": kl, "drift_l2": f_err, "drift_l2_off": f_err_off, "g": float(self.g_cur)}
         if h.learn_obs and dm.C_true is not None:
             logs["c_cos"] = abs(float(self.C_cur @ (dm.C_true / dm.C_true.norm())))
         self.log_dict(logs, prog_bar=True)
