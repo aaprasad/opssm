@@ -35,7 +35,8 @@ from torch import optim
 from opssm.models.operator import OperatorFilter, OperatorBackward
 from opssm.models.dynamics import DriftNet, DiffusionNet
 from opssm.models.losses import accumulate_pinn_grads, accumulate_adjoint_grads, kl_target_pred
-from opssm.models.mstep import mstep, log_smoothed, posterior_mean_fixed, smoother_mean_fixed
+from opssm.models.mstep import (mstep, log_smoothed, posterior_mean_fixed, smoother_mean_fixed,
+                                _fixed_nodes)
 from opssm.models.obs import make_decode, zhat_from_obs
 from opssm.analysis import viz
 
@@ -183,6 +184,53 @@ class ZakaiFilterModule(pl.LightningModule):
         if out.get("ess") is not None:
             self.log("ess", out["ess"], prog_bar=True)                  # SNIS health diagnostic
 
+    @torch.no_grad()
+    def _drift_source_diag(self, x, mask):
+        """CONFOUNDER-FREE (same operator) comparison of the drift from four latent estimates -> RMSE vs
+        the true a(z-z^3), on-data |z|<=1.5. filter/smoother MEAN use pure path increments (fully clean,
+        mesh-free, no transition). filter/smoother JOINT use the fixed-node CRN pair (mesh-free -- NO grid:
+        propose z_{t+1} via current (f,g), reweight by alpha_t * factor_{t+1}, factor = lik or msg); these
+        are EM-updates (the joint needs the transition), so read them as 'the update this source produces'.
+        Returns {drift_l2_fm, drift_l2_sm, drift_l2_fj, drift_l2_sj}."""
+        h = self.hparams; dt = self.dt; dev = self.device; a = self.a; ns = self.noise_std
+        center = (zhat_from_obs(x, self.C_cur, self.d_cur) / self.s_scale) if h.learn_obs else x[..., 0]
+        decode = make_decode(self.C_cur, self.d_cur, self.s_scale) if h.learn_obs else None
+        m = mask[..., 0]; mv = (m[:-1] * m[1:]).bool()
+        zf, _ = posterior_mean_fixed(self.model, x, mask, center, h.n_mean, h.near_std, h.broad_std)
+        zs, _ = smoother_mean_fixed(self.model, self.model_b, x, mask, center, h.n_mean, h.near_std, h.broad_std)
+        z, log_q = _fixed_nodes(center, mask, h.n_mean, h.near_std, h.broad_std)     # (T,B,K)
+        gen = torch.Generator(device=dev).manual_seed(1)
+        eps = torch.randn(1, z.shape[1], z.shape[2], device=dev, generator=gen)
+        z_next = z + self.drift_net.drift(z)[0] * dt + math.sqrt(max(float(self.g_cur), 1e-6) ** 2 * dt) * eps
+        ctx_f = self.model.context(x, mask); ctx_b = self.model_b.context(x, mask)
+        b0f = self.model.coeffs(ctx_f, torch.zeros(1, device=dev))[:, :, 0]
+        b0b = self.model_b.coeffs(ctx_b, torch.zeros(1, device=dev))[:, :, 0]
+        l_alpha = torch.einsum("tbp,tbkp->tbk", b0f, self.model.trunk(z.unsqueeze(-1))) + self.model.bias
+        l_msg1 = torch.einsum("tbp,tbkp->tbk", b0b[1:], self.model_b.trunk(z_next[:-1].unsqueeze(-1))) + self.model_b.bias
+        if decode is None:
+            loglik1 = -0.5 * (x[1:, :, 0].unsqueeze(-1) - z_next[:-1]) ** 2 / ns ** 2
+        else:
+            loglik1 = -0.5 * ((x[1:].unsqueeze(2) - decode(z_next[:-1])) ** 2).sum(-1) / ns ** 2
+        a_k = (l_alpha - log_q)[:-1]
+        Wf = torch.softmax(a_k + loglik1, dim=-1); Ws = torch.softmax(a_k + l_msg1, dim=-1)
+        zt, dzt = z[:-1], (z_next[:-1] - z[:-1]) / dt
+        edges = torch.linspace(-2.0, 2.0, 41, device=dev); ctr = 0.5 * (edges[:-1] + edges[1:])
+        ft = a * (ctr - ctr ** 3); onb = ctr.abs() <= 1.5
+
+        def rmse(zc, dz, w):
+            zc = zc.reshape(-1); dz = dz.reshape(-1); w = w.reshape(-1)
+            idx = (torch.bucketize(zc, edges) - 1).clamp(0, 39)
+            ws = torch.zeros(40, device=dev).scatter_add(0, idx, w)
+            ds = torch.zeros(40, device=dev).scatter_add(0, idx, w * dz)
+            fe = ds / ws.clamp_min(1e-12)
+            keep = onb & (ws > ws.sum() * 0.003)
+            return (fe[keep] - ft[keep]).pow(2).mean().sqrt().item() if bool(keep.any()) else float("nan")
+        one = torch.ones_like(zf[:-1])
+        return {"drift_l2_fm": rmse(zf[:-1][mv], ((zf[1:] - zf[:-1]) / dt)[mv], one[mv]),
+                "drift_l2_sm": rmse(zs[:-1][mv], ((zs[1:] - zs[:-1]) / dt)[mv], one[mv]),
+                "drift_l2_fj": rmse(zt[mv], dzt[mv], Wf[mv]),
+                "drift_l2_sj": rmse(zt[mv], dzt[mv], Ws[mv])}
+
     # -- validation: KL vs the exact filter, drift L2, C cos, + a figure -------------------------
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
@@ -213,19 +261,8 @@ class ZakaiFilterModule(pl.LightningModule):
         if h.learn_smoother and getattr(dm, "smoothed_val", None) is not None:
             log_sm = log_smoothed(self.model, self.model_b, x, mask, self.z_grid)
             logs["kl_smooth"] = kl_target_pred(dm.smoothed_val, log_sm).item()
-        # CONTROLLED filter-mean vs smoother-mean drift diagnostic (same operator, no g/RNG confound):
-        # is the smoother mean actually == the filter mean (mean_fs), and if so do their INCREMENTS still
-        # differ (dinc_fs)? A large dinc_fs with tiny mean_fs = differencing amplifies invisible per-step
-        # offsets -> explains "means look identical but the smoother-mean drift is worse".
-        if h.learn_smoother:
-            center = (zhat_from_obs(x, self.C_cur, self.d_cur) / self.s_scale) if h.learn_obs else x[..., 0]
-            zf, _ = posterior_mean_fixed(self.model, x, mask, center, h.n_mean, h.near_std, h.broad_std)
-            zs, _ = smoother_mean_fixed(self.model, self.model_b, x, mask, center, h.n_mean, h.near_std, h.broad_std)
-            mv = (mask[..., 0][:-1] * mask[..., 0][1:]).bool()
-            dzf = ((zf[1:] - zf[:-1]) / self.dt)[mv]; dzs = ((zs[1:] - zs[:-1]) / self.dt)[mv]
-            logs["mean_fs"] = (zs - zf).abs().mean().item()           # level-scale difference of the means
-            logs["dinc_fs"] = (dzs - dzf).abs().mean().item()         # increment-scale difference (drift input)
-            logs["dz_rms"] = dzf.pow(2).mean().sqrt().item()          # increment scale, for context
+        if h.learn_smoother:                                          # 4-way drift-source comparison (Option B)
+            logs.update(self._drift_source_diag(x, mask))
         self.log_dict(logs, prog_bar=True)
         # figure
         img = os.path.join(h.train_dir, f"step_{self.global_step:05d}.pdf")
