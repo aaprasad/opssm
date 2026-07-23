@@ -44,5 +44,9 @@ smoother_mstep: false     # v2: read the M-step statistics from the SMOOTHER (re
                           #   regresses on the less-laggy smoother-mean increments; g uses the deterministic
                           #   lag-one cross-cov (square-then-average) that recovers the increment variance the
                           #   filter-mean g under-reads. false = v1 (filter-mean M-step, smoother is passive).
+drift_method: euler       # drift quadrature vs the mean increment: euler (left-endpoint, only rule valid on
+                          #   the FILTER mean) | trapezoidal 1/2(f_t+f_t1) | midpoint f((z_t+z_t1)/2). The
+                          #   2nd-order rules cancel the left-endpoint bias only on the SMOOTHER mean (a proper
+                          #   state path) -- test with smoother_mstep=true.
 loss: zakai
 train_dir: ${train_dir}

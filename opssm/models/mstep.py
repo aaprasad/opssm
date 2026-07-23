@@ -155,12 +155,28 @@ def log_smoothed(model, model_b, x, mask, z_grid):
     return log_g - torch.logsumexp(log_g, dim=-1, keepdim=True)
 
 
-def fit_drift(drift_net, dr_opt, zc, dz, z_reg, hr, reg_lambda, m_inner):
-    """Regress f_theta(z) ~ dz with an H2 (curvature) smoothness penalty. Updates drift_net in place."""
+def fit_drift(drift_net, dr_opt, zc, dz, z_reg, hr, reg_lambda, m_inner,
+              zc_next=None, method="euler"):
+    """Regress f_theta ~ dz (the mean increment / dt) with an H2 (curvature) smoothness penalty.
+    `method` sets the quadrature relating f to the increment:
+      'euler'       left-endpoint  f(z_t) ~ dz               -- the ONLY valid rule on the FILTER mean
+                    (whose increment is filter propagation, not an SDE integral: 2nd-order rules failed).
+      'trapezoidal' 1/2(f(z_t)+f(z_{t+1})) ~ dz              -- 2nd-order; valid on the SMOOTHER mean
+      'midpoint'    f((z_t+z_{t+1})/2)      ~ dz             -- 2nd-order; valid on the SMOOTHER mean
+    The 2nd-order rules cancel the left-endpoint bias IFF the increment is a genuine state increment,
+    i.e. on the smoother mean (a proper state estimate) -- the hypothesis this knob tests. Updates in place."""
     drift_net.requires_grad_(True)
+    zc_next = zc if zc_next is None else zc_next
+    zmid = 0.5 * (zc + zc_next)
     for _ in range(m_inner):
         dr_opt.zero_grad()
-        f = drift_net.net(zc.unsqueeze(-1)).squeeze(-1)
+        if method == "trapezoidal":
+            f = 0.5 * (drift_net.net(zc.unsqueeze(-1)).squeeze(-1)
+                       + drift_net.net(zc_next.unsqueeze(-1)).squeeze(-1))
+        elif method == "midpoint":
+            f = drift_net.net(zmid.unsqueeze(-1)).squeeze(-1)
+        else:                                                # euler (left-endpoint)
+            f = drift_net.net(zc.unsqueeze(-1)).squeeze(-1)
         fit = ((f - dz) ** 2).mean()
         fr = drift_net.net(z_reg.unsqueeze(-1)).squeeze(-1)
         f_pp = (fr[2:] - 2 * fr[1:-1] + fr[:-2]) / hr ** 2
@@ -227,7 +243,7 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
           learn_g, g_net, reg_lambda, reg_lambda_g, m_inner,
           learn_obs=False, c_stable_tol=0.05, C_cur=None, d_cur=None, s_scale=1.0,
           meshfree_mean=False, n_mean=256, near_std=0.3, broad_std=1.6,
-          model_b=None, smoother_mstep=False, g_cur_in=None):
+          model_b=None, smoother_mstep=False, g_cur_in=None, drift_method="euler"):
     """One EM M-step. Order: posterior-mean increments -> (high-D) Stiefel obs-map + cstab ->
     drift GATED on `cstab < c_stable_tol` -> diffusion. In 1-D (learn_obs=False) cstab==0, so the
     gate is always open and this reduces to the plain f,g M-step. `meshfree_mean` replaces the grid
@@ -262,7 +278,8 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
     if learn_obs:
         C_cur, d_cur, cstab = fit_obs_map_stiefel(z_hat, x, s_scale, C_cur)
     if cstab < c_stable_tol:                                          # sensor-before-dynamics gate
-        fit_drift(drift_net, dr_opt, zc, dz, z_reg, hr, reg_lambda, m_inner)
+        fit_drift(drift_net, dr_opt, zc, dz, z_reg, hr, reg_lambda, m_inner,
+                  zc_next=zc_next, method=drift_method)
     g_cur = None
     if learn_g:
         g_cur = fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,

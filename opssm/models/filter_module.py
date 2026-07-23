@@ -52,7 +52,7 @@ class ZakaiFilterModule(pl.LightningModule):
                  g_init=1.0, learn_dynamics=True, learn_g=True, g_net=False, learn_obs=False,
                  pca_init=True, c_stable_tol=0.05, meshfree_mean=True, n_mean=256,
                  res_mode="rel", w_res=0.2, learn_smoother=False, smoother_mstep=False,
-                 loss="zakai", train_dir="./dump/nzf"):
+                 drift_method="euler", loss="zakai", train_dir="./dump/nzf"):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
@@ -174,7 +174,8 @@ class ZakaiFilterModule(pl.LightningModule):
                     C_cur=self.C_cur, d_cur=self.d_cur, s_scale=self.s_scale,
                     meshfree_mean=h.meshfree_mean, n_mean=h.n_mean,
                     near_std=h.near_std, broad_std=h.broad_std,
-                    model_b=self.model_b, smoother_mstep=h.smoother_mstep, g_cur_in=self.g_cur)
+                    model_b=self.model_b, smoother_mstep=h.smoother_mstep, g_cur_in=self.g_cur,
+                    drift_method=h.drift_method)
         if out["g_cur"] is not None:
             self.g_cur = out["g_cur"]
         if h.learn_obs:
