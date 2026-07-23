@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OperatorFilter: DeepONet conditional log-density (the core mesh-free Zakai operator)."""
+"""OperatorFilter + OperatorBackward: DeepONet conditional log-density (the mesh-free Zakai forward
+filter, and its anti-causal backward-message twin for the smoother)."""
 
 import torch
 from torch import nn
@@ -88,3 +89,27 @@ class OperatorFilter(nn.Module):
         """Normalized filtering log-posterior on z (post-update, s=0): (T,B,Nz)."""
         ell = self.log_density(self.context(xs, mask), z, s=0.0)
         return ell - torch.logsumexp(ell, dim=-1, keepdim=True)
+
+
+class OperatorBackward(OperatorFilter):
+    """ANTI-CAUSAL twin of OperatorFilter for the BACKWARD adjoint-Zakai smoother. Identical DeepONet
+    machinery (trunk / branch / coeffs / coeffs_dtime / trunk_zderivs) with its OWN weights; only the
+    context differs -- an anti-causal GRU. log_density(ctx_b, z, s=0) = log msg_t(z), the (unnormalized)
+    post-update backward MESSAGE msg_t(z) = p(y_{t:T} | z_t) (INCLUDES obs t, mirroring the forward
+    post-update pi_t = p(z_t | y_{0:t}); s>0 transports it backward (adjoint FP) toward obs t-1, and the
+    jump ties it to msg_{t-1} via lik_{t-1} -- see pinn_adjoint_loss). The smoothed posterior is
+    gamma_t(z) = p(z_t | y_{0:T}) proportional to alpha_t(z) * beta_t(z) = alpha_t * msg_t / lik_t, i.e.
+    softmax_z( ell_forward + log msg - loglik_t ) (see mstep.log_smoothed)."""
+
+    def context(self, xs, mask):
+        """xs (T,B,M), mask (T,B,1) -> ANTI-CAUSAL context (T,B,C): ctx[t] summarizes y_{t:T} (INCLUDING
+        obs t), so s=0 represents the post-update backward message msg_t(z) = p(y_{t:T} | z_t)."""
+        inp = torch.cat([xs * mask, mask], dim=-1)         # (T,B,M+1)
+        h, _ = self.gru(inp.flip(0))                       # causal GRU on the reversed seq = anti-causal
+        return self.to_ctx(h.flip(0))                      # (T,B,C); ctx[t] summarizes y_{t:T}
+
+    def log_msg(self, xs, mask, z):
+        """Normalized backward-message log-density at s=0 on grid z (for viz; the normalizer is
+        arbitrary for smoothing -- it cancels in the gamma = alpha * beta softmax)."""
+        lm = self.log_density(self.context(xs, mask), z, s=0.0)
+        return lm - torch.logsumexp(lm, dim=-1, keepdim=True)

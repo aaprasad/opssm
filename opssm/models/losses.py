@@ -170,3 +170,90 @@ def accumulate_pinn_grads(model, xs, mask, s_coll, drift, sigma, log_prior, nois
         for i, v in enumerate((res, jump, ic, nll)):
             agg[i] += bw * v.item()
     return agg
+
+
+def pinn_adjoint_loss(model_b, xs, mask, z_col, log_q, s_coll, drift, sigma,
+                      noise_std, dt, n_tcoll=None, res_mode="rel", decode=None):
+    """BACKWARD adjoint-Zakai PINN for the smoother's log post-update backward MESSAGE
+    lmsg = log msg_t(z), msg_t(z) = p(y_{t:T} | z_t). Time-reversed mirror of pinn_zakai_loss:
+        adjoint residual (s=0 at obs t, s=1 backward toward obs t-1 -- the backward Kolmogorov
+        GENERATOR on log msg):
+            d_s lmsg / dt = f * d_z lmsg + 0.5 g^2 ((d_z lmsg)^2 + d2_z lmsg)
+            [vs the forward rhs -(f' + f d_z ell) + 0.5 g^2(...): DROP the f' term, FLIP -f d_z -> +f d_z,
+             diffusion unchanged (+); no global time-sign flip. State-dependent g DROPS the forward's
+             d2g2/dg2 terms (generator, not the FP adjoint).]
+        backward jump (i -> i-1):  msg_{i-1}(s=0) = normalize( backward-predict_i(s=1) * lik_{i-1} )
+        terminal (i = T-1):        msg_{T-1} = normalize( lik_{T-1} )   [beta_{T-1}=1, no future]
+    Returns (res_b, jump_b, tc_b). Reuses sample_collocation's z_col/log_q, res_mode, and (via
+    accumulate_adjoint_grads) w_res. The smoothed readout is gamma_t proportional to
+    alpha_t * msg_t / lik_t (see mstep.log_smoothed)."""
+    T, B, K = z_col.shape
+    ctx = model_b.context(xs, mask)                                # (T,B,C) anti-causal
+    tau = model_b.trunk(z_col.reshape(-1, 1)).reshape(T, B, K, -1)  # (T,B,K,p)
+    b_ends = model_b.coeffs(ctx, torch.tensor([0.0, 1.0], device=z_col.device))   # (T,B,2,p)
+    lmsg0 = torch.einsum("tbp,tbkp->tbk", b_ends[:, :, 0], tau) + model_b.bias     # (T,B,K) msg, s=0
+
+    if decode is None:                                             # 1D direct obs: h(z) = z
+        loglik = -0.5 * (xs[..., 0].unsqueeze(-1) - z_col) ** 2 / noise_std ** 2   # (T,B,K)
+    else:                                                          # high-D: lik = N(y; C z + d, sigma^2 I)
+        loglik = -0.5 * ((xs.unsqueeze(2) - decode(z_col)) ** 2).sum(-1) / noise_std ** 2
+    m = mask[..., 0]                                               # (T,B)
+    logZ0 = torch.logsumexp(lmsg0 - log_q, dim=-1, keepdim=True) - math.log(K)
+    lmsgpi0 = lmsg0 - logZ0                                        # normalized (mirror of logpi0)
+
+    # ---- backward jump: step i's s=1 (backward-transported) message on step (i-1)'s nodes, x lik_{i-1}
+    bpred = torch.einsum("tbp,tbkp->tbk", b_ends[1:, :, 1], tau[:-1]) + model_b.bias   # (T-1,B,K)
+    logW_bpred = torch.log_softmax(bpred - log_q[:-1], dim=-1).detach()
+    logW_btgt = torch.log_softmax(logW_bpred + loglik[:-1] * m[:-1].unsqueeze(-1), dim=-1)
+    jump_b = -(logW_btgt.exp() * lmsgpi0[:-1]).sum(-1).mean()      # teach step (i-1)'s s=0
+
+    # ---- terminal condition: msg_{T-1} = normalize(lik_{T-1}) (no future beyond the last obs)
+    logW_tc = torch.log_softmax(loglik[-1] * m[-1].unsqueeze(-1) - log_q[-1], dim=-1)
+    tc_b = -(logW_tc.exp() * lmsgpi0[-1]).sum(-1).mean()
+
+    # ---- adjoint residual (autodiff on a random time subsample), same machinery as the forward
+    ti = (torch.randperm(T, device=z_col.device)[:n_tcoll] if n_tcoll and n_tcoll < T
+          else torch.arange(T, device=z_col.device))
+    b_s, ds_b = model_b.coeffs_dtime(ctx[ti], s_coll)             # (Ts,B,Ns,p)
+    tau_s, dz_tau, d2z_tau = model_b.trunk_zderivs(z_col[ti])     # (Ts,B,K,p)
+    dz_lm = torch.einsum("tbsp,tbkp->tbsk", b_s, dz_tau)
+    d2z_lm = torch.einsum("tbsp,tbkp->tbsk", b_s, d2z_tau)
+    ds_lm = torch.einsum("tbsp,tbkp->tbsk", ds_b, tau_s)
+    f, _ = drift(z_col[ti])                                       # backward generator uses f (NOT f')
+    f = f.unsqueeze(2)                                            # (Ts,B,1,K)
+    if callable(sigma):                                          # state-dependent g^2(z)
+        g2 = sigma(z_col[ti])[0].unsqueeze(2)
+        rhs = f * dz_lm + 0.5 * g2 * (dz_lm ** 2 + d2z_lm)        # NO d2g2/dg2 (generator, not FP adjoint)
+    else:                                                        # constant scalar g
+        rhs = f * dz_lm + 0.5 * sigma ** 2 * (dz_lm ** 2 + d2z_lm)
+    res2 = (ds_lm / dt - rhs) ** 2                                # (Ts,B,Ns,K)
+    if res_mode == "rel":                                         # scale-invariant residual (as forward)
+        scale = rhs.detach() ** 2 + (ds_lm / dt).detach() ** 2 + 1.0
+        res2 = res2 / scale
+    elif res_mode == "log1p":
+        res2 = torch.log1p(res2)
+    res_b = res2.mean()
+    return res_b, jump_b, tc_b
+
+
+def accumulate_adjoint_grads(model_b, xs, mask, s_coll, drift, sigma, noise_std, dt,
+                             n_colloc, near_std, broad_std, n_tcoll, chunk_size,
+                             res_mode="rel", w_res=1.0, decode=None, center=None):
+    """Memory-capped chunked forward+backward of the backward adjoint-Zakai loss (sibling of
+    accumulate_pinn_grads). Returns the batch-averaged (res_b, jump_b, tc_b); gradients left on
+    model_b's params (caller does zero_grad before / step after)."""
+    B = xs.shape[1]
+    agg = [0.0, 0.0, 0.0]
+    for st in range(0, B, chunk_size):
+        sl = slice(st, min(st + chunk_size, B))
+        bw = (sl.stop - sl.start) / B
+        ctr = None if center is None else center[:, sl]
+        z_col, log_q = sample_collocation(xs[:, sl], mask[:, sl], n_colloc, near_std, broad_std,
+                                          center=ctr)
+        res_b, jump_b, tc_b = pinn_adjoint_loss(
+            model_b, xs[:, sl], mask[:, sl], z_col, log_q, s_coll, drift, sigma,
+            noise_std, dt, n_tcoll=n_tcoll, res_mode=res_mode, decode=decode)
+        (bw * (w_res * res_b + jump_b + tc_b)).backward()
+        for i, v in enumerate((res_b, jump_b, tc_b)):
+            agg[i] += bw * v.item()
+    return agg
