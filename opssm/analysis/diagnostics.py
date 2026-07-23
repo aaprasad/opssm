@@ -25,7 +25,7 @@ from torch import nn
 
 from opssm.data.doublewell.sde import make_dataset
 from opssm.data.doublewell.oracle import (
-    build_transition, transition_power, forward_backward, ffbs_sample)
+    build_transition, transition_power, forward_backward, ffbs_sample, gauss_loglik_fn)
 from opssm.models.nn import mlp
 
 
@@ -220,7 +220,7 @@ def main_em_drift(batch_size=512, t0=0.0, t1=10.0, num_steps=100, a=1.0, sigma=0
     for em in range(n_em):
         # ---- E-step: exact grid smoother + FFBS path samples, using the CURRENT f
         K = transition_power(build_transition(f_on_grid(), z_grid, dt / n_sub, sigma), n_sub)
-        filtered, _ = forward_backward(xs, z_grid, K, noise_std)
+        filtered, _ = forward_backward(xs, z_grid, K, gauss_loglik_fn(xs, z_grid, noise_std))
         paths = ffbs_sample(z_grid, K, filtered, n_samp)    # (T, B, n_samp) posterior latent paths
         z = paths[:-1].reshape(-1)
         dzdt = ((paths[1:] - paths[:-1]) / dt).reshape(-1)

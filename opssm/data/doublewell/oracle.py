@@ -60,10 +60,35 @@ def stationary_density(T, n_iter=4000):
     return pi
 
 
+def gauss_loglik_fn(xs, z, rho):
+    """1-D direct-observation log-likelihood closure loglik_fn(i) -> (B,Nz): log N(x_i; z, rho^2)."""
+    inv2var = 0.5 / rho ** 2
+
+    def loglik_fn(i):
+        return -inv2var * (xs[i, :, 0].unsqueeze(1) - z.unsqueeze(0)) ** 2      # (B, Nz)
+    return loglik_fn
+
+
+def highd_loglik_fn(y, z, C, d, rho):
+    """High-D linear-sensor log-likelihood closure loglik_fn(i) -> (B,Nz):
+    log N(y_i; C z + d, rho^2 I). hz = C z + d precomputed on the grid."""
+    hz = C[None, :] * z[:, None] + d[None, :]                                   # (Nz, D)
+    inv2var = 0.5 / rho ** 2
+
+    def loglik_fn(i):
+        return -inv2var * ((y[i][:, None, :] - hz[None, :, :]) ** 2).sum(-1)    # (B, Nz)
+    return loglik_fn
+
+
 @torch.no_grad()
-def forward_backward(xs, z, T_full, rho, mask=None):
+def forward_backward(xs, z, T_full, loglik_fn, mask=None):
     """Forward filter + backward smoother (discrete HMM on the grid) -- EXACT
     latent-state inference, no variational approximation.
+
+    loglik_fn(i) -> (B, Nz): per-step LOG-likelihood log p(obs_i | z) on the grid (Gaussian for 1-D
+    via gauss_loglik_fn; high-D linear sensor via highd_loglik_fn) -- the single hook that lets 1-D
+    and high-D share this forward+backward+gamma code. Stabilized by per-step max-subtraction (the
+    constant cancels in every per-step normalization).
 
     mask: optional (T_steps,) bool; False = no observation at that step (the
     update is skipped, so the state is propagated by the dynamics alone). Lets us
@@ -75,14 +100,13 @@ def forward_backward(xs, z, T_full, rho, mask=None):
     """
     T_steps, B = xs.shape[0], xs.shape[1]
     Nz = z.shape[0]
-    inv2var = 0.5 / rho ** 2
 
     def obs(i):
         return mask is None or bool(mask[i])
 
     def lik(i):
-        x = xs[i, :, 0]
-        return torch.exp(-inv2var * (x.unsqueeze(1) - z.unsqueeze(0)) ** 2)   # (B, Nz)
+        ll = loglik_fn(i)
+        return (ll - ll.max(dim=1, keepdim=True).values).exp()                 # (B, Nz), stabilized
 
     # Forward filter (skip the update where unobserved).
     prior = torch.softmax(-0.5 * z ** 2, dim=0)
@@ -132,27 +156,19 @@ def grid_filter_target(xs, z_grid, a, sigma, noise_std, dt_obs, n_sub, mask=None
     f_true = a * (z_grid - z_grid ** 3)
     K = build_transition(f_true, z_grid, dt_obs / n_sub, sigma)
     K_full = transition_power(K, n_sub)
-    filtered, smoothed = forward_backward(xs, z_grid, K_full, noise_std, mask=mask)
+    filtered, smoothed = forward_backward(xs, z_grid, K_full, gauss_loglik_fn(xs, z_grid, noise_std),
+                                          mask=mask)
     return filtered, smoothed
 
 
 @torch.no_grad()
-def grid_filter_highd(y, z_grid, a, sigma, noise_std, dt, n_sub, C, d):
-    """Exact p(z_t | y_{0:t}) on the grid: true f/g transition + high-D Gaussian likelihood
-    N(y; C z + d, sigma^2 I). Returns (T,B,Nz). The high-D validation oracle (uses TRUE C,d)."""
+def grid_filter_highd(y, z_grid, a, sigma, noise_std, dt, n_sub, C, d, mask=None):
+    """Exact p(z_t | y_{0:t}) (filtered) and p(z_t | y_{0:T}) (smoothed) on the grid: true f/g
+    transition + high-D Gaussian likelihood N(y; C z + d, sigma^2 I), via the shared forward_backward.
+    Returns (filtered, smoothed), each (T,B,Nz). The high-D validation oracle (uses TRUE C,d)."""
     f_true = a * (z_grid - z_grid ** 3)
     K = transition_power(build_transition(f_true, z_grid, dt / n_sub, sigma), n_sub)   # (Nz,Nz)
-    T, B, _ = y.shape
-    hz = C[None, :] * z_grid[:, None] + d[None, :]               # (Nz, D)
-    pi = torch.softmax(-0.5 * z_grid ** 2, dim=0)[None, :].expand(B, z_grid.numel()).clone()
-    filt = torch.zeros(T, B, z_grid.numel(), device=y.device)
-    for t in range(T):
-        ll = -0.5 * ((y[t][:, None, :] - hz[None, :, :]) ** 2).sum(-1) / noise_std ** 2   # (B,Nz)
-        w = pi * (ll - ll.max(-1, keepdim=True).values).exp()
-        pi = w / w.sum(-1, keepdim=True).clamp_min(1e-30)
-        filt[t] = pi
-        pi = pi @ K.t()                                         # predict
-    return filt
+    return forward_backward(y, z_grid, K, highd_loglik_fn(y, z_grid, C, d, noise_std), mask=mask)
 
 
 @torch.no_grad()

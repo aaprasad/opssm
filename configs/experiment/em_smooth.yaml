@@ -1,0 +1,9 @@
+# @package _global_
+# Stage 5: 1-D EM WITH the two-filter backward-SPDE smoother. Adds the backward adjoint-Zakai operator
+# (a second E-step per iteration) so p(z_t|y_{0:T}) is available. v1 gate: kl_smooth should track kl
+# (the smoother marginal reproduces the oracle smoother). For the high-D variant use:
+#   experiment=em_highd model.learn_smoother=true
+defaults:
+  - override /data: doublewell
+model:
+  learn_smoother: true

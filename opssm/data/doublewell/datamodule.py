@@ -70,11 +70,12 @@ class DoubleWellDataModule(pl.LightningDataModule):
             mask = torch.ones(h.num_steps, h.batch_size, 1, device=dev)
             y_tr, y_val = y[:, h.n_val:], y[:, :h.n_val]
             mask_tr, mask_val = mask[:, h.n_val:], mask[:, :h.n_val]
-            filt = grid_filter_highd(y, self.z_grid, h.a, h.sigma, h.noise_std,
-                                     dt, h.n_sub, C_true, d_true)
+            filt, smoothed = grid_filter_highd(y, self.z_grid, h.a, h.sigma, h.noise_std,
+                                               dt, h.n_sub, C_true, d_true)
             self.train_batch = (y_tr, mask_tr, filt[:, h.n_val:])
             self.val_batch = (y_val, mask_val, filt[:, :h.n_val])
             self.z_val_true, self.C_true, self.d_true = z_true[:, :h.n_val], C_true, d_true
+            self.smoothed_val = smoothed[:, :h.n_val]             # oracle smoother ground truth (kl_smooth)
             self.full_obs = y_tr                                   # for PCA / random C init
         else:
             xs, ts = make_dataset(h.t0, h.t1, h.batch_size, h.noise_std, h.num_steps,
@@ -83,10 +84,11 @@ class DoubleWellDataModule(pl.LightningDataModule):
             mask_t = torch.ones(h.num_steps, dtype=torch.bool, device=dev)
             mask_t[int(h.gap_lo * h.num_steps):int(h.gap_hi * h.num_steps)] = False
             mask = mask_t.view(h.num_steps, 1, 1).float().expand(h.num_steps, h.batch_size, 1).contiguous()
-            filtered, _ = grid_filter_target(xs, self.z_grid, h.a, h.sigma, h.noise_std,
-                                             dt, h.n_sub, mask=mask_t)
+            filtered, smoothed = grid_filter_target(xs, self.z_grid, h.a, h.sigma, h.noise_std,
+                                                    dt, h.n_sub, mask=mask_t)
             self.train_batch = (xs[:, h.n_val:], mask[:, h.n_val:], filtered[:, h.n_val:])
             self.val_batch = (xs[:, :h.n_val], mask[:, :h.n_val], filtered[:, :h.n_val])
+            self.smoothed_val = smoothed[:, :h.n_val]             # oracle smoother ground truth (kl_smooth)
             self.z_val_true = self.C_true = self.d_true = self.full_obs = None
 
         self.ts, self.dt = ts, dt

@@ -70,6 +70,28 @@ def posterior_mean_fixed(model, x, mask, center, n_samples, near_std, broad_std)
     return (w * z).sum(-1), float(ess.mean())                       # (T,B), scalar
 
 
+@torch.no_grad()
+def log_smoothed(model, model_b, x, mask, z_grid):
+    """Neural SMOOTHER marginal log p(z_t | y_{0:T}) on a grid, via the numerically STABLE predict*msg
+    readout:  log gamma_t = log predict_t + log msg_t, normalized over z.
+      predict_t = the FORWARD operator's FP-predicted density (s=1) carried from step t-1 -- i.e.
+                  log p(z_t | y_{0:t-1}), SMOOTH in z (no observation applied), = the s=1 slice of step t-1.
+      msg_t     = the BACKWARD operator's post-update message (s=0) = log p(y_{t:T} | z_t) (INCLUDES lik_t).
+    Since alpha_t = predict_t * lik_t, predict*msg = predict*lik*beta = alpha*beta = gamma -- but the
+    equivalent alpha*msg/lik form is a numerical trap (the -loglik reaches ~+1/(2 noise_std^2) in the tails
+    and overwhelms any finite floor on log alpha, flushing all smoothed mass to the tails). predict is
+    smooth, so log predict + log msg has no such cancellation. t=0 uses the Gaussian prior for predict_0."""
+    ctx_f = model.context(x, mask)
+    ctx_b = model_b.context(x, mask)
+    ell_pred = model.log_density(ctx_f, z_grid, s=1.0)             # (T,B,Nz) forward s=1 = log predict_{t+1}
+    log_pred = torch.empty_like(ell_pred)
+    log_pred[0] = -0.5 * z_grid ** 2                              # predict_0 = prior N(0,1) (const cancels)
+    log_pred[1:] = ell_pred[:-1]                                  # predict_t = step (t-1) s=1
+    lmsg = model_b.log_density(ctx_b, z_grid, s=0.0)             # (T,B,Nz) log msg_t
+    log_g = log_pred + lmsg
+    return log_g - torch.logsumexp(log_g, dim=-1, keepdim=True)
+
+
 def fit_drift(drift_net, dr_opt, zc, dz, z_reg, hr, reg_lambda, m_inner):
     """Regress f_theta(z) ~ dz with an H2 (curvature) smoothness penalty. Updates drift_net in place."""
     drift_net.requires_grad_(True)

@@ -32,10 +32,10 @@ import lightning.pytorch as pl
 import torch
 from torch import optim
 
-from opssm.models.operator import OperatorFilter
+from opssm.models.operator import OperatorFilter, OperatorBackward
 from opssm.models.dynamics import DriftNet, DiffusionNet
-from opssm.models.losses import accumulate_pinn_grads, kl_target_pred
-from opssm.models.mstep import mstep
+from opssm.models.losses import accumulate_pinn_grads, accumulate_adjoint_grads, kl_target_pred
+from opssm.models.mstep import mstep, log_smoothed
 from opssm.models.obs import make_decode, zhat_from_obs
 from opssm.analysis import viz
 
@@ -51,12 +51,16 @@ class ZakaiFilterModule(pl.LightningModule):
                  warmup=2000, m_every=2000, m_inner=400, reg_lambda=3e-4, reg_lambda_g=3e-3,
                  g_init=1.0, learn_dynamics=True, learn_g=True, g_net=False, learn_obs=False,
                  pca_init=True, c_stable_tol=0.05, meshfree_mean=True, n_mean=256,
-                 res_mode="rel", w_res=0.2, loss="zakai", train_dir="./dump/nzf"):
+                 res_mode="rel", w_res=0.2, learn_smoother=False, loss="zakai",
+                 train_dir="./dump/nzf"):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
         h = self.hparams
         self.model = OperatorFilter(h.data_size, h.gru_hidden, h.ctx_dim, h.p)
+        # backward adjoint-Zakai twin for the two-filter smoother (default off => byte-identical filter)
+        self.model_b = OperatorBackward(h.data_size, h.gru_hidden, h.ctx_dim, h.p) \
+            if h.learn_smoother else None
         self.drift_net = DriftNet(h.drift_hidden); self.drift_net.requires_grad_(False)
         self.diff_net = None
         if h.learn_g and h.g_net:
@@ -102,8 +106,16 @@ class ZakaiFilterModule(pl.LightningModule):
         os.makedirs(h.train_dir, exist_ok=True)
 
     def configure_optimizers(self):
-        opt = optim.Adam(self.model.parameters(), lr=self.hparams.lr)
-        sched = optim.lr_scheduler.ExponentialLR(opt, gamma=self.hparams.sched_gamma)
+        h = self.hparams
+        # ONE optimizer over both operators' (disjoint) params -> a single optimizer.step() per batch,
+        # so global_step stays 1/batch (two Lightning optimizers under manual opt double-count it, which
+        # would halve warmup/m_every/max_steps and skip validation). The forward and backward losses
+        # touch disjoint parameters, so a shared Adam is exactly two independent Adams.
+        params = list(self.model.parameters())
+        if h.learn_smoother:
+            params += list(self.model_b.parameters())
+        opt = optim.Adam(params, lr=h.lr)
+        sched = optim.lr_scheduler.ExponentialLR(opt, gamma=h.sched_gamma)
         return {"optimizer": opt, "lr_scheduler": sched}
 
     # -- helpers for the high-D decode / collocation-center hooks --------------------------------
@@ -118,12 +130,12 @@ class ZakaiFilterModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         h = self.hparams
         x, mask, filt = batch
-        opt = self.optimizers()
+        opt, sched = self.optimizers(), self.lr_schedulers()
         if h.loss == "supervised":                                # Stage-1 sanity: fit the exact filter
             opt.zero_grad()
             loss = kl_target_pred(filt, self.model.log_posterior(x, mask, self.z_grid))
             self.manual_backward(loss)
-            opt.step(); self.lr_schedulers().step()
+            opt.step(); sched.step()
             self.log("kl_train", loss, prog_bar=True)
             return
         step = self.global_step + 1
@@ -136,9 +148,16 @@ class ZakaiFilterModule(pl.LightningModule):
             self.model, x, mask, self.s_coll, drift, diffusion, _log_prior, self.noise_std,
             self.dt, h.n_colloc, h.near_std, h.broad_std, h.n_tcoll, h.chunk_size,
             res_mode=h.res_mode, w_res=h.w_res, decode=decode, center=center)
+        if h.learn_smoother:                                      # backward E-step: accumulate into the
+            res_b, jump_b, tc_b = accumulate_adjoint_grads(       # SAME optimizer (disjoint model_b params,
+                self.model_b, x, mask, self.s_coll, drift, diffusion, self.noise_std, self.dt,  # same frozen dyn)
+                h.n_colloc, h.near_std, h.broad_std, h.n_tcoll, h.chunk_size,
+                res_mode=h.res_mode, w_res=h.w_res, decode=decode, center=center)
         opt.step()
-        self.lr_schedulers().step()
+        sched.step()
         self.log_dict({"res": res, "jump": jump, "ic": ic}, prog_bar=True)
+        if h.learn_smoother:
+            self.log_dict({"res_b": res_b, "jump_b": jump_b, "tc_b": tc_b}, prog_bar=False)
 
     # -- M-step ----------------------------------------------------------------------------------
     def on_train_batch_end(self, outputs, batch, batch_idx):
@@ -188,6 +207,10 @@ class ZakaiFilterModule(pl.LightningModule):
         logs = {"kl": kl, "drift_l2": f_err, "drift_l2_off": f_err_off, "g": float(self.g_cur)}
         if h.learn_obs and dm.C_true is not None:
             logs["c_cos"] = abs(float(self.C_cur @ (dm.C_true / dm.C_true.norm())))
+        # smoother marginal KL vs the oracle smoother (the v1 gate): should track `kl`.
+        if h.learn_smoother and getattr(dm, "smoothed_val", None) is not None:
+            log_sm = log_smoothed(self.model, self.model_b, x, mask, self.z_grid)
+            logs["kl_smooth"] = kl_target_pred(dm.smoothed_val, log_sm).item()
         self.log_dict(logs, prog_bar=True)
         # figure
         img = os.path.join(h.train_dir, f"step_{self.global_step:05d}.pdf")
