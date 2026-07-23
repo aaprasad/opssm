@@ -229,7 +229,11 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
     for r in range(2):
         for c in range(4):
             axes[r, c] = fig.add_subplot(gsp[r, c])
-    ax3d = fig.add_subplot(gsp[:, 4], projection="3d")                   # tall 3D posterior p(z,t) panel
+    if show_sm:                                                          # stack FILTER + SMOOTHER waterfalls
+        ax3d = fig.add_subplot(gsp[0, 4], projection="3d")
+        ax3d_s = fig.add_subplot(gsp[1, 4], projection="3d")
+    else:
+        ax3d = fig.add_subplot(gsp[:, 4], projection="3d")              # tall filter-only p(z,t) panel
     for j in range(n_traj):                                              # A: obs + recon + predictive band
         ax = axes[0, j]
         for dim in range(nd):
@@ -294,7 +298,11 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
     ax.bar(ctr, dens, width=(hi - lo) / nb, color="gray", alpha=0.5)
     ax.set_xlim(lo, hi); ax.set_xlabel("$z$"); ax.set_ylabel("count")
     ax.set_title("latent occupancy (data density)")
-    # E: 3D posterior evolution p(z,t) -- exact filter surface vs operator wireframe (traj 0)
+    # E: 3D posterior evolution p(z,t). Filter (red); with a smoother, a stacked SMOOTHER panel (blue,
+    # narrower through the dynamics), each vs its own oracle.
     _posterior3d(ax3d, zg, ts_np, filt_val[:, 0].cpu().numpy(), pi[:, 0].cpu().numpy(),
-                 lo, hi, "posterior $p(z,t)$ traj 0")
+                 lo, hi, ("filter $p(z,t)$ traj 0" if show_sm else "posterior $p(z,t)$ traj 0"))
+    if show_sm:
+        _posterior3d(ax3d_s, zg, ts_np, smoothed_val[:, 0].cpu().numpy(), pi_sm[:, 0].cpu().numpy(),
+                     lo, hi, "smoother $p(z,t)$ traj 0", color="C0", op_label="smoother")
     plt.tight_layout(); plt.savefig(img_path); plt.close()
