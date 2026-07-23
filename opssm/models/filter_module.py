@@ -35,7 +35,7 @@ from torch import optim
 from opssm.models.operator import OperatorFilter, OperatorBackward
 from opssm.models.dynamics import DriftNet, DiffusionNet
 from opssm.models.losses import accumulate_pinn_grads, accumulate_adjoint_grads, kl_target_pred
-from opssm.models.mstep import mstep, log_smoothed
+from opssm.models.mstep import mstep, log_smoothed, posterior_mean_fixed, smoother_mean_fixed
 from opssm.models.obs import make_decode, zhat_from_obs
 from opssm.analysis import viz
 
@@ -213,6 +213,19 @@ class ZakaiFilterModule(pl.LightningModule):
         if h.learn_smoother and getattr(dm, "smoothed_val", None) is not None:
             log_sm = log_smoothed(self.model, self.model_b, x, mask, self.z_grid)
             logs["kl_smooth"] = kl_target_pred(dm.smoothed_val, log_sm).item()
+        # CONTROLLED filter-mean vs smoother-mean drift diagnostic (same operator, no g/RNG confound):
+        # is the smoother mean actually == the filter mean (mean_fs), and if so do their INCREMENTS still
+        # differ (dinc_fs)? A large dinc_fs with tiny mean_fs = differencing amplifies invisible per-step
+        # offsets -> explains "means look identical but the smoother-mean drift is worse".
+        if h.learn_smoother:
+            center = (zhat_from_obs(x, self.C_cur, self.d_cur) / self.s_scale) if h.learn_obs else x[..., 0]
+            zf, _ = posterior_mean_fixed(self.model, x, mask, center, h.n_mean, h.near_std, h.broad_std)
+            zs, _ = smoother_mean_fixed(self.model, self.model_b, x, mask, center, h.n_mean, h.near_std, h.broad_std)
+            mv = (mask[..., 0][:-1] * mask[..., 0][1:]).bool()
+            dzf = ((zf[1:] - zf[:-1]) / self.dt)[mv]; dzs = ((zs[1:] - zs[:-1]) / self.dt)[mv]
+            logs["mean_fs"] = (zs - zf).abs().mean().item()           # level-scale difference of the means
+            logs["dinc_fs"] = (dzs - dzf).abs().mean().item()         # increment-scale difference (drift input)
+            logs["dz_rms"] = dzf.pow(2).mean().sqrt().item()          # increment scale, for context
         self.log_dict(logs, prog_bar=True)
         # figure
         img = os.path.join(h.train_dir, f"step_{self.global_step:05d}.pdf")
