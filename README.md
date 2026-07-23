@@ -55,9 +55,10 @@ stays available and is exact for a low-D latent. Findings (full account in the d
   *variance* amplified by `1/dt`, so readout noise feeds a runaway feedback with the over-dispersion. The grid
   (deterministic) is stable → **determinism is necessary**, and fixing the nodes supplies it while keeping the
   dimension-agnostic `O(K)` cost.
-- With the fixed-node readout, **drift and sensor recover well** (data-regime drift L2 ≈ 0.2, `c_cos → 1`);
-  **`g` is over-estimated** (≈ 0.79 vs true 0.6 in high-D — *the grid has this too*, so it's the estimator, not
-  the readout).
+- With the fixed-node readout, **drift and sensor recover well** (`c_cos → 1`). `g` *was* over-estimated (≈ 0.79
+  vs true 0.6) — but that was **downstream of the over-dispersion**: with the residual fix below the operator is
+  much less over-wide and **`g ≈ 0.6`** (0.61 high-D, 0.52 1-D). The residual bias in `g² = Var[Δẑ]/dt` is real
+  but is now second-order (see the `g` estimator limitation).
 - Ruled out: gradient **mode**-finding (under-converges; mode ≠ mean) and **Gauss–Hermite** quadrature
   (`O(n^d)`, doesn't scale).
 
@@ -77,9 +78,19 @@ down-weights the FP residual against the jump/ic recursion: the residual *spread
 L2 residual made it a runaway). Together, full 1-D EM (8k) reaches **KL 0.67 → 0.055 (~6×, near-exact)**. The
 residual also couples the operator to the learned `f, g`, so `w_res` trades posterior width against dynamics — at
 `w_res=0.2` the drift still fits well **in-regime** (its error is in the off-data tail; the drift metric is now
-split into on-data / off-data), and `g≈0.52` (close to the exact filter's own mean-path value ~0.58). `w_res=0.4`
-is the conservative balance (KL 0.13, drift/g nearest to rel). Full account + ruled-out alternatives (`res_post`,
-proposal tightening, Fourier time features) in `notes/overdispersion.md`.
+split into on-data / off-data), and `g≈0.52` (close to the exact filter's own mean-path value ~0.58).
+
+**`w_res` is dimension-dependent:** 1-D uses `0.2`, **high-D uses `0.4`** (`configs/experiment/em_highd.yaml`) — a
+higher-D sensor sharpens the true posterior, so it needs less residual down-weighting; the optimum saturates at
+0.4 (sweep 0.2→0.6). High-D EM reaches **KL ~0.7 → 0.36**, `c_cos → 1.0`, `g ≈ 0.6`.
+
+**Remaining high-D gap (open):** `w_res=0.4` leaves high-D at KL ~0.36 (operator ~1.5× too wide). We showed this is
+a **biased minimum of the self-supervised objective**, *not* a sensor/capacity/resolution limit — supervised
+fitting reaches KL 3e-4, and the true filter is not a stable point of the Zakai loss even with true dynamics + a
+perfect sensor. Structural fixes tried and **ruled out** (detach-rhs → collapses; variance-growth → no effect, a
+differential constraint can't move the absolute width; also Fourier/`res_post`/resolution). Closing it likely
+needs the **smoother** (a joint/path sampler), not more objective tuning. Full account + ruled-out alternatives in
+`notes/overdispersion.md`.
 
 ## Known limitations (open)
 1. **Diffusion `g` estimator** — `g² = Var[Δẑ]/dt` is a *variance* estimator over the per-time posterior marginals,
