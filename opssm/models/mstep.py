@@ -36,14 +36,11 @@ def posterior_mean(model, x, mask, z_grid):
     return (log_pi.exp() * z_grid).sum(-1)
 
 
-@torch.no_grad()
-def posterior_mean_fixed(model, x, mask, center, n_samples, near_std, broad_std):
-    """DETERMINISTIC mesh-free MEAN via FIXED-NODE importance sampling: the proposal nodes are drawn
-    ONCE (fixed seed) and reused every M-step, shared across t. So z_hat = sum_k w_k z_k is a smooth
-    deterministic function of the operator -- the grid's deterministic mean, but with data-following
-    nodes instead of a uniform grid. No fresh per-M-step randomness => no readout noise => the diffusion
-    estimator g^2 = Var[dz]/dt stays stable (the SNIS blowup was the fresh per-step sampling noise;
-    fixing the nodes removes it while keeping the MEAN, unlike the mode). Returns (z_hat (T,B), ess_frac)."""
+def _fixed_nodes(center, mask, n_samples, near_std, broad_std):
+    """FIXED-seed CRN proposal nodes shared across t -- the deterministic-readout building block reused
+    by posterior_mean_fixed / smoother_mean_fixed / smoother_pair_fixed. Half near the data-following
+    center (near_std), half broad (broad_std); nodes are per-t via the near center but the seed is fixed
+    so they are reused every M-step (no fresh randomness). Returns (z (T,B,K), log_q (T,B,K))."""
     T, B = center.shape
     dev = center.device
     gen = torch.Generator(device=dev).manual_seed(0)                 # FIXED nodes -> deterministic readout
@@ -61,13 +58,79 @@ def posterior_mean_fixed(model, x, mask, center, n_samples, near_std, broad_std)
     lqn = -0.5 * ((z - c.unsqueeze(-1)) / near_sd) ** 2 - near_sd.log() - c2
     lqb = -0.5 * (z / broad_std) ** 2 - math.log(broad_std) - c2
     log_q = torch.logaddexp(lqn, lqb)
+    return z, log_q
+
+
+@torch.no_grad()
+def posterior_mean_fixed(model, x, mask, center, n_samples, near_std, broad_std):
+    """DETERMINISTIC mesh-free FILTER MEAN via FIXED-NODE importance sampling: the proposal nodes are
+    drawn ONCE (fixed seed) and reused every M-step. So z_hat = sum_k w_k z_k is a smooth deterministic
+    function of the operator -- the grid's deterministic mean, but with data-following nodes instead of a
+    uniform grid. No fresh per-M-step randomness => no readout noise (the SNIS blowup was the fresh
+    per-step sampling noise; fixing the nodes removes it while keeping the MEAN, unlike the mode).
+    Returns (z_hat (T,B), ess_frac)."""
+    z, log_q = _fixed_nodes(center, mask, n_samples, near_std, broad_std)
     ctx = model.context(x, mask)
-    b0 = model.coeffs(ctx, torch.zeros(1, device=dev))[:, :, 0]      # (T,B,p) at s=0
+    b0 = model.coeffs(ctx, torch.zeros(1, device=z.device))[:, :, 0]  # (T,B,p) at s=0
     tau = model.trunk(z.unsqueeze(-1))                              # (T,B,K,p)
     ell = torch.einsum("tbp,tbkp->tbk", b0, tau) + model.bias       # (T,B,K)
     w = torch.softmax(ell - log_q, dim=-1)                          # SNIS weights
     ess = 1.0 / (w.pow(2).sum(-1) * z.shape[-1])                    # (T,B) fraction
     return (w * z).sum(-1), float(ess.mean())                       # (T,B), scalar
+
+
+@torch.no_grad()
+def smoother_mean_fixed(model, model_b, x, mask, center, n_samples, near_std, broad_std):
+    """DETERMINISTIC mesh-free SMOOTHER MEAN E[z_t | y_{0:T}] on the same fixed-node CRN proposal, with
+    the numerically STABLE predict*msg smoother weights
+        W_k = softmax_k( log predict_t(z_k) + log msg_t(z_k) - log q_k ),
+      log predict_t = forward operator s=1 of step t-1 evaluated on node_t (= log p(z_t|y_{0:t-1}), smooth);
+      log msg_t     = backward operator s=0 (= log p(y_{t:T}|z_t)).
+    Unlike the FILTER mean, the smoother mean is a proper state estimate, so the midpoint/trapezoidal drift
+    correction becomes valid on its increments (v2 M-step). Returns (z_hat (T,B), ess_frac)."""
+    z, log_q = _fixed_nodes(center, mask, n_samples, near_std, broad_std)
+    dev = z.device
+    ctx_f = model.context(x, mask)
+    ctx_b = model_b.context(x, mask)
+    tau_f = model.trunk(z.unsqueeze(-1))                            # (T,B,K,p) forward basis on nodes
+    tau_b = model_b.trunk(z.unsqueeze(-1))                          # (T,B,K,p) backward basis (own weights)
+    b1_f = model.coeffs(ctx_f, torch.ones(1, device=dev))[:, :, 0]  # (T,B,p) forward s=1 coeffs
+    log_pred = torch.empty_like(z)                                  # (T,B,K)
+    log_pred[0] = -0.5 * z[0] ** 2                                  # predict_0 = prior N(0,1) on node_0
+    log_pred[1:] = torch.einsum("tbp,tbkp->tbk", b1_f[:-1], tau_f[1:]) + model.bias  # predict_t on node_t
+    b0_b = model_b.coeffs(ctx_b, torch.zeros(1, device=dev))[:, :, 0]   # (T,B,p) backward s=0
+    lmsg = torch.einsum("tbp,tbkp->tbk", b0_b, tau_b) + model_b.bias    # (T,B,K) log msg_t on node_t
+    w = torch.softmax(log_pred + lmsg - log_q, dim=-1)
+    ess = 1.0 / (w.pow(2).sum(-1) * z.shape[-1])
+    return (w * z).sum(-1), float(ess.mean())
+
+
+@torch.no_grad()
+def smoother_pair_fixed(model, model_b, x, mask, center, drift_net, g_cur, dt,
+                        n_samples, near_std, broad_std):
+    """Deterministic fixed-node CRN LAG-ONE joint p(z_t, z_{t+1} | y_{0:T}) -> the cross-covariance that
+    fixes the diffusion g. Proposal: z_t^k ~ q_t (fixed nodes); z_{t+1}^k = z_t^k + f(z_t^k) dt +
+    sqrt(g^2 dt) eps^k (fixed eps^k = the transition K, which CANCELS in the importance weight). The
+    two-filter lag-one joint is proportional to alpha_t(z_t) K(z_{t+1}|z_t) msg_{t+1}(z_{t+1}), so
+        W_k = softmax_k( log alpha_t(z_t^k) - log q_t^k + log msg_{t+1}(z_{t+1}^k) )
+    (alpha_t = forward s=0; msg_{t+1} = backward s=0 -- INCLUDES lik_{t+1}, Convention B). Data-local nodes,
+    so no tail blow-up. Returns (zt, zt1, W) each (T-1,B,K): joint samples + weights for fit_diffusion's
+    square-then-average g^2 = (1/dt) mean_pairs sum_k W_k (Δz^k - 1/2(f_k+f'_k) dt)^2. CRN (fixed nodes +
+    fixed eps) makes this g deterministic across M-steps (no stochastic-FFBS runaway)."""
+    z, log_q = _fixed_nodes(center, mask, n_samples, near_std, broad_std)   # (T,B,K)
+    dev = z.device
+    gen = torch.Generator(device=dev).manual_seed(1)                       # FIXED transition noise (CRN)
+    eps = torch.randn(1, z.shape[1], z.shape[2], device=dev, generator=gen)  # shared across t
+    f_z = drift_net.drift(z)[0]                                            # (T,B,K) drift on nodes
+    z_next = z + f_z * dt + math.sqrt(max(float(g_cur), 1e-6) ** 2 * dt) * eps  # (T,B,K) ~ K(.|z)
+    zt, zt1 = z[:-1], z_next[:-1]                                          # pair (t, t+1) samples
+    ctx_f = model.context(x, mask); ctx_b = model_b.context(x, mask)
+    b0_f = model.coeffs(ctx_f, torch.zeros(1, device=dev))[:, :, 0]        # (T,B,p) forward s=0
+    b0_b = model_b.coeffs(ctx_b, torch.zeros(1, device=dev))[:, :, 0]      # (T,B,p) backward s=0
+    l_alpha = torch.einsum("tbp,tbkp->tbk", b0_f[:-1], model.trunk(zt.unsqueeze(-1))) + model.bias
+    l_msg1 = torch.einsum("tbp,tbkp->tbk", b0_b[1:], model_b.trunk(zt1.unsqueeze(-1))) + model_b.bias
+    W = torch.softmax((l_alpha - log_q[:-1]) + l_msg1, dim=-1)             # (T-1,B,K)
+    return zt, zt1, W
 
 
 @torch.no_grad()
