@@ -131,3 +131,32 @@ starts over-shooting past it. So **high-D default `w_res=0.4`** (`configs/experi
 Note the high-D drift stays ~0.36–0.39 for *all* `w_res` (much softer than 1-D's ~0.13) — the drift floor there is
 set by the latent-readout noise (`C⁺(y−d)`) and the sensor-before-dynamics curriculum, not by `w_res`; sensor
 (`C cos=1.0`) and `g` (~0.6) are both excellent regardless.
+
+## The high-D residual gap is a BIASED OBJECTIVE MINIMUM (open problem)
+
+`w_res=0.4` leaves high-D at KL ~0.36 (operator std ~0.15 vs exact 0.104). This is **not** a sensor, capacity,
+resolution, or dynamics-error limit — it's the self-supervised objective's *minimum being biased wide*. Evidence:
+
+- **Capacity is there.** Supervised fitting of the exact high-D filter reaches **KL 3e-4** (`experiment=em_highd
+  model.loss=supervised model.learn_dynamics=false`). The operator *can* represent the sharp filter.
+- **The true filter is not a stable point.** `sup2zakai_highd` (scratch): pretrain to the exact filter (std 0.104),
+  then run the Zakai loss with **true dynamics + a perfect PCA sensor** (cos 1.0). It **blows up to ~0.15** and
+  settles there — the objective actively pushes *away* from the exact filter even with everything else ideal.
+- **`w_res` can't relocate the fixed point.** In the isolated objective, lowering `w_res` shrinks the *width* but
+  *worsens KL* (the shape breaks); best KL is at `w_res=0.4`. The width is a self-consistent fixed point of the
+  SNIS jump recursion (`v0* = update(predict(v0*))`), set by the operator's *effective* likelihood width.
+
+**Structural fixes tried and RULED OUT** (both prototyped in `sup2zakai_highd`, from the std-0.104 narrow start):
+- **`res_detach`** — detach `rhs` so the residual only trains the forward evolution ("decouple the filtering head
+  from the FP IC"). **Collapses** to a spike (std 0.104 → 0.032, KL 81): removing `rhs` from the graph also removes
+  the residual's resistance to *over*-sharpening, so the shape is under-constrained.
+- **`w_var`** — add the FP variance-*growth* regularizer `(Var[s1]−Var[s0] − (2·Cov(z,f)+g²)dt)²`. **No effect**
+  (std 0.164–0.172 = baseline 0.167 at `w_var` 1 and 10): variance *growth* is a *differential* constraint,
+  satisfied at *any* absolute width, so it can't move the over-wide fixed point.
+
+Also ruled out earlier: richer time features (Fourier), `res_post`, and proposal resolution (`near_std`/`n_colloc` —
+transient help that washes out at convergence).
+
+**Status:** `rel + w_res` is the best filter-objective fix we have (1-D near-exact; high-D ~2×). Closing the high-D
+gap needs a *different estimation paradigm*, not more objective tuning — the backward-SPDE **smoother** (a joint /
+path sampler) is the natural next attack, and is independently the principled fix for `g`.
