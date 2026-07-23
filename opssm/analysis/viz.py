@@ -68,11 +68,12 @@ def vis_operator(model, xs_val, mask_val, filt_val, z_grid, ts, img_path, n_traj
 
 
 @torch.no_grad()
-def _posterior3d(ax, z, ts, filt_j, pi_j, lo, hi, title):
-    """3D posterior evolution p(z, t) as a WATERFALL of per-time density profiles: the EXACT filter
+def _posterior3d(ax, z, ts, filt_j, pi_j, lo, hi, title, color="C3", op_label="operator"):
+    """3D posterior evolution p(z, t) as a WATERFALL of per-time density profiles: the EXACT reference
     as light dashed curves, the OPERATOR as solid curves, over the data-regime z. Over-dispersion
     reads as the solid operator curve sitting lower/broader than the dashed exact one. `ax` is a
-    pre-made 3D axis; filt_j / pi_j are (T, Nz) numpy densities for one traj."""
+    pre-made 3D axis; filt_j / pi_j are (T, Nz) numpy densities for one traj. `color`/`op_label` let
+    the caller distinguish the filter panel (red) from the smoother panel (blue)."""
     import numpy as np
     T = len(ts)
     ti = np.arange(0, T, max(1, T // 28))                   # subsample time for legibility
@@ -81,8 +82,8 @@ def _posterior3d(ax, z, ts, filt_j, pi_j, lo, hi, title):
     for t in ti:
         tt = np.full_like(zc, ts[t])
         ax.plot(zc, tt, filt_j[t, inr], color="0.62", ls="--", lw=0.8)   # exact: light dashed
-        ax.plot(zc, tt, pi_j[t, inr], color="C3", ls="-", lw=1.1)        # operator: solid
-    ax.plot([], [], [], color="C3", ls="-", label="operator")
+        ax.plot(zc, tt, pi_j[t, inr], color=color, ls="-", lw=1.1)       # operator: solid
+    ax.plot([], [], [], color=color, ls="-", label=op_label)
     ax.plot([], [], [], color="0.62", ls="--", label="exact")
     ax.set_xlabel("$z$"); ax.set_ylabel("$t$"); ax.set_zlabel("$p$")
     ax.set_title(title, fontsize=10); ax.legend(fontsize=8, loc="upper left")
@@ -91,13 +92,23 @@ def _posterior3d(ax, z, ts, filt_j, pi_j, lo, hi, title):
 
 
 def vis_learn(model, drift_net, xs_val, mask_val, filt_val, z_grid, ts, a, img_path, n_traj=2,
-        diff_net=None, sigma=None):
+        diff_net=None, sigma=None, model_b=None, smoothed_val=None):
+    from opssm.models.mstep import log_smoothed
     z = z_grid.cpu().numpy()
     ts_np = ts.cpu().numpy()
     f_learned = drift_net.drift(z_grid)[0].cpu().numpy()
     f_true = (a * (z_grid - z_grid ** 3)).cpu().numpy()
     log_pi = model.log_posterior(xs_val, mask_val, z_grid)
     pi = log_pi.exp().cpu().numpy()
+    # SMOOTHER marginal (when the backward operator is present): p(z_t|y_{0:T}) vs the oracle smoothed.
+    show_sm = model_b is not None and smoothed_val is not None
+    if show_sm:
+        log_sm = log_smoothed(model, model_b, xs_val, mask_val, z_grid)
+        pi_sm = log_sm.exp()
+        m_sm = (pi_sm * z_grid).sum(-1)
+        s_sm = ((pi_sm * z_grid ** 2).sum(-1) - m_sm ** 2).clamp_min(0).sqrt()
+        sm_ex = smoothed_val.cpu().numpy(); pi_sm = pi_sm.cpu().numpy()
+        m_sm_ex = (smoothed_val * z_grid).sum(-1)
     # DATA REGIME: the range the inferred latent actually visits (operator posterior mean's 1-99
     # percentile) -- the SAME support the drift_l2 metric scores on. Outside it there is no data,
     # so the drift is unconstrained and naturally diverges; shading/limiting to it keeps the figure
@@ -139,19 +150,30 @@ def vis_learn(model, drift_net, xs_val, mask_val, filt_val, z_grid, ts, a, img_p
         ax.set_xlabel("$z$"); ax.set_ylabel("$g^2(z)$")
         ax.set_ylim(0, max(0.6, float(g2.max()) * 1.2)); ax.set_xlim(lo - 0.3, hi + 0.3)
         ax.set_title("learned diffusion"); ax.legend(fontsize=9)
-    # posterior EVOLUTION p(z,t): exact filter surface vs operator wireframe (3D), one per traj
-    for j in range(n_traj):
-        _posterior3d(axes[off + j], z, ts_np, filt[:, j], pi[:, j], lo, hi,
-                     f"posterior $p(z,t)$ traj {j}")
-    # mean +/- 2 std over time, traj 0
+    # posterior EVOLUTION p(z,t) (3D). With a smoother: FILTER traj 0 + SMOOTHER traj 0 side by side
+    # (each vs its own oracle) so the smoother's narrower gap density is visible. Else filter, per traj.
+    if show_sm:
+        _posterior3d(axes[off], z, ts_np, filt[:, 0], pi[:, 0], lo, hi, "filter $p(z,t)$ traj 0")
+        _posterior3d(axes[off + 1], z, ts_np, sm_ex[:, 0], pi_sm[:, 0], lo, hi,
+                     "smoother $p(z,t)$ traj 0", color="C0", op_label="smoother")
+    else:
+        for j in range(n_traj):
+            _posterior3d(axes[off + j], z, ts_np, filt[:, j], pi[:, j], lo, hi,
+                         f"posterior $p(z,t)$ traj {j}")
+    # mean +/- 2 std over time, traj 0: filter (red) and, when present, smoother (blue, tighter in the gap)
     j = 0; ax = axes[-1]
     m_op = (log_pi[:, j].exp() * z_grid).sum(-1).cpu().numpy()
     s_op = ((log_pi[:, j].exp() * z_grid ** 2).sum(-1).cpu().numpy() - m_op ** 2).clip(0) ** 0.5
     if gap.any():
         ax.axvspan(ts_np[gap][0], ts_np[gap][-1], color="gray", alpha=0.15, label="no obs")
-    ax.plot(ts_np, mean[:, j].cpu().numpy(), "k-", lw=2, label="exact mean")
-    ax.plot(ts_np, m_op, "C3--", lw=2, label="operator mean")
+    ax.plot(ts_np, mean[:, j].cpu().numpy(), "k-", lw=2, label="exact filter mean")
+    ax.plot(ts_np, m_op, "C3--", lw=2, label="filter mean")
     ax.fill_between(ts_np, m_op - 2 * s_op, m_op + 2 * s_op, color="C3", alpha=0.2)
+    if show_sm:
+        msm = m_sm[:, j].cpu().numpy(); ssm = s_sm[:, j].cpu().numpy()
+        ax.plot(ts_np, m_sm_ex[:, j].cpu().numpy(), color="0.4", ls="-", lw=1.5, label="exact smoother mean")
+        ax.plot(ts_np, msm, "C0--", lw=2, label="smoother mean")
+        ax.fill_between(ts_np, msm - 2 * ssm, msm + 2 * ssm, color="C0", alpha=0.2)
     ax.set_xlabel("$t$"); ax.set_ylabel("$z$"); ax.set_title("estimate traj 0"); ax.legend(fontsize=8)
     plt.tight_layout(); plt.savefig(img_path); plt.close()
 
@@ -159,7 +181,7 @@ def vis_learn(model, drift_net, xs_val, mask_val, filt_val, z_grid, ts, a, img_p
 @torch.no_grad()
 def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val, z_grid, ts,
               a, sigma, C_cur, d_cur, C_true, d_true, learn_obs, img_path, n_traj=2, s_scale=1.0,
-              g_scalar=None):
+              g_scalar=None, model_b=None, smoothed_val=None):
     """High-D Duncker panels with UNCERTAINTY BANDS everywhere and the drift/diffusion shown over the
     DATA REGIME only (the range the inferred latent actually visits). The drift/diffusion bands are the
     empirical +/-2 SE per z-bin -- wide where the latent rarely goes (cf. Duncker's GP uncertainty);
@@ -175,6 +197,13 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
     ex_s = (filt_val * z_grid ** 2).sum(-1).sub(ex_m ** 2).clamp_min(0).sqrt()
     recon = s_scale * C_cur * m_op[..., None] + d_cur                     # (T,B,D)
     nd = min(2, y_val.shape[-1])
+    # SMOOTHER marginal (when the backward operator is present): p(z_t|y_{0:T}) mean/std for the latent panel.
+    show_sm = model_b is not None and smoothed_val is not None
+    if show_sm:
+        from opssm.models.mstep import log_smoothed
+        pi_sm = log_smoothed(model, model_b, y_val, mask_val, z_grid).exp()
+        m_sm = (pi_sm * z_grid).sum(-1)                                   # (T,B)
+        s_sm = (pi_sm * z_grid ** 2).sum(-1).sub(m_sm ** 2).clamp_min(0).sqrt()
 
     # ---- empirical drift / diffusion with data-density (+/-2 SE) uncertainty ----
     zc = m_op[:-1].reshape(-1)
@@ -219,8 +248,12 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
         ax.plot(ts_np, exm, "C7-", lw=1.2, label="exact mean")
         ax.fill_between(ts_np, exm - 2 * exs, exm + 2 * exs, color="C7", alpha=0.18)
         mo = m_op[:, j].cpu().numpy(); so = s_op[:, j].cpu().numpy()
-        ax.plot(ts_np, mo, "r--", lw=2, label="operator mean")
+        ax.plot(ts_np, mo, "r--", lw=2, label="filter mean" if show_sm else "operator mean")
         ax.fill_between(ts_np, mo - 2 * so, mo + 2 * so, color="r", alpha=0.2)
+        if show_sm:                                                       # smoother: tighter band, less lag
+            msm = m_sm[:, j].cpu().numpy(); ssm = s_sm[:, j].cpu().numpy()
+            ax.plot(ts_np, msm, "C0--", lw=2, label="smoother mean")
+            ax.fill_between(ts_np, msm - 2 * ssm, msm + 2 * ssm, color="C0", alpha=0.2)
         ax.set_ylim(-1.7, 1.7); ax.set_title(f"latent $z$, traj {j}"); ax.set_xlabel("$t$")
         if j == 0:
             ax.legend(fontsize=8)

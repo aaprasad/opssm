@@ -214,10 +214,13 @@ class ZakaiFilterModule(pl.LightningModule):
         self.log_dict(logs, prog_bar=True)
         # figure
         img = os.path.join(h.train_dir, f"step_{self.global_step:05d}.pdf")
+        sm_val = getattr(dm, "smoothed_val", None) if h.learn_smoother else None
         if h.learn_obs:
             viz.vis_highd(self.model, self.drift_net, self.diff_net, x, mask, dm.z_val_true, filt,
                           self.z_grid, dm.ts, self.a, self.sigma, self.C_cur, self.d_cur,
-                          dm.C_true, dm.d_true, True, img, s_scale=self.s_scale, g_scalar=self.g_cur)
+                          dm.C_true, dm.d_true, True, img, s_scale=self.s_scale, g_scalar=self.g_cur,
+                          model_b=self.model_b, smoothed_val=sm_val)
         else:
             viz.vis_learn(self.model, self.drift_net, x, mask, filt, self.z_grid, dm.ts, self.a,
-                          img, diff_net=self.diff_net, sigma=self.sigma)
+                          img, diff_net=self.diff_net, sigma=self.sigma,
+                          model_b=self.model_b, smoothed_val=sm_val)
