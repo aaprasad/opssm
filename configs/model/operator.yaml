@@ -23,7 +23,10 @@ learn_dynamics: true
 learn_g: true
 g_net: false
 learn_obs: false
-pca_init: true
+pca_init: false          # HONEST default: learn the sensor direction C from a RANDOM init (the M-step
+                         #   recovers |cos|->1 from scratch). pca_init=true seeds C at the data's top-PC
+                         #   (~= the true sensor direction) -- a data-driven head start that trivially
+                         #   pre-solves the sensor, so it's not an honest test of sensor learning.
 c_stable_tol: 0.05
 meshfree_mean: true       # M-step E[z|y]: true = deterministic mesh-free fixed-node IS (default; scales to
                           #   high-D latent, drift/sensor good, g mildly over-estimated); false = grid quadrature
