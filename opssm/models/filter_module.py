@@ -211,8 +211,8 @@ class ZakaiFilterModule(pl.LightningModule):
         f_al = self.drift_net.drift(M)[0].reshape(-1, d) @ A
         f_true = self.a * (z_al - z_al ** 3)                            # <-- benchmark-specific true drift
         on = z_al.abs().le(1.5).all(-1)                                # true-scale data region
-        gscale = A.abs().reshape(-1)[0].item() if d == 1 else A.det().abs().pow(1.0 / d).item()  # |A| scale
-        out = {"s_fit": float(A.reshape(-1)[0]) if d == 1 else gscale,
+        gscale = A.det().abs().pow(1.0 / d).item()                      # |A|^(1/d): scalar |A| for 1-D, dxd det
+        out = {"s_fit": float(A.reshape(-1)[0]) if d == 1 else gscale,  # signed 1-D scale (viz) / geo-mean scale
                "lat_rmse": (M - Z).pow(2).sum(-1).mean().sqrt().item(),          # RAW (unaligned)
                "lat_rmse_aln": (z_al - Z).pow(2).sum(-1).mean().sqrt().item(),   # aligned
                "drift_l2_aln": (f_al[on] - f_true[on]).pow(2).sum(-1).mean().sqrt().item(),

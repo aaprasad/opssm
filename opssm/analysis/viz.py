@@ -284,11 +284,11 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
     ax = axes[1, 2]                                                      # diffusion in g (not g^2): natural scale
     g_emp = np.sqrt(np.clip(g2_emp, 0.0, None))                         # g = sqrt(g^2)
     g_emp_se = g2_se / (2.0 * np.clip(g_emp, 1e-3, None))               # delta method: SE(g)=SE(g^2)/(2g)
-    if diff_net is not None:
-        gc = s * np.sqrt(np.clip(diff_net._g2((z_grid / s).unsqueeze(-1)).squeeze(-1).cpu().numpy(), 0.0, None))
+    if diff_net is not None:                                             # g is a MAGNITUDE -> scale by |s|
+        gc = abs(s) * np.sqrt(np.clip(diff_net._g2((z_grid / s).unsqueeze(-1)).squeeze(-1).cpu().numpy(), 0.0, None))
         ax.plot(zg[inr], gc[inr], "C0-", lw=2, label=r"learned $g(z)$")
     elif g_scalar is not None:
-        ax.axhline(s * g_scalar, color="C0", lw=2, label=fr"learned $g={s * g_scalar:.3f}$")
+        ax.axhline(abs(s) * g_scalar, color="C0", lw=2, label=fr"learned $g={abs(s) * g_scalar:.3f}$")
     ax.fill_between(ctr, g_emp - 2 * g_emp_se, g_emp + 2 * g_emp_se, color="C1", alpha=0.25, label=r"empirical $\pm2$SE")
     ax.plot(ctr, g_emp, "C1.", ms=4)
     ax.axhline(sigma, ls="--", c="k", lw=2, label=fr"true $\sigma={sigma:.3f}$")
