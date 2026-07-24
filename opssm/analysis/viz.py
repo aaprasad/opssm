@@ -181,7 +181,7 @@ def vis_learn(model, drift_net, xs_val, mask_val, filt_val, z_grid, ts, a, img_p
 @torch.no_grad()
 def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val, z_grid, ts,
               a, sigma, C_cur, d_cur, C_true, d_true, learn_obs, img_path, n_traj=2, s_scale=1.0,
-              g_scalar=None, model_b=None, smoothed_val=None):
+              g_scalar=None, model_b=None, smoothed_val=None, s_fit=None, aligned=False):
     """High-D Duncker panels with UNCERTAINTY BANDS everywhere and the drift/diffusion shown over the
     DATA REGIME only (the range the inferred latent actually visits). The drift/diffusion bands are the
     empirical +/-2 SE per z-bin -- wide where the latent rarely goes (cf. Duncker's GP uncertainty);
@@ -204,11 +204,23 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
         pi_sm = log_smoothed(model, model_b, y_val, mask_val, z_grid).exp()
         m_sm = (pi_sm * z_grid).sum(-1)                                   # (T,B)
         s_sm = (pi_sm * z_grid ** 2).sum(-1).sub(m_sm ** 2).clamp_min(0).sqrt()
+    # RAW (s=1) vs PROCRUSTES-ALIGNED (s=s_fit) view: operator-z lives on the identifiable-up-to-scale gauge,
+    # so scale every operator-derived quantity (latent, drift, diffusion, p(z,t)) to the true frame. Called
+    # once aligned=False (raw) and once True (aligned) -> two side-by-side figures (report both, hide nothing).
+    s = float(s_fit) if (aligned and s_fit is not None) else 1.0
+    md = s * m_op                                                        # displayed latent mean (raw if s=1)
 
-    # ---- empirical drift / diffusion with data-density (+/-2 SE) uncertainty ----
-    zc = m_op[:-1].reshape(-1)
-    dz = ((m_op[1:] - m_op[:-1]) / dt).reshape(-1)
-    ft = 0.5 * (drift_net.net(m_op[:-1].reshape(-1, 1)) + drift_net.net(m_op[1:].reshape(-1, 1))).squeeze(-1)
+    def _push_density(p):                                                # p_op(m) -> p_z(z)=p_op(z/s)/s, traj 0
+        p0 = p[:, 0].cpu().numpy()
+        if s == 1.0:
+            return p0
+        pa = np.stack([np.interp(zg / s, zg, p0[t]) for t in range(p0.shape[0])]) / abs(s)
+        return pa / pa.sum(-1, keepdims=True).clip(1e-12)
+
+    # ---- empirical drift / diffusion with data-density (+/-2 SE) uncertainty (on the displayed scale) ----
+    zc = md[:-1].reshape(-1)
+    dz = ((md[1:] - md[:-1]) / dt).reshape(-1)
+    ft = s * 0.5 * (drift_net.net(m_op[:-1].reshape(-1, 1)) + drift_net.net(m_op[1:].reshape(-1, 1))).squeeze(-1)
     r2dt = (dz - ft) ** 2 * dt                                            # per-sample g^2 target
     zc = zc.cpu().numpy(); dz = dz.cpu().numpy(); r2dt = r2dt.cpu().numpy()
     lo, hi = -1.5, 1.5                                                    # fixed data-regime window (Duncker axes)
@@ -251,11 +263,11 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
         exm = ex_m[:, j].cpu().numpy(); exs = ex_s[:, j].cpu().numpy()
         ax.plot(ts_np, exm, "C7-", lw=1.2, label="exact mean")
         ax.fill_between(ts_np, exm - 2 * exs, exm + 2 * exs, color="C7", alpha=0.18)
-        mo = m_op[:, j].cpu().numpy(); so = s_op[:, j].cpu().numpy()
+        mo = md[:, j].cpu().numpy(); so = (abs(s) * s_op[:, j]).cpu().numpy()
         ax.plot(ts_np, mo, "r--", lw=2, label="filter mean" if show_sm else "operator mean")
         ax.fill_between(ts_np, mo - 2 * so, mo + 2 * so, color="r", alpha=0.2)
         if show_sm:                                                       # smoother: tighter band, less lag
-            msm = m_sm[:, j].cpu().numpy(); ssm = s_sm[:, j].cpu().numpy()
+            msm = (s * m_sm[:, j]).cpu().numpy(); ssm = (abs(s) * s_sm[:, j]).cpu().numpy()
             ax.plot(ts_np, msm, "C0--", lw=2, label="smoother mean")
             ax.fill_between(ts_np, msm - 2 * ssm, msm + 2 * ssm, color="C0", alpha=0.2)
         ax.set_ylim(-1.7, 1.7); ax.set_title(f"latent $z$, traj {j}"); ax.set_xlabel("$t$")
@@ -263,7 +275,8 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
             ax.legend(fontsize=8)
     ax = axes[0, 2]                                                      # C: drift over data regime + band
     ax.plot(zg[inr], (a * (z_grid - z_grid ** 3)).cpu().numpy()[inr], "k-", lw=2, label="true $a(z-z^3)$")
-    ax.plot(zg[inr], drift_net.drift(z_grid)[0].cpu().numpy()[inr], "C2--", lw=2, label=r"learned $f_\theta$")
+    ax.plot(zg[inr], (s * drift_net.drift(z_grid / s)[0]).cpu().numpy()[inr], "C2--", lw=2,
+            label=r"learned $f_\theta$")            # s*f_op(z/s): true-scale drift when aligned, raw when s=1
     ax.fill_between(ctr, f_emp - 2 * f_se, f_emp + 2 * f_se, color="C1", alpha=0.25, label=r"empirical $\pm2$SE")
     ax.plot(ctr, f_emp, "C1.", ms=4)
     ax.set_xlim(lo, hi); ax.set_ylim(-1.5, 1.5); ax.set_xlabel("$z$"); ax.set_ylabel("$f(z)$")
@@ -272,10 +285,10 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
     g_emp = np.sqrt(np.clip(g2_emp, 0.0, None))                         # g = sqrt(g^2)
     g_emp_se = g2_se / (2.0 * np.clip(g_emp, 1e-3, None))               # delta method: SE(g)=SE(g^2)/(2g)
     if diff_net is not None:
-        gc = np.sqrt(np.clip(diff_net._g2(z_grid.unsqueeze(-1)).squeeze(-1).cpu().numpy(), 0.0, None))
+        gc = s * np.sqrt(np.clip(diff_net._g2((z_grid / s).unsqueeze(-1)).squeeze(-1).cpu().numpy(), 0.0, None))
         ax.plot(zg[inr], gc[inr], "C0-", lw=2, label=r"learned $g(z)$")
     elif g_scalar is not None:
-        ax.axhline(g_scalar, color="C0", lw=2, label=fr"learned $g={g_scalar:.3f}$")
+        ax.axhline(s * g_scalar, color="C0", lw=2, label=fr"learned $g={s * g_scalar:.3f}$")
     ax.fill_between(ctr, g_emp - 2 * g_emp_se, g_emp + 2 * g_emp_se, color="C1", alpha=0.25, label=r"empirical $\pm2$SE")
     ax.plot(ctr, g_emp, "C1.", ms=4)
     ax.axhline(sigma, ls="--", c="k", lw=2, label=fr"true $\sigma={sigma:.3f}$")
@@ -298,11 +311,12 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
     ax.bar(ctr, dens, width=(hi - lo) / nb, color="gray", alpha=0.5)
     ax.set_xlim(lo, hi); ax.set_xlabel("$z$"); ax.set_ylabel("count")
     ax.set_title("latent occupancy (data density)")
-    # E: 3D posterior evolution p(z,t). Filter (red); with a smoother, a stacked SMOOTHER panel (blue,
-    # narrower through the dynamics), each vs its own oracle.
-    _posterior3d(ax3d, zg, ts_np, filt_val[:, 0].cpu().numpy(), pi[:, 0].cpu().numpy(),
+    # E: 3D posterior evolution p(z,t) -- OPERATOR density pushed to the frame (raw or aligned), vs its oracle.
+    _posterior3d(ax3d, zg, ts_np, filt_val[:, 0].cpu().numpy(), _push_density(pi),
                  lo, hi, ("filter $p(z,t)$ traj 0" if show_sm else "posterior $p(z,t)$ traj 0"))
     if show_sm:
-        _posterior3d(ax3d_s, zg, ts_np, smoothed_val[:, 0].cpu().numpy(), pi_sm[:, 0].cpu().numpy(),
+        _posterior3d(ax3d_s, zg, ts_np, smoothed_val[:, 0].cpu().numpy(), _push_density(pi_sm),
                      lo, hi, "smoother $p(z,t)$ traj 0", color="C0", op_label="smoother")
+    fig.suptitle("gauge-ALIGNED (operator -> true scale)" if s != 1.0 else "RAW (operator gauge)",
+                 fontsize=13, y=1.0)
     plt.tight_layout(); plt.savefig(img_path); plt.close()

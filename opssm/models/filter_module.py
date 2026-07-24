@@ -44,6 +44,14 @@ def _log_prior(z):
     return -0.5 * z ** 2                                       # log N(0,1) up to a constant
 
 
+def _interp1d(vals, grid, query):
+    """Batched 1-D linear interpolation: vals (..., Nz) on ascending grid (Nz,), query (Nq,) -> (..., Nq)."""
+    idx = torch.searchsorted(grid, query).clamp(1, grid.numel() - 1)
+    x0 = grid[idx - 1]; x1 = grid[idx]
+    w = ((query - x0) / (x1 - x0).clamp_min(1e-12)).clamp(0.0, 1.0)
+    return vals[..., idx - 1] * (1 - w) + vals[..., idx] * w
+
+
 class ZakaiFilterModule(pl.LightningModule):
     def __init__(self, data_size=1, gru_hidden=64, ctx_dim=64, p=64, drift_hidden=64,
                  lr=2e-3, drift_lr=2e-3, sched_gamma=0.9998,
@@ -181,6 +189,41 @@ class ZakaiFilterModule(pl.LightningModule):
         if out.get("ess") is not None:
             self.log("ess", out["ess"], prog_bar=True)                  # SNIS health diagnostic
 
+    @torch.no_grad()
+    def _gauge_aligned(self, log_pi, filt, m_op, z_true):
+        """PROCRUSTES-aligned metrics. A latent SDE with linear-Gaussian obs is identifiable only up to a
+        LINEAR-MAP gauge (z->A z, f->A f(A^-1 .), g->A g, s_scale absorbs it -- the data distribution is
+        unchanged), so scoring operator-z vs true-z on an absolute frame is ill-posed and inflates the gap.
+        Fit the best map A (least squares z_true ~ A m_op) and score in the aligned frame.
+          DIMENSION-AGNOSTIC (pure linear algebra, no grid): A is a SCALAR for a 1-D latent, a d x d matrix
+          for a multi-dim latent; `lat_rmse_aln` follows for any d.
+          1-D-MODEL-BOUND (guarded to d==1): drift/diffusion (the drift net is 1->1) and KL (needs the 1-D
+          grid oracle -- no analog for a multi-dim latent). These generalize by swapping in a d->d drift net
+          and a sample-based KL once the LATENT model goes multi-dim; the metric code is not the blocker."""
+        d = m_op.shape[-1] if m_op.dim() >= 3 else 1
+        M = m_op.reshape(-1, d); Z = z_true.reshape(-1, d)                # inferred vs true latent points (N,d)
+        A = torch.linalg.lstsq(M, Z).solution                            # (d,d): Z ~ M @ A  (scalar for 1-D)
+        z_al = M @ A                                                     # aligned latent at the inferred points
+        # aligned DRIFT (dimension-agnostic, mesh-free): evaluate f_op at the inferred points and map to the
+        # true frame  F = f_op @ A ; compare to the benchmark's true drift at z_al. Works for a 1-D double-well
+        # or a 2-D Van der Pol / 3-D Lorenz latent given a matching d->d drift net; the true-drift form below
+        # is the ONLY per-benchmark piece (double-well a(z-z^3) here -- swap for VdP/Lorenz's field).
+        f_al = self.drift_net.drift(M)[0].reshape(-1, d) @ A
+        f_true = self.a * (z_al - z_al ** 3)                            # <-- benchmark-specific true drift
+        on = z_al.abs().le(1.5).all(-1)                                # true-scale data region
+        gscale = A.abs().reshape(-1)[0].item() if d == 1 else A.det().abs().pow(1.0 / d).item()  # |A| scale
+        out = {"s_fit": float(A.reshape(-1)[0]) if d == 1 else gscale,
+               "lat_rmse": (M - Z).pow(2).sum(-1).mean().sqrt().item(),          # RAW (unaligned)
+               "lat_rmse_aln": (z_al - Z).pow(2).sum(-1).mean().sqrt().item(),   # aligned
+               "drift_l2_aln": (f_al[on] - f_true[on]).pow(2).sum(-1).mean().sqrt().item(),
+               "g_aln": gscale * float(self.g_cur)}                     # isotropic g scales by |A|^(1/d)
+        if d == 1:                                                       # KL: grid-bound (1-D oracle only)
+            s = float(A.reshape(-1)[0]); zg = self.z_grid
+            pi_al = _interp1d(log_pi.exp(), zg, zg / s).clamp_min(0) / abs(s)   # push posterior to true frame
+            pi_al = pi_al / pi_al.sum(-1, keepdim=True).clamp_min(1e-12)
+            out["kl_aln"] = kl_target_pred(filt, pi_al.clamp_min(1e-20).log()).item()
+        return out
+
     # -- validation: KL vs the exact filter, drift L2, C cos, + a figure -------------------------
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
@@ -207,6 +250,11 @@ class ZakaiFilterModule(pl.LightningModule):
         logs = {"kl": kl, "drift_l2": f_err, "drift_l2_off": f_err_off, "g": float(self.g_cur)}
         if h.learn_obs and dm.C_true is not None:
             logs["c_cos"] = abs(float(self.C_cur @ (dm.C_true / dm.C_true.norm())))
+        # PROCRUSTES gauge-aligned metrics (the well-posed ones; the raw kl/drift_l2/g are gauge-inflated).
+        s_fit = None
+        if h.learn_obs and dm.z_val_true is not None:
+            al = self._gauge_aligned(log_pi, filt, m_op, dm.z_val_true)
+            logs.update(al); s_fit = al["s_fit"]
         # smoother marginal KL vs the oracle smoother (the v1 gate): should track `kl`.
         if h.learn_smoother and getattr(dm, "smoothed_val", None) is not None:
             log_sm = log_smoothed(self.model, self.model_b, x, mask, self.z_grid)
@@ -216,10 +264,13 @@ class ZakaiFilterModule(pl.LightningModule):
         img = os.path.join(h.train_dir, f"step_{self.global_step:05d}.pdf")
         sm_val = getattr(dm, "smoothed_val", None) if h.learn_smoother else None
         if h.learn_obs:
-            viz.vis_highd(self.model, self.drift_net, self.diff_net, x, mask, dm.z_val_true, filt,
-                          self.z_grid, dm.ts, self.a, self.sigma, self.C_cur, self.d_cur,
-                          dm.C_true, dm.d_true, True, img, s_scale=self.s_scale, g_scalar=self.g_cur,
-                          model_b=self.model_b, smoothed_val=sm_val)
+            # RAW and PROCRUSTES-ALIGNED as two separate figures (report/plot both -- alignment hides nothing)
+            for al, tag in ([(False, "_raw"), (True, "_aligned")] if s_fit is not None else [(False, "")]):
+                viz.vis_highd(self.model, self.drift_net, self.diff_net, x, mask, dm.z_val_true, filt,
+                              self.z_grid, dm.ts, self.a, self.sigma, self.C_cur, self.d_cur,
+                              dm.C_true, dm.d_true, True, img.replace(".pdf", tag + ".pdf"),
+                              s_scale=self.s_scale, g_scalar=self.g_cur,
+                              model_b=self.model_b, smoothed_val=sm_val, s_fit=s_fit, aligned=al)
         else:
             viz.vis_learn(self.model, self.drift_net, x, mask, filt, self.z_grid, dm.ts, self.a,
                           img, diff_net=self.diff_net, sigma=self.sigma,
