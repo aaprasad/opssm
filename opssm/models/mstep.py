@@ -133,6 +133,37 @@ def smoother_pair_fixed(model, model_b, x, mask, center, drift_net, g_cur, dt,
     return zt, zt1, W
 
 
+def filter_pair_fixed(model, x, mask, center, drift_net, g_cur, dt,
+                      n_samples, near_std, broad_std, noise_std, decode=None):
+    """Deterministic fixed-node CRN FILTER lag-one joint p(z_t, z_{t+1} | y_{0:t+1}) -> the cross-covariance
+    that fixes the diffusion g, using ONLY the forward operator (no backward/smoother -- so it is CONSISTENT
+    with the filter-mean drift: one posterior feeds both moments). Proposal: z_t^k ~ q_t (fixed nodes);
+    z_{t+1}^k = z_t^k + f(z_t^k) dt + sqrt(g^2 dt) eps^k (fixed eps^k), so the proposal transition equals the
+    model K and CANCELS in the importance weight. The forward filter joint is proportional to
+    alpha_t(z_t) K(z_{t+1}|z_t) lik_{t+1}(z_{t+1}), hence
+        W_k = softmax_k( log alpha_t(z_t^k) - log q_t^k + loglik_{t+1}(z_{t+1}^k) )
+    (alpha_t = forward s=0; lik_{t+1} = the Gaussian obs likelihood at y_{t+1}, computed DIRECTLY from the
+    obs model -- stable, unlike the alpha/predict ratio, whose -loglik blows up in the tails). Returns
+    (zt, zt1, W) each (T-1,B,K) for fit_diffusion's square-then-average g."""
+    z, log_q = _fixed_nodes(center, mask, n_samples, near_std, broad_std)   # (T,B,K)
+    dev = z.device
+    gen = torch.Generator(device=dev).manual_seed(1)                       # FIXED transition noise (CRN)
+    eps = torch.randn(1, z.shape[1], z.shape[2], device=dev, generator=gen)  # shared across t
+    f_z = drift_net.drift(z)[0]                                            # (T,B,K) drift on nodes
+    z_next = z + f_z * dt + math.sqrt(max(float(g_cur), 1e-6) ** 2 * dt) * eps  # (T,B,K) ~ K(.|z)
+    zt, zt1 = z[:-1], z_next[:-1]                                          # pair (t, t+1) samples
+    ctx_f = model.context(x, mask)
+    b0_f = model.coeffs(ctx_f, torch.zeros(1, device=dev))[:, :, 0]        # (T,B,p) forward s=0
+    l_alpha = torch.einsum("tbp,tbkp->tbk", b0_f[:-1], model.trunk(zt.unsqueeze(-1))) + model.bias
+    xnext = x[1:]                                                          # obs at t+1
+    if decode is None:                                                    # 1-D direct obs h(z)=z
+        loglik = -0.5 * (xnext[..., 0].unsqueeze(-1) - zt1) ** 2 / noise_std ** 2   # (T-1,B,K)
+    else:                                                                 # high-D: h(z) = s C z + d
+        loglik = -0.5 * ((xnext.unsqueeze(2) - decode(zt1)) ** 2).sum(-1) / noise_std ** 2
+    W = torch.softmax((l_alpha - log_q[:-1]) + loglik, dim=-1)            # (T-1,B,K)
+    return zt, zt1, W
+
+
 @torch.no_grad()
 def log_smoothed(model, model_b, x, mask, z_grid):
     """Neural SMOOTHER marginal log p(z_t | y_{0:T}) on a grid, via the numerically STABLE predict*msg
@@ -170,10 +201,25 @@ def fit_drift(drift_net, dr_opt, zc, dz, z_reg, hr, reg_lambda, m_inner):
 
 
 def fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,
-                  g_net, reg_lambda_g, m_inner):
+                  g_net, reg_lambda_g, m_inner, pair=None):
     """Diffusion from the increment residual after the trapezoidal drift
     (r = dz - 1/2(f(z_t)+f(z_t+1))). g_net=True fits a g^2(z) network on the per-sample target
-    dt*r^2 with an H2 penalty; else a constant scalar. Returns the scalar g summary."""
+    dt*r^2 with an H2 penalty; else a constant scalar. Returns the scalar g summary.
+
+    `pair` (zt, zt1, W) from filter_pair_fixed switches to the CORRECT square-then-average estimator:
+        g^2 = (1/dt) mean_pairs sum_k W_k (z_{t+1}^k - z_t^k - 1/2(f_k+f'_k) dt)^2.
+    The default path below uses the increment of the filter MEAN (E[z_{t+1}]-E[z_t]), which drops the
+    increment VARIANCE and so under-reads g (~0.54 vs 0.60 high-D). The pair path averages the SQUARED
+    per-sample residual over the lag-one joint, recovering E[(Δz)^2|y] = (Δmean)^2 + Var_t + Var_{t+1}
+    - 2 Cov -- the hidden-state form of the NKE covariance-increment diffusion loss. Scalar g."""
+    if pair is not None:                                            # lag-one joint square-then-average g
+        zt, zt1, W = pair
+        with torch.no_grad():
+            f_t = drift_net.net(zt.unsqueeze(-1)).squeeze(-1)
+            f_t1 = drift_net.net(zt1.unsqueeze(-1)).squeeze(-1)
+        res = zt1 - zt - 0.5 * (f_t + f_t1) * dt                    # (T-1,B,K) trapezoidal residual
+        g2 = (W * res ** 2).sum(-1).mean() / dt                    # W-weighted mean over the joint
+        return float(g2.sqrt().clamp(min=0.05))
     with torch.no_grad():
         f_trap = 0.5 * (drift_net.net(zc.unsqueeze(-1)).squeeze(-1)
                         + drift_net.net(zc_next.unsqueeze(-1)).squeeze(-1))
@@ -212,17 +258,30 @@ def fit_obs_map_stiefel(z_hat, y, s_scale, C_cur):
 def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg, hr, *,
           learn_g, g_net, reg_lambda, reg_lambda_g, m_inner,
           learn_obs=False, c_stable_tol=0.05, C_cur=None, d_cur=None, s_scale=1.0,
-          meshfree_mean=False, n_mean=256, near_std=0.3, broad_std=1.6):
+          meshfree_mean=False, n_mean=256, near_std=0.3, broad_std=1.6,
+          joint_g=False, noise_std=None, g_cur_in=None):
     """One EM M-step. Order: posterior-mean increments -> (high-D) Stiefel obs-map + cstab ->
     drift GATED on `cstab < c_stable_tol` -> diffusion. In 1-D (learn_obs=False) cstab==0, so the
     gate is always open and this reduces to the plain f,g M-step. `meshfree_mean` replaces the grid
-    E[z|y] with the SNIS estimate (no z_grid). Returns updated {g_cur, C_cur, d_cur, cstab}."""
+    E[z|y] with the SNIS estimate (no z_grid).
+
+    `joint_g` estimates g from the FILTER lag-one joint (filter_pair_fixed) instead of the filter-MEAN
+    increment -- the mean drops the increment variance and under-reads g (~0.54 vs 0.60 high-D); the
+    joint's square-then-average residual recovers it. DRIFT still uses the filter mean (the smoother mean
+    is the wrong, over-smoothed drift target), so ONE posterior (the forward filter) feeds both moments.
+    Returns updated {g_cur, C_cur, d_cur, cstab}."""
     ess = None
+    center = (zhat_from_obs(x, C_cur, d_cur) / s_scale) if learn_obs else x[..., 0]
     if meshfree_mean:                                                 # grid-free E[z|y] via deterministic fixed-node mean
-        center = (zhat_from_obs(x, C_cur, d_cur) / s_scale) if learn_obs else x[..., 0]
         z_hat, ess = posterior_mean_fixed(model, x, mask, center, n_mean, near_std, broad_std)
     else:
         z_hat = posterior_mean(model, x, mask, z_grid)                # (T, B)
+    pair = None                                                       # filter lag-one joint for g (drift stays on the mean)
+    if joint_g and learn_g:
+        decode = (lambda z: s_scale * C_cur * z[..., None] + d_cur) if learn_obs else None
+        pair = filter_pair_fixed(model, x, mask, center, drift_net,
+                                 g_cur_in if g_cur_in is not None else 0.5, dt,
+                                 n_mean, near_std, broad_std, noise_std, decode)
     m = mask[..., 0]
     valid = (m[:-1] * m[1:]).bool()                                   # data-anchored increments
     zc = z_hat[:-1][valid]
@@ -237,5 +296,5 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
     g_cur = None
     if learn_g:
         g_cur = fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,
-                              g_net, reg_lambda_g, m_inner)
+                              g_net, reg_lambda_g, m_inner, pair=pair)
     return dict(g_cur=g_cur, C_cur=C_cur, d_cur=d_cur, cstab=cstab, ess=ess)
