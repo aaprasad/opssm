@@ -18,9 +18,15 @@ import torch
 
 
 def zhat_from_obs(y, C, d):
-    """Pseudo-inverse latent estimate z_hat = C^+ (y - d) per (T,B) -- the collocation center."""
-    return ((y - d) * C).sum(-1) / (C * C).sum().clamp_min(1e-8)
+    """Pseudo-inverse latent estimate z_hat = (C^T C)^-1 C^T (y - d) -> (...,d_lat). C (D,d_lat),
+    y (...,D). On the Stiefel manifold C^T C = I so this is C^T(y-d); the solve is kept for robustness
+    at random init. The collocation / M-step center."""
+    r = torch.einsum("od,...o->...d", C, y - d)                    # C^T (y-d)  (...,d_lat)
+    gram = C.t() @ C                                               # (d_lat,d_lat)
+    return torch.linalg.solve(gram, r.unsqueeze(-1)).squeeze(-1)   # (C^T C)^-1 C^T (y-d)
 
 
-def make_decode(C, d, s_scale):
-    return lambda z: s_scale * C * z[..., None] + d
+def make_decode(C, d):
+    """h(z) = C z + d, C (D,d_lat), z (...,d_lat) -> (...,D). Obs are standardized to ~unit scale at the
+    dataloader level, so the decode carries no separate obs-scale factor (s_scale removed)."""
+    return lambda z: torch.einsum("od,...d->...o", C, z) + d

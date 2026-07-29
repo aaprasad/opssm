@@ -1,0 +1,21 @@
+_target_: opssm.data.doublewell.datamodule.DoubleWellDataModule
+system: vanderpol     # 2-D limit-cycle latent (drift from the systems registry); selects the multi-D path
+a: 1.0                # double-well knob; unused for VdP (true drift comes from the registry) -- kept for compat
+sigma: 0.3            # TRUE latent process-noise scale (isotropic g); the learned g_cur should recover it
+noise_std: 0.3        # observation noise on the D-dim linear sensor
+num_steps: 200        # ~3 limit-cycle periods at dt=0.1
+t0: 0.0
+t1: 20.0
+batch_size: 128      # halved vs the double-well (the d=2 M-step readouts are (T,B,K,p); 128 traj x 200
+                     #   steps is still plenty for the drift/sensor regression) -- keeps peak memory modest
+n_val: 32
+n_sub: 5              # Euler-Maruyama substeps -> inner dt = 0.02 (stable for mu=1.5)
+Nz: 200              # grid knobs unused for d>1 (no O(N^d) grid oracle) -- kept for compat
+zmax: 3.0
+num_iters: ${trainer.max_steps}
+highd: false          # the multi-D branch is selected by system != doublewell, not by highd
+obs_dim: 10           # sensor dim D
+c_scale: 1.0
+init_std: 1.0         # initial-condition spread; burn_in settles trajectories onto the limit cycle
+burn_in: 50
+train_dir: ${train_dir}

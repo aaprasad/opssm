@@ -1,0 +1,20 @@
+_target_: opssm.data.doublewell.datamodule.DoubleWellDataModule
+system: lorenz       # 3-D chaotic attractor (drift from the systems registry); selects the multi-D path
+a: 1.0               # double-well knob; unused for Lorenz -- kept for datamodule compat
+sigma: 3.0           # TRUE latent process-noise scale (isotropic g); mild vs the ~90-magnitude drift
+noise_std: 2.0       # observation noise on the D-dim linear sensor (raw units; obs per-dim std ~14)
+num_steps: 200       # t in [0,20]; ~15 wing-switches per trajectory -> good attractor coverage
+t0: 0.0
+t1: 20.0
+batch_size: 128      # d=3 M-step readouts are (T,B,K,p) -- keep B modest for memory
+n_val: 32
+n_sub: 10            # Euler-Maruyama substeps -> inner dt = 0.01 (Lorenz-stable)
+Nz: 200             # grid knobs unused for d>1 (no O(N^d) grid oracle) -- kept for compat
+zmax: 3.0
+num_iters: ${trainer.max_steps}
+highd: false          # the multi-D branch is selected by system != doublewell
+obs_dim: 10           # sensor dim D (10 sensors observing the 3-D latent -> over-determined)
+c_scale: 1.0
+init_std: 1.0         # burn_in sub-integrates onto the attractor before the recorded window
+burn_in: 50
+train_dir: ${train_dir}

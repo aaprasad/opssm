@@ -25,7 +25,7 @@ import math
 
 import torch
 
-from opssm.models.obs import zhat_from_obs
+from opssm.models.obs import make_decode, zhat_from_obs
 
 
 @torch.no_grad()
@@ -40,24 +40,24 @@ def _fixed_nodes(center, mask, n_samples, near_std, broad_std):
     """FIXED-seed CRN proposal nodes shared across t -- the deterministic-readout building block reused
     by posterior_mean_fixed / smoother_mean_fixed / smoother_pair_fixed. Half near the data-following
     center (near_std), half broad (broad_std); nodes are per-t via the near center but the seed is fixed
-    so they are reused every M-step (no fresh randomness). Returns (z (T,B,K), log_q (T,B,K))."""
-    T, B = center.shape
+    so they are reused every M-step (no fresh randomness). Returns (z (T,B,K,d), log_q (T,B,K))."""
+    T, B, d = center.shape
     dev = center.device
     gen = torch.Generator(device=dev).manual_seed(0)                 # FIXED nodes -> deterministic readout
     obs = mask[..., 0]
-    c = center * obs
-    near_sd = (near_std * obs + broad_std * (1.0 - obs)).unsqueeze(-1)
+    c = center * obs.unsqueeze(-1)                                   # (T,B,d)
+    near_sd = (near_std * obs + broad_std * (1.0 - obs))             # (T,B)
     Kn = n_samples // 2
     Kb = n_samples - Kn
-    eps_n = torch.randn(1, B, Kn, device=dev, generator=gen)         # shared across t (CRN) + fixed seed
-    eps_b = torch.randn(1, B, Kb, device=dev, generator=gen)
-    near = c.unsqueeze(-1) + near_sd * eps_n
-    broad = (broad_std * eps_b).expand(T, B, Kb)
-    z = torch.cat([near, broad], dim=-1)                            # (T,B,K)
-    c2 = math.log(2.0) + 0.5 * math.log(2 * math.pi)
-    lqn = -0.5 * ((z - c.unsqueeze(-1)) / near_sd) ** 2 - near_sd.log() - c2
-    lqb = -0.5 * (z / broad_std) ** 2 - math.log(broad_std) - c2
-    log_q = torch.logaddexp(lqn, lqb)
+    eps_n = torch.randn(1, B, Kn, d, device=dev, generator=gen)      # shared across t (CRN) + fixed seed
+    eps_b = torch.randn(1, B, Kb, d, device=dev, generator=gen)
+    near = c.unsqueeze(2) + near_sd[..., None, None] * eps_n         # (T,B,Kn,d)
+    broad = (broad_std * eps_b).expand(T, B, Kb, d)
+    z = torch.cat([near, broad], dim=2)                            # (T,B,K,d)
+    off = math.log(2.0) + 0.5 * d * math.log(2 * math.pi)
+    lqn = -0.5 * ((z - c.unsqueeze(2)) / near_sd[..., None, None]).pow(2).sum(-1) - d * near_sd[..., None].log() - off
+    lqb = -0.5 * (z / broad_std).pow(2).sum(-1) - d * math.log(broad_std) - off
+    log_q = torch.logaddexp(lqn, lqb)                              # (T,B,K)
     return z, log_q
 
 
@@ -69,14 +69,14 @@ def posterior_mean_fixed(model, x, mask, center, n_samples, near_std, broad_std)
     uniform grid. No fresh per-M-step randomness => no readout noise (the SNIS blowup was the fresh
     per-step sampling noise; fixing the nodes removes it while keeping the MEAN, unlike the mode).
     Returns (z_hat (T,B), ess_frac)."""
-    z, log_q = _fixed_nodes(center, mask, n_samples, near_std, broad_std)
+    z, log_q = _fixed_nodes(center, mask, n_samples, near_std, broad_std)   # (T,B,K,d)
     ctx = model.context(x, mask)
     b0 = model.coeffs(ctx, torch.zeros(1, device=z.device))[:, :, 0]  # (T,B,p) at s=0
-    tau = model.trunk(z.unsqueeze(-1))                              # (T,B,K,p)
+    tau = model.trunk(z)                                           # (T,B,K,p)  (z already (...,d))
     ell = torch.einsum("tbp,tbkp->tbk", b0, tau) + model.bias       # (T,B,K)
     w = torch.softmax(ell - log_q, dim=-1)                          # SNIS weights
-    ess = 1.0 / (w.pow(2).sum(-1) * z.shape[-1])                    # (T,B) fraction
-    return (w * z).sum(-1), float(ess.mean())                       # (T,B), scalar
+    ess = 1.0 / (w.pow(2).sum(-1) * z.shape[2])                     # (T,B) fraction (K = z.shape[2])
+    return (w.unsqueeze(-1) * z).sum(2), float(ess.mean())          # (T,B,d), scalar
 
 
 @torch.no_grad()
@@ -88,21 +88,21 @@ def smoother_mean_fixed(model, model_b, x, mask, center, n_samples, near_std, br
       log msg_t     = backward operator s=0 (= log p(y_{t:T}|z_t)).
     Unlike the FILTER mean, the smoother mean is a proper state estimate, so the midpoint/trapezoidal drift
     correction becomes valid on its increments (v2 M-step). Returns (z_hat (T,B), ess_frac)."""
-    z, log_q = _fixed_nodes(center, mask, n_samples, near_std, broad_std)
+    z, log_q = _fixed_nodes(center, mask, n_samples, near_std, broad_std)   # (T,B,K,d)
     dev = z.device
     ctx_f = model.context(x, mask)
     ctx_b = model_b.context(x, mask)
-    tau_f = model.trunk(z.unsqueeze(-1))                            # (T,B,K,p) forward basis on nodes
-    tau_b = model_b.trunk(z.unsqueeze(-1))                          # (T,B,K,p) backward basis (own weights)
+    tau_f = model.trunk(z)                                          # (T,B,K,p) forward basis on nodes
+    tau_b = model_b.trunk(z)                                        # (T,B,K,p) backward basis (own weights)
     b1_f = model.coeffs(ctx_f, torch.ones(1, device=dev))[:, :, 0]  # (T,B,p) forward s=1 coeffs
-    log_pred = torch.empty_like(z)                                  # (T,B,K)
-    log_pred[0] = -0.5 * z[0] ** 2                                  # predict_0 = prior N(0,1) on node_0
+    log_pred = torch.empty(z.shape[:3], device=dev)                # (T,B,K)
+    log_pred[0] = -0.5 * z[0].pow(2).sum(-1)                       # predict_0 = prior N(0,I) on node_0
     log_pred[1:] = torch.einsum("tbp,tbkp->tbk", b1_f[:-1], tau_f[1:]) + model.bias  # predict_t on node_t
     b0_b = model_b.coeffs(ctx_b, torch.zeros(1, device=dev))[:, :, 0]   # (T,B,p) backward s=0
     lmsg = torch.einsum("tbp,tbkp->tbk", b0_b, tau_b) + model_b.bias    # (T,B,K) log msg_t on node_t
     w = torch.softmax(log_pred + lmsg - log_q, dim=-1)
-    ess = 1.0 / (w.pow(2).sum(-1) * z.shape[-1])
-    return (w * z).sum(-1), float(ess.mean())
+    ess = 1.0 / (w.pow(2).sum(-1) * z.shape[2])
+    return (w.unsqueeze(-1) * z).sum(2), float(ess.mean())
 
 
 @torch.no_grad()
@@ -117,18 +117,18 @@ def smoother_pair_fixed(model, model_b, x, mask, center, drift_net, g_cur, dt,
     so no tail blow-up. Returns (zt, zt1, W) each (T-1,B,K): joint samples + weights for fit_diffusion's
     square-then-average g^2 = (1/dt) mean_pairs sum_k W_k (Δz^k - 1/2(f_k+f'_k) dt)^2. CRN (fixed nodes +
     fixed eps) makes this g deterministic across M-steps (no stochastic-FFBS runaway)."""
-    z, log_q = _fixed_nodes(center, mask, n_samples, near_std, broad_std)   # (T,B,K)
+    z, log_q = _fixed_nodes(center, mask, n_samples, near_std, broad_std)   # (T,B,K,d)
     dev = z.device
     gen = torch.Generator(device=dev).manual_seed(1)                       # FIXED transition noise (CRN)
-    eps = torch.randn(1, z.shape[1], z.shape[2], device=dev, generator=gen)  # shared across t
-    f_z = drift_net.drift(z)[0]                                            # (T,B,K) drift on nodes
-    z_next = z + f_z * dt + math.sqrt(max(float(g_cur), 1e-6) ** 2 * dt) * eps  # (T,B,K) ~ K(.|z)
+    eps = torch.randn(1, z.shape[1], z.shape[2], z.shape[3], device=dev, generator=gen)  # (1,B,K,d)
+    f_z = drift_net.drift(z)[0]                                            # (T,B,K,d) drift on nodes
+    z_next = z + f_z * dt + math.sqrt(max(float(g_cur), 1e-6) ** 2 * dt) * eps  # (T,B,K,d) ~ K(.|z)
     zt, zt1 = z[:-1], z_next[:-1]                                          # pair (t, t+1) samples
     ctx_f = model.context(x, mask); ctx_b = model_b.context(x, mask)
     b0_f = model.coeffs(ctx_f, torch.zeros(1, device=dev))[:, :, 0]        # (T,B,p) forward s=0
     b0_b = model_b.coeffs(ctx_b, torch.zeros(1, device=dev))[:, :, 0]      # (T,B,p) backward s=0
-    l_alpha = torch.einsum("tbp,tbkp->tbk", b0_f[:-1], model.trunk(zt.unsqueeze(-1))) + model.bias
-    l_msg1 = torch.einsum("tbp,tbkp->tbk", b0_b[1:], model_b.trunk(zt1.unsqueeze(-1))) + model_b.bias
+    l_alpha = torch.einsum("tbp,tbkp->tbk", b0_f[:-1], model.trunk(zt)) + model.bias
+    l_msg1 = torch.einsum("tbp,tbkp->tbk", b0_b[1:], model_b.trunk(zt1)) + model_b.bias
     W = torch.softmax((l_alpha - log_q[:-1]) + l_msg1, dim=-1)             # (T-1,B,K)
     return zt, zt1, W
 
@@ -145,19 +145,19 @@ def filter_pair_fixed(model, x, mask, center, drift_net, g_cur, dt,
     (alpha_t = forward s=0; lik_{t+1} = the Gaussian obs likelihood at y_{t+1}, computed DIRECTLY from the
     obs model -- stable, unlike the alpha/predict ratio, whose -loglik blows up in the tails). Returns
     (zt, zt1, W) each (T-1,B,K) for fit_diffusion's square-then-average g."""
-    z, log_q = _fixed_nodes(center, mask, n_samples, near_std, broad_std)   # (T,B,K)
+    z, log_q = _fixed_nodes(center, mask, n_samples, near_std, broad_std)   # (T,B,K,d)
     dev = z.device
     gen = torch.Generator(device=dev).manual_seed(1)                       # FIXED transition noise (CRN)
-    eps = torch.randn(1, z.shape[1], z.shape[2], device=dev, generator=gen)  # shared across t
-    f_z = drift_net.drift(z)[0]                                            # (T,B,K) drift on nodes
-    z_next = z + f_z * dt + math.sqrt(max(float(g_cur), 1e-6) ** 2 * dt) * eps  # (T,B,K) ~ K(.|z)
+    eps = torch.randn(1, z.shape[1], z.shape[2], z.shape[3], device=dev, generator=gen)  # (1,B,K,d)
+    f_z = drift_net.drift(z)[0]                                            # (T,B,K,d) drift on nodes
+    z_next = z + f_z * dt + math.sqrt(max(float(g_cur), 1e-6) ** 2 * dt) * eps  # (T,B,K,d) ~ K(.|z)
     zt, zt1 = z[:-1], z_next[:-1]                                          # pair (t, t+1) samples
     ctx_f = model.context(x, mask)
     b0_f = model.coeffs(ctx_f, torch.zeros(1, device=dev))[:, :, 0]        # (T,B,p) forward s=0
-    l_alpha = torch.einsum("tbp,tbkp->tbk", b0_f[:-1], model.trunk(zt.unsqueeze(-1))) + model.bias
-    xnext = x[1:]                                                          # obs at t+1
-    if decode is None:                                                    # 1-D direct obs h(z)=z
-        loglik = -0.5 * (xnext[..., 0].unsqueeze(-1) - zt1) ** 2 / noise_std ** 2   # (T-1,B,K)
+    l_alpha = torch.einsum("tbp,tbkp->tbk", b0_f[:-1], model.trunk(zt)) + model.bias
+    xnext = x[1:]                                                          # obs at t+1 (T-1,B,D)
+    if decode is None:                                                    # direct obs h(z)=z (D=d)
+        loglik = -0.5 * ((xnext.unsqueeze(2) - zt1) ** 2).sum(-1) / noise_std ** 2   # (T-1,B,K)
     else:                                                                 # high-D: h(z) = s C z + d
         loglik = -0.5 * ((xnext.unsqueeze(2) - decode(zt1)) ** 2).sum(-1) / noise_std ** 2
     W = torch.softmax((l_alpha - log_q[:-1]) + loglik, dim=-1)            # (T-1,B,K)
@@ -186,16 +186,17 @@ def log_smoothed(model, model_b, x, mask, z_grid):
     return log_g - torch.logsumexp(log_g, dim=-1, keepdim=True)
 
 
-def fit_drift(drift_net, dr_opt, zc, dz, z_reg, hr, reg_lambda, m_inner):
-    """Regress f_theta(z) ~ dz with an H2 (curvature) smoothness penalty. Updates drift_net in place."""
+def fit_drift(drift_net, dr_opt, zc, dz, reg_lambda, m_inner):
+    """Regress f_theta(z) ~ dz (d-D: fit ||f - dz||^2 over d). Smoothness via L2 weight decay on the net
+    -- the 1-D finite-diff H2 grid penalty has no mesh-free d-D analog (a sampled-point Jacobian-norm
+    penalty is a future option). Updates drift_net in place. zc, dz: (N,d)."""
     drift_net.requires_grad_(True)
     for _ in range(m_inner):
         dr_opt.zero_grad()
-        f = drift_net.net(zc.unsqueeze(-1)).squeeze(-1)
-        fit = ((f - dz) ** 2).mean()
-        fr = drift_net.net(z_reg.unsqueeze(-1)).squeeze(-1)
-        f_pp = (fr[2:] - 2 * fr[1:-1] + fr[:-2]) / hr ** 2
-        (fit + reg_lambda * (f_pp ** 2).mean()).backward()
+        f = drift_net.net(zc)                                       # (N,d)
+        fit = ((f - dz) ** 2).sum(-1).mean()
+        reg = sum(p.pow(2).sum() for p in drift_net.net.parameters())
+        (fit + reg_lambda * reg).backward()
         dr_opt.step()
     drift_net.requires_grad_(False)
 
@@ -213,24 +214,25 @@ def fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,
     per-sample residual over the lag-one joint, recovering E[(Δz)^2|y] = (Δmean)^2 + Var_t + Var_{t+1}
     - 2 Cov -- the hidden-state form of the NKE covariance-increment diffusion loss. Scalar g."""
     if pair is not None:                                            # lag-one joint square-then-average g
-        zt, zt1, W = pair
+        zt, zt1, W = pair                                          # zt,zt1 (T-1,B,K,d); W (T-1,B,K)
         with torch.no_grad():
-            f_t = drift_net.net(zt.unsqueeze(-1)).squeeze(-1)
-            f_t1 = drift_net.net(zt1.unsqueeze(-1)).squeeze(-1)
-        res = zt1 - zt - 0.5 * (f_t + f_t1) * dt                    # (T-1,B,K) trapezoidal residual
-        g2 = (W * res ** 2).sum(-1).mean() / dt                    # W-weighted mean over the joint
-        return float(g2.sqrt().clamp(min=0.05))
+            f_t = drift_net.net(zt)                                # (T-1,B,K,d)
+            f_t1 = drift_net.net(zt1)
+        res = zt1 - zt - 0.5 * (f_t + f_t1) * dt                   # (T-1,B,K,d) trapezoidal residual
+        dcnt = res.shape[-1]
+        g2 = (W * res.pow(2).sum(-1)).sum(-1).mean() / (dt * dcnt) # isotropic: E[|res|^2]/(d dt)
+        return float(g2.detach().sqrt().clamp(min=0.05))
     with torch.no_grad():
-        f_trap = 0.5 * (drift_net.net(zc.unsqueeze(-1)).squeeze(-1)
-                        + drift_net.net(zc_next.unsqueeze(-1)).squeeze(-1))
-    r = dz - f_trap
-    if g_net:
-        target_g2 = dt * r ** 2
+        f_trap = 0.5 * (drift_net.net(zc) + drift_net.net(zc_next))  # (N,d)
+    r = dz - f_trap                                               # (N,d)
+    dcnt = r.shape[-1]
+    if g_net:                                                     # state-dependent g^2(z) -- 1-D only for now
+        target_g2 = dt * r.pow(2).sum(-1, keepdim=True)           # (N,1)  (d==1)
         diff_net.requires_grad_(True)
         for _ in range(m_inner):
             dg_opt.zero_grad()
-            g2p = diff_net._g2(zc.unsqueeze(-1)).squeeze(-1)
-            g2r = diff_net._g2(z_reg.unsqueeze(-1)).squeeze(-1)
+            g2p = diff_net._g2(zc)                                # (N,1)
+            g2r = diff_net._g2(z_reg.unsqueeze(-1)).squeeze(-1)   # 1-D reg grid
             g2_pp = (g2r[2:] - 2 * g2r[1:-1] + g2r[:-2]) / hr ** 2
             (((g2p - target_g2) ** 2).mean()
              + reg_lambda_g * (g2_pp ** 2).mean()).backward()
@@ -238,26 +240,30 @@ def fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,
         diff_net.requires_grad_(False)
         with torch.no_grad():
             return float(diff_net._g2(z_reg.unsqueeze(-1)).clamp(min=1e-6).sqrt().mean())
-    return float((r.pow(2).mean() * dt).sqrt().clamp(min=0.05))
+    return float((r.pow(2).sum(-1).mean() * dt / dcnt).sqrt().clamp(min=0.05))
 
 
 @torch.no_grad()
-def fit_obs_map_stiefel(z_hat, y, s_scale, C_cur):
-    """High-D Stiefel observation map (orthogonal Procrustes): C = unit direction of the
-    cross-covariance of y and the inferred latent; the scale s is FIXED (no runaway) and d is the
-    intercept. Returns (C_new, d_new, cstab) with cstab = 1 - |cos(C_new, C_cur)| (the gate signal)."""
-    zf = z_hat.reshape(-1)
-    yf = y.reshape(-1, y.shape[-1])
-    M = ((yf - yf.mean(0)) * (zf - zf.mean())[:, None]).sum(0)          # cross-cov (D,)
-    C_new = M / M.norm().clamp_min(1e-8)
-    cstab = 1.0 - abs(float(C_new @ C_cur))
-    d_new = yf.mean(0) - s_scale * C_new * zf.mean()
+def fit_obs_map_stiefel(z_hat, y, C_cur):
+    """High-D Stiefel observation map (orthogonal Procrustes): C = unit direction of the cross-covariance
+    of y and the inferred latent; d is the intercept. Obs are standardized upstream so the decode has no
+    scale factor (h(z) = C z + d). z_hat (T,B,d), y (T,B,D), C_cur (D,d). C = nearest orthonormal-columns
+    matrix to the D x d cross-cov via SVD (C = U V^T); cstab = 1 - mean principal-angle cosine."""
+    d = z_hat.shape[-1]
+    Z = z_hat.reshape(-1, d)
+    Y = y.reshape(-1, y.shape[-1])
+    M = (Y - Y.mean(0)).t() @ (Z - Z.mean(0))                          # (D,d) cross-cov
+    U, _, Vt = torch.linalg.svd(M, full_matrices=False)               # U (D,d), Vt (d,d)
+    C_new = U @ Vt                                                    # (D,d) Stiefel (orthonormal cols)
+    cos = torch.linalg.svdvals(C_new.t() @ C_cur).clamp(max=1.0)      # principal-angle cosines (d,)
+    cstab = 1.0 - float(cos.mean())
+    d_new = Y.mean(0) - C_new @ Z.mean(0)                            # (D,) intercept
     return C_new, d_new, cstab
 
 
 def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg, hr, *,
           learn_g, g_net, reg_lambda, reg_lambda_g, m_inner,
-          learn_obs=False, c_stable_tol=0.05, C_cur=None, d_cur=None, s_scale=1.0,
+          learn_obs=False, c_stable_tol=0.05, C_cur=None, d_cur=None,
           meshfree_mean=False, n_mean=256, near_std=0.3, broad_std=1.6,
           joint_g=False, noise_std=None, g_cur_in=None):
     """One EM M-step. Order: posterior-mean increments -> (high-D) Stiefel obs-map + cstab ->
@@ -271,28 +277,28 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
     is the wrong, over-smoothed drift target), so ONE posterior (the forward filter) feeds both moments.
     Returns updated {g_cur, C_cur, d_cur, cstab}."""
     ess = None
-    center = (zhat_from_obs(x, C_cur, d_cur) / s_scale) if learn_obs else x[..., 0]
+    center = zhat_from_obs(x, C_cur, d_cur) if learn_obs else x       # (T,B,d) (obs standardized upstream)
     if meshfree_mean:                                                 # grid-free E[z|y] via deterministic fixed-node mean
         z_hat, ess = posterior_mean_fixed(model, x, mask, center, n_mean, near_std, broad_std)
     else:
-        z_hat = posterior_mean(model, x, mask, z_grid)                # (T, B)
+        z_hat = posterior_mean(model, x, mask, z_grid)                # (T, B) -- 1-D grid only
     pair = None                                                       # filter lag-one joint for g (drift stays on the mean)
     if joint_g and learn_g:
-        decode = (lambda z: s_scale * C_cur * z[..., None] + d_cur) if learn_obs else None
+        decode = make_decode(C_cur, d_cur) if learn_obs else None
         pair = filter_pair_fixed(model, x, mask, center, drift_net,
                                  g_cur_in if g_cur_in is not None else 0.5, dt,
                                  n_mean, near_std, broad_std, noise_std, decode)
     m = mask[..., 0]
     valid = (m[:-1] * m[1:]).bool()                                   # data-anchored increments
-    zc = z_hat[:-1][valid]
+    zc = z_hat[:-1][valid]                                            # (N,d)
     zc_next = z_hat[1:][valid]
-    dz = ((z_hat[1:] - z_hat[:-1]) / dt)[valid]
+    dz = ((z_hat[1:] - z_hat[:-1]) / dt)[valid]                       # (N,d)
 
     cstab = 0.0
     if learn_obs:
-        C_cur, d_cur, cstab = fit_obs_map_stiefel(z_hat, x, s_scale, C_cur)
+        C_cur, d_cur, cstab = fit_obs_map_stiefel(z_hat, x, C_cur)
     if cstab < c_stable_tol:                                          # sensor-before-dynamics gate
-        fit_drift(drift_net, dr_opt, zc, dz, z_reg, hr, reg_lambda, m_inner)
+        fit_drift(drift_net, dr_opt, zc, dz, reg_lambda, m_inner)
     g_cur = None
     if learn_g:
         g_cur = fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,

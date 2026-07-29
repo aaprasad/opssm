@@ -47,6 +47,9 @@ w_res: 0.2                # weight on the FP residual vs the jump/ic recursion. 
 learn_smoother: false     # two-filter backward-SPDE smoother: false = filter only (byte-identical to before);
                           #   true = also train the backward adjoint-Zakai operator (2nd E-step per iteration)
                           #   for p(z_t|y_{0:T}), enabling the smoother-mean drift + cross-cov g (see em_smooth).
+latent_dim: 1             # LATENT state dim d (SEPARATE from data_size = obs dim D). 1 = the double-well;
+                          #   2 = Van der Pol, 3 = Lorenz. The trunk/drift/collocation are all (...,d);
+                          #   d=1 is the special case gated to reproduce the em_1d/em_highd baselines.
 joint_g: true             # estimate g from the FILTER lag-one joint (filter_pair_fixed) instead of the
                           #   filter-mean increment. The mean drops the increment VARIANCE so g under-reads
                           #   (~0.54 vs true 0.60 high-D); the joint's square-then-average residual recovers

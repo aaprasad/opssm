@@ -1,0 +1,15 @@
+# @package _global_
+# Multi-D latent stretch target: Lorenz (3-D chaotic attractor). Learn f, g, and the D x d Stiefel
+# sensor from a high-D linear sensor of a 3-D latent. No KL (the O(N^d) grid oracle is deferred);
+# scored by the Procrustes lat_rmse_aln + drift_l2_aln + principal-angle c_cos. Watch the logged `ess`
+# -- the SNIS curse of dimensionality is worst at d=3.
+defaults:
+  - override /data: lorenz
+model:
+  learn_obs: true
+  data_size: 10
+  latent_dim: 3       # MUST match the datamodule's system dim (lorenz -> 3)
+  w_res: 0.4          # high-D sweet spot (as in em_highd / em_vdp)
+  n_colloc: 384       # bumped for the d=3 SNIS load (E-step residual is chunked, so this is memory-cheap)
+  n_mean: 512         # mesh-free E[z|y] / joint-g sample count
+  chunk_size: 4       # the d=3 FP residual grad_tau is (...,d,p) = 3x the 1-D memory -> smaller chunk

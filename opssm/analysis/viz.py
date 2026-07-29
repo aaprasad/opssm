@@ -96,7 +96,7 @@ def vis_learn(model, drift_net, xs_val, mask_val, filt_val, z_grid, ts, a, img_p
     from opssm.models.mstep import log_smoothed
     z = z_grid.cpu().numpy()
     ts_np = ts.cpu().numpy()
-    f_learned = drift_net.drift(z_grid)[0].cpu().numpy()
+    f_learned = drift_net.drift(z_grid.unsqueeze(-1))[0].squeeze(-1).cpu().numpy()   # generalized drift is (...,d)
     f_true = (a * (z_grid - z_grid ** 3)).cpu().numpy()
     log_pi = model.log_posterior(xs_val, mask_val, z_grid)
     pi = log_pi.exp().cpu().numpy()
@@ -132,8 +132,8 @@ def vis_learn(model, drift_net, xs_val, mask_val, filt_val, z_grid, ts, a, img_p
             for k in range(n_cols)]
     # learned drift vs truth
     ax = axes[0]
-    ax.plot(z, f_true, "k-", lw=2, label="true $a(z-z^3)$")
-    ax.plot(z, f_learned, "C2--", lw=2, label=r"learned $f_\theta$")
+    ax.plot(z, f_learned, "C2-", lw=2, label=r"learned $f_\theta$")             # MODEL = solid
+    ax.plot(z, f_true, "k--", lw=2, label="true $a(z-z^3)$")                     # GROUND TRUTH = dashed
     ax.axvspan(lo, hi, color="C2", alpha=0.12, label="data regime")
     mrg = 0.3
     ax.set_xlim(lo - mrg, hi + mrg)                          # focus on where there is data
@@ -166,13 +166,13 @@ def vis_learn(model, drift_net, xs_val, mask_val, filt_val, z_grid, ts, a, img_p
     s_op = ((log_pi[:, j].exp() * z_grid ** 2).sum(-1).cpu().numpy() - m_op ** 2).clip(0) ** 0.5
     if gap.any():
         ax.axvspan(ts_np[gap][0], ts_np[gap][-1], color="gray", alpha=0.15, label="no obs")
-    ax.plot(ts_np, mean[:, j].cpu().numpy(), "k-", lw=2, label="exact filter mean")
-    ax.plot(ts_np, m_op, "C3--", lw=2, label="filter mean")
+    ax.plot(ts_np, m_op, "C3-", lw=2, label="filter mean")                          # MODEL = solid
     ax.fill_between(ts_np, m_op - 2 * s_op, m_op + 2 * s_op, color="C3", alpha=0.2)
+    ax.plot(ts_np, mean[:, j].cpu().numpy(), "k--", lw=2, label="exact filter mean")  # exact-filter reference = dashed
     if show_sm:
         msm = m_sm[:, j].cpu().numpy(); ssm = s_sm[:, j].cpu().numpy()
-        ax.plot(ts_np, m_sm_ex[:, j].cpu().numpy(), color="0.4", ls="-", lw=1.5, label="exact smoother mean")
-        ax.plot(ts_np, msm, "C0--", lw=2, label="smoother mean")
+        ax.plot(ts_np, msm, "C0-", lw=2, label="smoother mean")                      # MODEL = solid
+        ax.plot(ts_np, m_sm_ex[:, j].cpu().numpy(), color="0.4", ls="--", lw=1.5, label="exact smoother mean")
         ax.fill_between(ts_np, msm - 2 * ssm, msm + 2 * ssm, color="C0", alpha=0.2)
     ax.set_xlabel("$t$"); ax.set_ylabel("$z$"); ax.set_title("estimate traj 0"); ax.legend(fontsize=8)
     plt.tight_layout(); plt.savefig(img_path); plt.close()
@@ -181,7 +181,8 @@ def vis_learn(model, drift_net, xs_val, mask_val, filt_val, z_grid, ts, a, img_p
 @torch.no_grad()
 def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val, z_grid, ts,
               a, sigma, C_cur, d_cur, C_true, d_true, learn_obs, img_path, n_traj=2, s_scale=1.0,
-              g_scalar=None, model_b=None, smoothed_val=None, s_fit=None, aligned=False):
+              g_scalar=None, model_b=None, smoothed_val=None, s_fit=None, aligned=False,
+              obs_mean=None, obs_scale=1.0):
     """High-D Duncker panels with UNCERTAINTY BANDS everywhere and the drift/diffusion shown over the
     DATA REGIME only (the range the inferred latent actually visits). The drift/diffusion bands are the
     empirical +/-2 SE per z-bin -- wide where the latent rarely goes (cf. Duncker's GP uncertainty);
@@ -246,37 +247,48 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
         ax3d_s = fig.add_subplot(gsp[1, 4], projection="3d")
     else:
         ax3d = fig.add_subplot(gsp[:, 4], projection="3d")              # tall filter-only p(z,t) panel
-    for j in range(n_traj):                                              # A: obs + recon + predictive band
+    # A: noisy obs (dots) + model RECON (dashed) vs the TRUE noiseless signal C_true z + d (solid), in
+    # PHYSICAL units (un-standardized). Obs reconstruction is GAUGE-INVARIANT (the z->A z freedom cancels
+    # in y=Cz+d), so recon and the true signal are directly comparable with NO alignment: solid == dashed
+    # means accurate reconstruction. Judging recon against the noisy dots alone is not meaningful.
+    om = obs_mean.cpu().numpy() if obs_mean is not None else None
+    for j in range(n_traj):
         ax = axes[0, j]
         for dim in range(nd):
-            rc = recon[:, j, dim].cpu().numpy()
-            rc_sd = (s_scale * abs(float(C_cur[dim])) * s_op[:, j]).cpu().numpy()   # latent unc. -> obs space
-            ax.plot(ts_np, y_val[:, j, dim].cpu().numpy(), ".", ms=3, alpha=0.3, color=f"C{dim}")
-            ax.plot(ts_np, rc, "-", lw=2, color=f"C{dim}", label=f"$y_{dim}$" if j == 0 else None)
-            ax.fill_between(ts_np, rc - 2 * rc_sd, rc + 2 * rc_sd, color=f"C{dim}", alpha=0.15)
-        ax.set_title(f"obs + recon, traj {j}"); ax.set_xlabel("$t$")
+            off = float(om[dim]) if om is not None else 0.0
+            rc = recon[:, j, dim].cpu().numpy() * obs_scale + off               # model recon (physical)
+            rc_sd = (abs(float(C_cur[dim])) * s_op[:, j]).cpu().numpy() * obs_scale
+            yobs = y_val[:, j, dim].cpu().numpy() * obs_scale + off             # noisy obs (physical)
+            y_sig = (C_true[dim] * z_val_true[:, j] + d_true[dim]).cpu().numpy()  # TRUE noiseless obs
+            ax.plot(ts_np, yobs, ".", ms=3, alpha=0.22, color=f"C{dim}")               # noisy obs
+            ax.plot(ts_np, rc, "-", lw=2, color=f"C{dim}", label=f"recon $y_{dim}$" if j == 0 else None)
+            ax.fill_between(ts_np, rc - 2 * rc_sd, rc + 2 * rc_sd, color=f"C{dim}", alpha=0.15)   # +/-2 std
+            ax.plot(ts_np, y_sig, "--", lw=1.5, color=f"C{dim}", alpha=0.9,             # TRUE noiseless obs
+                    label=f"true $y_{dim}$" if j == 0 else None)
+        ax.set_title(f"obs recon vs true signal, traj {j}"); ax.set_xlabel("$t$")
         if j == 0:
             ax.legend(fontsize=8)
     for j in range(n_traj):                                              # B: latent + operator & exact bands
         ax = axes[1, j]
-        ax.plot(ts_np, z_val_true[:, j].cpu().numpy(), "k-", lw=2, label="true $z$")
+        ax.plot(ts_np, z_val_true[:, j].cpu().numpy(), "k--", lw=2, label="true $z$")   # GROUND TRUTH = dashed
         exm = ex_m[:, j].cpu().numpy(); exs = ex_s[:, j].cpu().numpy()
-        ax.plot(ts_np, exm, "C7-", lw=1.2, label="exact mean")
+        ax.plot(ts_np, exm, "C7--", lw=1.2, label="exact mean")                         # exact-filter reference = dashed
         ax.fill_between(ts_np, exm - 2 * exs, exm + 2 * exs, color="C7", alpha=0.18)
         mo = md[:, j].cpu().numpy(); so = (abs(s) * s_op[:, j]).cpu().numpy()
-        ax.plot(ts_np, mo, "r--", lw=2, label="filter mean" if show_sm else "operator mean")
+        ax.plot(ts_np, mo, "r-", lw=2, label="filter mean" if show_sm else "operator mean")   # MODEL = solid
         ax.fill_between(ts_np, mo - 2 * so, mo + 2 * so, color="r", alpha=0.2)
         if show_sm:                                                       # smoother: tighter band, less lag
             msm = (s * m_sm[:, j]).cpu().numpy(); ssm = (abs(s) * s_sm[:, j]).cpu().numpy()
-            ax.plot(ts_np, msm, "C0--", lw=2, label="smoother mean")
+            ax.plot(ts_np, msm, "C0-", lw=2, label="smoother mean")                     # MODEL = solid
             ax.fill_between(ts_np, msm - 2 * ssm, msm + 2 * ssm, color="C0", alpha=0.2)
         ax.set_ylim(-1.7, 1.7); ax.set_title(f"latent $z$, traj {j}"); ax.set_xlabel("$t$")
         if j == 0:
             ax.legend(fontsize=8)
     ax = axes[0, 2]                                                      # C: drift over data regime + band
-    ax.plot(zg[inr], (a * (z_grid - z_grid ** 3)).cpu().numpy()[inr], "k-", lw=2, label="true $a(z-z^3)$")
-    ax.plot(zg[inr], (s * drift_net.drift(z_grid / s)[0]).cpu().numpy()[inr], "C2--", lw=2,
-            label=r"learned $f_\theta$")            # s*f_op(z/s): true-scale drift when aligned, raw when s=1
+    ax.plot(zg[inr], (a * (z_grid - z_grid ** 3)).cpu().numpy()[inr], "k--", lw=2, label="true $a(z-z^3)$")  # GT dashed
+    f_op = drift_net.drift((z_grid / s).unsqueeze(-1))[0].squeeze(-1)     # (Nz,): generalized drift is (...,d)
+    ax.plot(zg[inr], (s * f_op).cpu().numpy()[inr], "C2-", lw=2,
+            label=r"learned $f_\theta$")            # MODEL = solid; s*f_op(z/s) is true-scale drift when aligned
     ax.fill_between(ctr, f_emp - 2 * f_se, f_emp + 2 * f_se, color="C1", alpha=0.25, label=r"empirical $\pm2$SE")
     ax.plot(ctr, f_emp, "C1.", ms=4)
     ax.set_xlim(lo, hi); ax.set_ylim(-1.5, 1.5); ax.set_xlabel("$z$"); ax.set_ylabel("$f(z)$")
@@ -319,4 +331,105 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
                      lo, hi, "smoother $p(z,t)$ traj 0", color="C0", op_label="smoother")
     fig.suptitle("gauge-ALIGNED (operator -> true scale)" if s != 1.0 else "RAW (operator gauge)",
                  fontsize=13, y=1.0)
+    plt.tight_layout(); plt.savefig(img_path); plt.close()
+
+
+@torch.no_grad()
+def vis_latent2d(drift_net, m_op, z_true, ts, true_drift, g_scalar, img_path, n_traj=4, ng=32):
+    """Phase-plane visualization for a 2-D latent (Van der Pol). The DRIFT field is shown as a STREAMPLOT
+    over the (z1,z2) plane. Because the latent SDE is identifiable only up to a linear-map gauge
+    (z_true ~ A m_op), the LEARNED drift is gauge-mapped into the TRUE frame -- f_true_frame(z) =
+    f_op(z A^-1) A -- so its streamplot is directly comparable to the benchmark field f_op(z) A on the
+    same axes. Three panels: (a) true drift + true trajectories, (b) learned drift (aligned) + inferred
+    trajectories, (c) latent recovery (true vs aligned-inferred). m_op / z_true are (T,B,2)."""
+    import numpy as np
+    dev = m_op.device
+    M = m_op.reshape(-1, 2); Z = z_true.reshape(-1, 2)               # inferred vs true latent points (N,2)
+    A = torch.linalg.lstsq(M, Z).solution                           # (2,2): Z ~ M @ A (the Procrustes gauge)
+    A_inv = torch.linalg.pinv(A)                                     # pinv: robust if A is ill-conditioned early
+    z_al = m_op @ A                                                 # aligned inferred latent (T,B,2), true frame
+
+    lo = Z.min(0).values; hi = Z.max(0).values                      # plane extent from the true latent + margin
+    pad = 0.2 * (hi - lo).clamp_min(1e-3)
+    lo = (lo - pad).cpu().numpy(); hi = (hi + pad).cpu().numpy()
+    xs = torch.linspace(float(lo[0]), float(hi[0]), ng, device=dev)
+    ys = torch.linspace(float(lo[1]), float(hi[1]), ng, device=dev)
+    GX, GY = torch.meshgrid(xs, ys, indexing="xy")                  # (ng,ng); streamplot wants U,V as (Ny,Nx)
+    P = torch.stack([GX.reshape(-1), GY.reshape(-1)], dim=-1)       # (ng*ng, 2) true-frame grid points
+    FT = true_drift(P)                                             # true drift on the grid (ng*ng, 2)
+    FL = drift_net.drift(P @ A_inv)[0] @ A                          # learned drift mapped into the true frame
+    xs_np, ys_np = xs.cpu().numpy(), ys.cpu().numpy()
+
+    def _stream(ax, F, title):
+        u = F[:, 0].reshape(ng, ng).cpu().numpy(); v = F[:, 1].reshape(ng, ng).cpu().numpy()
+        spd = np.hypot(u, v)
+        strm = ax.streamplot(xs_np, ys_np, u, v, color=spd, cmap="viridis",
+                             density=1.2, linewidth=1.0, arrowsize=0.8)
+        ax.set_xlabel("$z_1$"); ax.set_ylabel("$z_2$"); ax.set_title(title)
+        ax.set_xlim(xs_np[0], xs_np[-1]); ax.set_ylim(ys_np[0], ys_np[-1])
+        return strm
+
+    zt = z_true.cpu().numpy(); za = z_al.cpu().numpy()
+    nj = min(n_traj, zt.shape[1])
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.4))
+    s0 = _stream(axes[0], FT, "true drift $f(z)$")
+    for j in range(nj):
+        axes[0].plot(zt[:, j, 0], zt[:, j, 1], "k-", lw=0.8, alpha=0.5)
+    fig.colorbar(s0.lines, ax=axes[0], label="$|f|$", fraction=0.046)
+    s1 = _stream(axes[1], FL, "learned drift (aligned to true frame)")
+    for j in range(nj):
+        axes[1].plot(za[:, j, 0], za[:, j, 1], "C3-", lw=0.8, alpha=0.6)
+    fig.colorbar(s1.lines, ax=axes[1], label="$|f|$", fraction=0.046)
+    ax = axes[2]
+    for j in range(nj):
+        ax.plot(za[:, j, 0], za[:, j, 1], "C3-", lw=1.0, alpha=0.8,               # MODEL (inferred) = solid
+                label="inferred (aligned)" if j == 0 else None)
+        ax.plot(zt[:, j, 0], zt[:, j, 1], "k--", lw=1.0, alpha=0.6,               # GROUND TRUTH = dashed
+                label="true" if j == 0 else None)
+    ax.set_xlabel("$z_1$"); ax.set_ylabel("$z_2$"); ax.set_title("latent recovery"); ax.legend(fontsize=9)
+    fig.suptitle(fr"Van der Pol 2-D latent -- learned $g$={float(g_scalar):.3f}", fontsize=13, y=1.01)
+    plt.tight_layout(); plt.savefig(img_path); plt.close()
+
+
+@torch.no_grad()
+def vis_latent3d(drift_net, m_op, z_true, ts, true_drift, g_scalar, img_path, n_traj=3, n_arrows=160):
+    """Phase-space visualization for a 3-D latent (Lorenz). Panel 0: the 3-D attractor -- true (black)
+    vs Procrustes-aligned inferred (red) -- the latent-recovery headline. Panels 1-3: the three 2-D
+    coordinate projections showing DRIFT-field agreement as overlaid unit-direction quivers, true (gray)
+    vs learned (red), at sampled attractor points. As in the 2-D viz the learned drift is gauge-mapped to
+    the true frame (f(z) = f_op(z A^-1) A, A the gauge z_true ~ A m_op) so it is directly comparable; the
+    arrows are normalized to DIRECTION (magnitude agreement is the drift_l2_aln metric). m_op/z_true (T,B,3)."""
+    import numpy as np
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the 3d projection)
+    M = m_op.reshape(-1, 3); Z = z_true.reshape(-1, 3)
+    A = torch.linalg.lstsq(M, Z).solution                          # (3,3) gauge Z ~ M @ A
+    A_inv = torch.linalg.pinv(A)
+    z_al = m_op @ A                                                # aligned inferred latent (T,B,3)
+    sub = max(1, Z.shape[0] // n_arrows)
+    P = Z[::sub]                                                   # sampled true-frame attractor points
+    FT = true_drift(P)                                            # true drift there
+    FL = drift_net.drift(P @ A_inv)[0] @ A                         # learned drift mapped to the true frame
+    p = P.cpu().numpy()
+    ftn = (FT / FT.norm(dim=-1, keepdim=True).clamp_min(1e-9)).cpu().numpy()   # unit directions
+    fln = (FL / FL.norm(dim=-1, keepdim=True).clamp_min(1e-9)).cpu().numpy()
+    zt = z_true.cpu().numpy(); za = z_al.cpu().numpy(); nj = min(n_traj, zt.shape[1])
+
+    fig = plt.figure(figsize=(21, 5.2))
+    ax0 = fig.add_subplot(1, 4, 1, projection="3d")               # 3-D attractor: latent recovery
+    for j in range(nj):
+        ax0.plot(za[:, j, 0], za[:, j, 1], za[:, j, 2], "C3-", lw=0.7, alpha=0.8,      # MODEL (inferred) = solid
+                 label="inferred (aligned)" if j == 0 else None)
+        ax0.plot(zt[:, j, 0], zt[:, j, 1], zt[:, j, 2], "k--", lw=0.6, alpha=0.6,      # GROUND TRUTH = dashed
+                 label="true" if j == 0 else None)
+    ax0.set_xlabel("$z_1$"); ax0.set_ylabel("$z_2$"); ax0.set_zlabel("$z_3$")
+    ax0.set_title("latent recovery (3-D attractor)"); ax0.legend(fontsize=8)
+    for ax, (i, k), name in zip([fig.add_subplot(1, 4, c) for c in (2, 3, 4)],
+                                [(0, 1), (0, 2), (1, 2)], ["z1-z2", "z1-z3", "z2-z3"]):
+        ax.quiver(p[:, i], p[:, k], ftn[:, i], ftn[:, k], color="0.5", alpha=0.7,
+                  angles="xy", scale=28, width=0.004, label="true")
+        ax.quiver(p[:, i], p[:, k], fln[:, i], fln[:, k], color="C3", alpha=0.6,
+                  angles="xy", scale=28, width=0.004, label="learned")
+        ax.set_xlabel(fr"$z_{{{i + 1}}}$"); ax.set_ylabel(fr"$z_{{{k + 1}}}$")
+        ax.set_title(f"drift dirs ({name})"); ax.legend(fontsize=8)
+    fig.suptitle(fr"Lorenz 3-D latent -- learned $g$={float(g_scalar):.3f}", fontsize=13, y=1.01)
     plt.tight_layout(); plt.savefig(img_path); plt.close()

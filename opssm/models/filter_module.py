@@ -25,7 +25,6 @@ supervised/known-dynamics operator), `learn_obs` toggles the high-D Stiefel sens
 `loss` selects the operator objective. 1-D is the degenerate `cstab≡0` case of the high-D curriculum.
 """
 
-import math
 import os
 
 import lightning.pytorch as pl
@@ -37,11 +36,13 @@ from opssm.models.dynamics import DriftNet, DiffusionNet
 from opssm.models.losses import accumulate_pinn_grads, accumulate_adjoint_grads, kl_target_pred
 from opssm.models.mstep import mstep, log_smoothed
 from opssm.models.obs import make_decode, zhat_from_obs
+from opssm.models.mstep import posterior_mean_fixed
+from opssm.data.systems import make_drift
 from opssm.analysis import viz
 
 
 def _log_prior(z):
-    return -0.5 * z ** 2                                       # log N(0,1) up to a constant
+    return -0.5 * z.pow(2).sum(-1)                             # log N(0, I_d) up to a const (z (...,d) -> (...,))
 
 
 def _interp1d(vals, grid, query):
@@ -61,25 +62,24 @@ class ZakaiFilterModule(pl.LightningModule):
                  pca_init=True, c_stable_tol=0.05, meshfree_mean=True, n_mean=256,
                  res_mode="rel", w_res=0.2, learn_smoother=False, joint_g=False,
                  encoder="gru", encoder_kwargs=None,
-                 loss="zakai", train_dir="./dump/nzf"):
+                 latent_dim=1, loss="zakai", train_dir="./dump/nzf"):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
         h = self.hparams
         self.model = OperatorFilter(h.data_size, h.gru_hidden, h.ctx_dim, h.p,
-                                    encoder=h.encoder, encoder_kwargs=h.encoder_kwargs)
+                                    encoder=h.encoder, encoder_kwargs=h.encoder_kwargs, latent_dim=h.latent_dim)
         # backward adjoint-Zakai twin for the two-filter smoother (default off => byte-identical filter)
         self.model_b = OperatorBackward(h.data_size, h.gru_hidden, h.ctx_dim, h.p,
-                                        encoder=h.encoder, encoder_kwargs=h.encoder_kwargs) \
+                                        encoder=h.encoder, encoder_kwargs=h.encoder_kwargs, latent_dim=h.latent_dim) \
             if h.learn_smoother else None
-        self.drift_net = DriftNet(h.drift_hidden); self.drift_net.requires_grad_(False)
+        self.drift_net = DriftNet(h.drift_hidden, latent_dim=h.latent_dim); self.drift_net.requires_grad_(False)
         self.diff_net = None
         if h.learn_g and h.g_net:
-            self.diff_net = DiffusionNet(h.drift_hidden, g_init=h.g_init)
+            self.diff_net = DiffusionNet(h.drift_hidden, g_init=h.g_init, latent_dim=h.latent_dim)
             self.diff_net.requires_grad_(False)
         # mutable EM state (initialized in setup once the data is known)
         self.g_cur = h.g_init
-        self.s_scale = 1.0
         self.C_cur = self.d_cur = None
         self.dr_opt = self.dg_opt = None
 
@@ -90,25 +90,33 @@ class ZakaiFilterModule(pl.LightningModule):
         dev = self.device
         self.z_grid = dm.z_grid
         self.dt = dm.dt
-        self.a, self.sigma, self.noise_std = dm.hparams.a, dm.hparams.sigma, dm.hparams.noise_std
+        self.a, self.sigma = dm.hparams.a, dm.hparams.sigma
+        self.noise_std = dm.noise_std_eff                            # obs noise in the STANDARDIZED units (see datamodule)
+        self.system = dm.hparams.system
+        self.true_drift = make_drift(self.system)[0]                  # ground-truth drift for the metric (registry)
         self.s_coll = torch.linspace(0.0, 1.0, h.n_scoll, device=dev)
-        self.z_reg = torch.linspace(-2.0, 2.0, 80, device=dev)
-        self.hr = float(self.z_reg[1] - self.z_reg[0])
-        self.f_true_grid = self.a * (self.z_grid - self.z_grid ** 3)
-        self.supp = self.z_grid.abs() <= 2.0
+        d = self.model.latent_dim
+        if d == 1:                                                    # 1-D grid metrics (kl, drift_l2) + g_net reg
+            self.z_reg = torch.linspace(-2.0, 2.0, 80, device=dev)
+            self.hr = float(self.z_reg[1] - self.z_reg[0])
+            self.f_true_grid = self.a * (self.z_grid - self.z_grid ** 3)
+            self.supp = self.z_grid.abs() <= 2.0
+        else:                                                         # mesh-free for d>1 (no grid)
+            self.z_reg = self.hr = self.f_true_grid = self.supp = None
         if not h.learn_g:
             self.g_cur = self.sigma
-        # high-D observation map: fixed scale + PCA/random unit direction (see plan)
+        # high-D observation map init. Obs are standardized to ~unit scale at the dataloader level, so the
+        # decode is h(z) = C z + d with NO scale factor (s_scale removed) -- C is a D x d Stiefel matrix and
+        # d the (now ~zero) intercept.
         if h.learn_obs:
             obs_dim = dm.hparams.obs_dim
             Yc = dm.full_obs.reshape(-1, obs_dim)
             ybar = Yc.mean(0)
-            _, Sv, Vt = torch.linalg.svd(Yc - ybar, full_matrices=False)
-            self.s_scale = float(Sv[0] / math.sqrt(Yc.shape[0]))
             if h.pca_init:
-                self.C_cur = Vt[0].clone()
+                _, _, Vt = torch.linalg.svd(Yc - ybar, full_matrices=False)
+                self.C_cur = Vt[:d].t().contiguous()                  # (D,d) top-d PCA directions as columns
             else:
-                c = torch.randn(obs_dim, device=dev); self.C_cur = c / c.norm()
+                self.C_cur = torch.linalg.qr(torch.randn(obs_dim, d, device=dev))[0]   # random Stiefel (D,d)
             self.d_cur = ybar.clone()
         # manual M-step optimizers (not Lightning-managed; the M-step is fully manual)
         self.dr_opt = optim.Adam(self.drift_net.parameters(), lr=h.drift_lr)
@@ -133,8 +141,8 @@ class ZakaiFilterModule(pl.LightningModule):
     def _decode_center(self, x):
         if not self.hparams.learn_obs:
             return None, None
-        decode = make_decode(self.C_cur, self.d_cur, self.s_scale)
-        center = zhat_from_obs(x, self.C_cur, self.d_cur) / self.s_scale
+        decode = make_decode(self.C_cur, self.d_cur)               # h(z) = C z + d (obs standardized upstream)
+        center = zhat_from_obs(x, self.C_cur, self.d_cur)
         return decode, center
 
     # -- E-step ----------------------------------------------------------------------------------
@@ -150,7 +158,7 @@ class ZakaiFilterModule(pl.LightningModule):
             self.log("kl_train", loss, prog_bar=True)
             return
         step = self.global_step + 1
-        drift = (lambda z: (torch.zeros_like(z), torch.zeros_like(z))) \
+        drift = (lambda z: (torch.zeros_like(z), torch.zeros(z.shape[:-1], device=z.device, dtype=z.dtype))) \
             if step <= h.warmup else self.drift_net.drift
         diffusion = self.diff_net.diffusion if (h.g_net and step > h.warmup) else self.g_cur
         decode, center = self._decode_center(x)
@@ -182,7 +190,7 @@ class ZakaiFilterModule(pl.LightningModule):
                     learn_g=h.learn_g, g_net=h.g_net, reg_lambda=h.reg_lambda,
                     reg_lambda_g=h.reg_lambda_g, m_inner=h.m_inner,
                     learn_obs=h.learn_obs, c_stable_tol=h.c_stable_tol,
-                    C_cur=self.C_cur, d_cur=self.d_cur, s_scale=self.s_scale,
+                    C_cur=self.C_cur, d_cur=self.d_cur,
                     meshfree_mean=h.meshfree_mean, n_mean=h.n_mean,
                     near_std=h.near_std, broad_std=h.broad_std,
                     joint_g=h.joint_g, noise_std=self.noise_std, g_cur_in=self.g_cur)
@@ -213,8 +221,9 @@ class ZakaiFilterModule(pl.LightningModule):
         # or a 2-D Van der Pol / 3-D Lorenz latent given a matching d->d drift net; the true-drift form below
         # is the ONLY per-benchmark piece (double-well a(z-z^3) here -- swap for VdP/Lorenz's field).
         f_al = self.drift_net.drift(M)[0].reshape(-1, d) @ A
-        f_true = self.a * (z_al - z_al ** 3)                            # <-- benchmark-specific true drift
-        on = z_al.abs().le(1.5).all(-1)                                # true-scale data region
+        f_true = self.true_drift(z_al)                                 # ground-truth drift from the systems registry
+        on = (z_al.abs().le(1.5).all(-1) if d == 1                     # double-well data region; all points for d>1
+              else torch.ones(z_al.shape[0], dtype=torch.bool, device=z_al.device))
         gscale = A.det().abs().pow(1.0 / d).item()                      # |A|^(1/d): scalar |A| for 1-D, dxd det
         out = {"s_fit": float(A.reshape(-1)[0]) if d == 1 else gscale,  # signed 1-D scale (viz) / geo-mean scale
                "lat_rmse": (M - Z).pow(2).sum(-1).mean().sqrt().item(),          # RAW (unaligned)
@@ -234,48 +243,52 @@ class ZakaiFilterModule(pl.LightningModule):
         h = self.hparams
         dm = self.trainer.datamodule
         x, mask, filt = batch
-        log_pi = self.model.log_posterior(x, mask, self.z_grid)
-        kl = kl_target_pred(filt, log_pi).item()
-        # drift error over the DATA REGIME only -- the range the inferred latent actually visits.
-        # Evaluating on a fixed [-2,2] is dominated by the tails (|z|>1.5) where there is no data and
-        # the regression must extrapolate; that penalizes coverage, not fit.
-        # SPLIT the drift RMSE into ON-DATA (inside the range the latent visits, m_op's 1-99
-        # percentile) and OFF-DATA (|z|<=2 but outside that range -- where the regression must
-        # extrapolate with no data to constrain it, so the drift naturally peels off the truth).
-        # Reporting them separately keeps the on-data fit from being masked by off-data divergence.
-        m_op = (log_pi.exp() * self.z_grid).sum(-1)                   # (T,B) inferred latent
-        lo, hi = m_op.quantile(0.01), m_op.quantile(0.99)
-        on = (self.z_grid >= lo) & (self.z_grid <= hi)                # data regime
-        off = self.supp & ~on                                        # |z|<=2 but outside the data regime
-        fd = self.drift_net.drift(self.z_grid)[0]
-        f_err = (fd[on] - self.f_true_grid[on]).pow(2).mean().sqrt().item()
-        f_err_off = ((fd[off] - self.f_true_grid[off]).pow(2).mean().sqrt().item()
-                     if bool(off.any()) else float("nan"))
-        logs = {"kl": kl, "drift_l2": f_err, "drift_l2_off": f_err_off, "g": float(self.g_cur)}
-        if h.learn_obs and dm.C_true is not None:
-            logs["c_cos"] = abs(float(self.C_cur @ (dm.C_true / dm.C_true.norm())))
-        # PROCRUSTES gauge-aligned metrics (the well-posed ones; the raw kl/drift_l2/g are gauge-inflated).
-        s_fit = None
+        d = self.model.latent_dim
+        logs = {"g": float(self.g_cur)}
+        log_pi = None
+        if d == 1:                                                   # 1-D GRID metrics (kl, drift_l2 on the grid)
+            log_pi = self.model.log_posterior(x, mask, self.z_grid)
+            logs["kl"] = kl_target_pred(filt, log_pi).item()
+            m_op = (log_pi.exp() * self.z_grid).sum(-1)              # (T,B) grid-quadrature mean
+            lo, hi = m_op.quantile(0.01), m_op.quantile(0.99)       # ON-DATA regime (the range the latent visits)
+            on = (self.z_grid >= lo) & (self.z_grid <= hi)
+            off = self.supp & ~on                                   # |z|<=2 but outside the data regime
+            fd = self.drift_net.drift(self.z_grid.unsqueeze(-1))[0].squeeze(-1)   # drift on the 1-D grid
+            logs["drift_l2"] = (fd[on] - self.f_true_grid[on]).pow(2).mean().sqrt().item()
+            logs["drift_l2_off"] = ((fd[off] - self.f_true_grid[off]).pow(2).mean().sqrt().item()
+                                    if bool(off.any()) else float("nan"))
+            m_op_al = m_op                                          # (T,B) -> _gauge_aligned (d==1)
+        else:                                                       # MESH-FREE mean for d>1 (no grid)
+            _, center = self._decode_center(x)
+            m_op_al, _ = posterior_mean_fixed(self.model, x, mask, center, h.n_mean, h.near_std, h.broad_std)  # (T,B,d)
+        if h.learn_obs and dm.C_true is not None:                   # c_cos: mean principal-angle cosine (any d)
+            Cn = dm.C_true / dm.C_true.norm(dim=0, keepdim=True)
+            logs["c_cos"] = float(torch.linalg.svdvals(self.C_cur.t() @ Cn).clamp(max=1.0).mean())
+        s_fit = None                                                # PROCRUSTES gauge-aligned metrics (well-posed)
         if h.learn_obs and dm.z_val_true is not None:
-            al = self._gauge_aligned(log_pi, filt, m_op, dm.z_val_true)
+            al = self._gauge_aligned(log_pi, filt, m_op_al, dm.z_val_true)
             logs.update(al); s_fit = al["s_fit"]
-        # smoother marginal KL vs the oracle smoother (the v1 gate): should track `kl`.
-        if h.learn_smoother and getattr(dm, "smoothed_val", None) is not None:
+        if d == 1 and h.learn_smoother and getattr(dm, "smoothed_val", None) is not None:
             log_sm = log_smoothed(self.model, self.model_b, x, mask, self.z_grid)
             logs["kl_smooth"] = kl_target_pred(dm.smoothed_val, log_sm).item()
         self.log_dict(logs, prog_bar=True)
-        # figure
+        # figure: 1-D the rich Duncker panels (raw + Procrustes-aligned), 2-D the phase-plane drift
+        # STREAMPLOT, 3-D the attractor + projected drift quivers. d>3 has no figure.
         img = os.path.join(h.train_dir, f"step_{self.global_step:05d}.pdf")
-        sm_val = getattr(dm, "smoothed_val", None) if h.learn_smoother else None
-        if h.learn_obs:
-            # RAW and PROCRUSTES-ALIGNED as two separate figures (report/plot both -- alignment hides nothing)
-            for al, tag in ([(False, "_raw"), (True, "_aligned")] if s_fit is not None else [(False, "")]):
-                viz.vis_highd(self.model, self.drift_net, self.diff_net, x, mask, dm.z_val_true, filt,
-                              self.z_grid, dm.ts, self.a, self.sigma, self.C_cur, self.d_cur,
-                              dm.C_true, dm.d_true, True, img.replace(".pdf", tag + ".pdf"),
-                              s_scale=self.s_scale, g_scalar=self.g_cur,
-                              model_b=self.model_b, smoothed_val=sm_val, s_fit=s_fit, aligned=al)
-        else:
-            viz.vis_learn(self.model, self.drift_net, x, mask, filt, self.z_grid, dm.ts, self.a,
-                          img, diff_net=self.diff_net, sigma=self.sigma,
-                          model_b=self.model_b, smoothed_val=sm_val)
+        if d == 1:
+            sm_val = getattr(dm, "smoothed_val", None) if h.learn_smoother else None
+            if h.learn_obs:                                          # squeeze the trailing latent axis to the 1-D viz
+                zt1, Cc, Ct = dm.z_val_true.squeeze(-1), self.C_cur.squeeze(-1), dm.C_true.squeeze(-1)
+                for al, tag in ([(False, "_raw"), (True, "_aligned")] if s_fit is not None else [(False, "")]):
+                    viz.vis_highd(self.model, self.drift_net, self.diff_net, x, mask, zt1, filt,
+                                  self.z_grid, dm.ts, self.a, self.sigma, Cc, self.d_cur, Ct, dm.d_true,
+                                  True, img.replace(".pdf", tag + ".pdf"), g_scalar=self.g_cur,
+                                  model_b=self.model_b, smoothed_val=sm_val, s_fit=s_fit, aligned=al,
+                                  obs_mean=dm.obs_mean, obs_scale=dm.obs_scale)
+            else:
+                viz.vis_learn(self.model, self.drift_net, x, mask, filt, self.z_grid, dm.ts, self.a,
+                              img, diff_net=self.diff_net, sigma=self.sigma,
+                              model_b=self.model_b, smoothed_val=sm_val)
+        elif d in (2, 3) and dm.z_val_true is not None:
+            vis = viz.vis_latent2d if d == 2 else viz.vis_latent3d
+            vis(self.drift_net, m_op_al, dm.z_val_true, dm.ts, self.true_drift, self.g_cur, img)

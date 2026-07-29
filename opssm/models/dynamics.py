@@ -24,22 +24,28 @@ from opssm.models.nn import mlp
 
 
 class DriftNet(nn.Module):
-    """Learnable drift f_theta: z -> R, with f and f' = d_z f BOTH by autodiff (jvp), so
-    it is a drop-in for the analytic `drift(z) -> (f, df)` callable the Zakai residual
-    expects. Mesh-free: queryable at any sampled z. Last layer zero-initialized so f ~ 0
-    at the start (pure diffusion) and grows to fit the data."""
+    """Learnable drift f_theta: z (...,d) -> R^d, with f and div f = trace(J) = sum_i d f_i/d z_i BOTH
+    by autodiff (jvp), a drop-in for the analytic `drift(z) -> (f, div_f)` callable the Zakai residual
+    expects (in 1-D div f = f'). Mesh-free: queryable at any sampled z. Last layer zero-initialized so
+    f ~ 0 at the start (pure diffusion) and grows to fit the data."""
 
-    def __init__(self, hidden=64, layers=3):
+    def __init__(self, hidden=64, layers=3, latent_dim=1):
         super().__init__()
-        self.net = mlp([1] + [hidden] * layers + [1])
+        self.net = mlp([latent_dim] + [hidden] * layers + [latent_dim])
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
     def drift(self, z):
-        """z (any shape) -> f(z), f'(z), each z.shape (autodiff in z, trainable in theta)."""
-        zin = z.reshape(-1, 1)
-        f, df = jvp(self.net, (zin,), (torch.ones_like(zin),))
-        return f.reshape(z.shape), df.reshape(z.shape)
+        """z (...,d) -> f (...,d), div_f (...,) [divergence = trace of the Jacobian]. Per-axis forward
+        jvp: J e_i = d f / d z_i; accumulate the i-th component over axes -> div f."""
+        d = z.shape[-1]
+        zin = z.reshape(-1, d)
+        f, div = None, 0.0
+        for i in range(d):
+            e = torch.zeros_like(zin); e[:, i] = 1.0
+            f, jf = jvp(self.net, (zin,), (e,))            # jf = J e_i = d f / d z_i  (N,d)
+            div = div + jf[:, i]                           # trace contribution d f_i / d z_i
+        return f.reshape(z.shape), div.reshape(z.shape[:-1])
 
 
 class DiffusionNet(nn.Module):
@@ -53,11 +59,13 @@ class DiffusionNet(nn.Module):
     not just 1/2 g^2 d^2_z rho. Last layer init so g ~ g_init (flat); the M-step fits g^2 to the
     conditional variance of the increments. Drop-in for the scalar sigma**2 in the residual."""
 
-    def __init__(self, hidden=64, layers=3, g_init=1.0):
+    def __init__(self, hidden=64, layers=3, g_init=1.0, latent_dim=1):
         super().__init__()
-        self.net = mlp([1] + [hidden] * layers + [1])
+        self.net = mlp([latent_dim] + [hidden] * layers + [1])   # ISOTROPIC scalar g^2 (anisotropic G deferred)
         nn.init.zeros_(self.net[-1].weight)
         self.net[-1].bias.data.fill_(g_init)            # g(z) ~ g_init (flat) => g^2 ~ g_init^2
+        # NOTE: diffusion() (the state-dependent g^2 derivatives) is still 1-D; only used when
+        # g_net=True, which the first d-D milestone does not (constant scalar g).
 
     def _g2(self, zin):
         g = self.net(zin)

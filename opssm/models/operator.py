@@ -40,8 +40,9 @@ class OperatorFilter(nn.Module):
 
     def __init__(self, data_size=1, gru_hidden=64, ctx_dim=64, p=64,
                  branch_hidden=128, trunk_hidden=64, trunk_layers=3,
-                 encoder="gru", encoder_kwargs=None, reverse=False):
+                 encoder="gru", encoder_kwargs=None, reverse=False, latent_dim=1):
         super().__init__()
+        self.latent_dim = latent_dim                                 # d: LATENT dim (separate from data_size = obs dim)
         # CAUSAL context encoder: packs [obs (zeroed where missing), observed-mask] -> (T,B,ctx_dim), so it
         # knows when to update vs predict-only through a gap. Pluggable (encoder=gru|tcn|transformer|...);
         # built FIRST so the default gru keeps the original init RNG order (byte-identical). `gru_hidden`
@@ -50,13 +51,14 @@ class OperatorFilter(nn.Module):
         self.encoder = make_encoder(encoder, data_size + 1, ctx_dim, **enc_kwargs)
         self.reverse = reverse                                       # True = anti-causal (backward twin)
         self.branch = mlp([ctx_dim + 1, branch_hidden, p])           # (context, time) -> coeffs
-        self.trunk = mlp([1] + [trunk_hidden] * trunk_layers + [p])  # query z -> state basis
+        self.trunk = mlp([latent_dim] + [trunk_hidden] * trunk_layers + [p])  # query z (d) -> state basis
         self.bias = nn.Parameter(torch.zeros(()))
 
     def context(self, xs, mask):
         """xs (T,B,M), mask (T,B,1) observed-indicator -> context (T,B,C). reverse=False: CAUSAL, ctx[t]
         summarizes y_{0:t}. reverse=True (backward twin): ANTI-CAUSAL via flip -> causal encoder -> flip,
-        so ctx[t] summarizes y_{t:T} (inclusive) -- generic over ANY causal encoder."""
+        so ctx[t] summarizes y_{t:T} (inclusive) -- generic over ANY causal encoder. Obs are standardized at
+        the DATALOADER level (see the datamodule), so the encoder sees ~unit-scale input."""
         inp = torch.cat([xs * mask, mask], dim=-1)         # (T,B,M+1)
         if self.reverse:
             return self.encoder(inp.flip(0)).flip(0)       # (T,B,C); ctx[t] <- y_{t:T}
@@ -78,20 +80,27 @@ class OperatorFilter(nn.Module):
         return jvp(self.branch, (inp,), (tan,))            # b, d_s b
 
     def trunk_zderivs(self, z):
-        """State basis trunk(z) and its z, zz derivatives by autodiff. z any shape
-        (mesh-free: sampled points, not a grid) -> tau, d_z, d2_z each (*z.shape, p)."""
-        zin = z.reshape(-1, 1)
-        e = torch.ones_like(zin)
-        tau, dz = jvp(self.trunk, (zin,), (e,))
-        _, d2z = jvp(lambda x: jvp(self.trunk, (x,), (e,))[1], (zin,), (e,))
-        shp = (*z.shape, -1)
-        return tau.reshape(shp), dz.reshape(shp), d2z.reshape(shp)
+        """State basis trunk(z) with its GRADIENT + LAPLACIAN by autodiff (mesh-free; z (...,d)) ->
+        tau (...,p), grad_tau (...,d,p) [d_i tau], lap_tau (...,p) [sum_i d_ii tau]. Per-axis FUSED
+        forward-over-forward jvp: one nested jvp along e_i yields BOTH d_i tau and d_ii tau (cost ~4d
+        forward passes, independent of p -- vs jacrev/hessian which scale with p, p*d)."""
+        d = z.shape[-1]
+        zin = z.reshape(-1, d)                                        # (N,d)
+        grads, lap, tau = [], 0.0, None
+        for i in range(d):
+            e = torch.zeros_like(zin); e[:, i] = 1.0                  # unit tangent along axis i
+            (tau, di), (_, dii) = jvp(lambda x: jvp(self.trunk, (x,), (e,)), (zin,), (e,))
+            grads.append(di); lap = lap + dii                        # d_i tau ; accumulate Laplacian
+        shp = z.shape[:-1]
+        grad = torch.stack(grads, dim=-2)                            # (N,d,p)
+        return tau.reshape(*shp, -1), grad.reshape(*shp, d, -1), lap.reshape(*shp, -1)
 
     def log_density(self, ctx, z, s=0.0):
-        """ctx (T,B,C), z (Nz,) at within-interval time s (scalar) -> ell (T,B,Nz)."""
+        """ctx (T,B,C), z (Nz,) [1-D grid] or (Nz,d) at within-interval time s (scalar) -> ell (T,B,Nz)."""
         s_t = torch.as_tensor([s], dtype=z.dtype, device=z.device)
         b = self.coeffs(ctx, s_t)[:, :, 0]                 # (T,B,p)
-        return torch.einsum("tbp,zp->tbz", b, self.trunk(z.unsqueeze(-1))) + self.bias
+        zt = z.unsqueeze(-1) if z.dim() == 1 else z        # (Nz,d)
+        return torch.einsum("tbp,zp->tbz", b, self.trunk(zt)) + self.bias
 
     def log_posterior(self, xs, mask, z):
         """Normalized filtering log-posterior on z (post-update, s=0): (T,B,Nz)."""

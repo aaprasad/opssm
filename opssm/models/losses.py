@@ -29,30 +29,31 @@ def sample_collocation(xs, mask, n_colloc, near_std, broad_std, center=None):
     """MESH-FREE collocation: draw state points from a data-following proposal q (no grid,
     no zmax). Half are near the observation (the peaked observed posterior), half broad
     (covering the wells / the gap's bimodality where there is no observation). Returns
-    z (T,B,K) sampled points and log_q (T,B,K) the proposal log-density (the importance
-    weights for the SNIS normalizer). In high-D this q is the importance-sampling lever
-    that replaces the O(N^d) grid. `center` (T,B): the LATENT location to draw the near
-    component around; default xs[...,0] (1D direct obs). For high-D obs y, pass a z-estimate
-    (e.g. the pseudo-inverse C^+ (y-d)) since the obs itself is not in latent space."""
+    z (T,B,K,d) sampled points and log_q (T,B,K) the ISOTROPIC-Gaussian-mixture proposal log-density
+    (the SNIS weights). In high-D-LATENT this q is the importance-sampling lever that replaces the O(N^d)
+    grid; ESS decays with d, so n_colloc must grow with d. `center` (T,B,d): the LATENT location for the
+    near component; default = xs (direct obs, D=d). For a high-D linear sensor y pass a z-estimate (the
+    pseudo-inverse (C^T C)^-1 C^T (y-d)) since the obs is not in latent space."""
     T, B = xs.shape[0], xs.shape[1]
     dev = xs.device
+    ctr = xs if center is None else center                      # (T,B,d)
+    d = ctr.shape[-1]
     obs = mask[..., 0]                                          # (T,B) observed indicator
-    center = (xs[..., 0] if center is None else center) * obs   # latent estimate where observed
-    # "near" component: tight around the obs where observed. In the GAP there is no obs and
-    # the posterior is BIMODAL (mass at the wells, not at 0), so widen the near component to
-    # broad there -- otherwise half the samples pile up at z=0, exactly where the gap
-    # posterior is empty, and the modes stay under-sampled.
-    near_sd = (near_std * obs + broad_std * (1.0 - obs)).unsqueeze(-1)   # (T,B,1) per step
+    ctr = ctr * obs.unsqueeze(-1)                               # latent estimate where observed (T,B,d)
+    # "near" component: tight around the obs where observed. In the GAP there is no obs and the posterior
+    # is BIMODAL (mass at the wells, not at 0), so widen the near component to broad there.
+    near_sd = (near_std * obs + broad_std * (1.0 - obs))        # (T,B) per step
     Kn = n_colloc // 2
     Kb = n_colloc - Kn
-    near = center.unsqueeze(-1) + near_sd * torch.randn(T, B, Kn, device=dev)
-    broad = broad_std * torch.randn(T, B, Kb, device=dev)
-    z = torch.cat([near, broad], dim=-1)                        # (T,B,K)
-    c2 = math.log(2.0) + 0.5 * math.log(2 * math.pi)
-    lqn = -0.5 * ((z - center.unsqueeze(-1)) / near_sd) ** 2 - near_sd.log() - c2
-    lqb = -0.5 * (z / broad_std) ** 2 - math.log(broad_std) - c2
-    log_q = torch.logaddexp(lqn, lqb)                           # log(0.5 q_near + 0.5 q_broad)
-    return z, log_q
+    near = ctr.unsqueeze(2) + near_sd[..., None, None] * torch.randn(T, B, Kn, d, device=dev)
+    broad = broad_std * torch.randn(T, B, Kb, d, device=dev)
+    z = torch.cat([near, broad], dim=2)                        # (T,B,K,d)
+    off = math.log(2.0) + 0.5 * d * math.log(2 * math.pi)      # d-dim mixture normalizer
+    lqn = (-0.5 * ((z - ctr.unsqueeze(2)) / near_sd[..., None, None]).pow(2).sum(-1)
+           - d * near_sd[..., None].log() - off)               # (T,B,K)
+    lqb = -0.5 * (z / broad_std).pow(2).sum(-1) - d * math.log(broad_std) - off
+    log_q = torch.logaddexp(lqn, lqb)                          # log(0.5 q_near + 0.5 q_broad), (T,B,K)
+    return z, log_q                                            # (T,B,K,d), (T,B,K)
 
 
 def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_prior,
@@ -70,16 +71,16 @@ def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_pri
     steps; the costly per-sample Jacobians (d_z, d2_z, d_s) for the FP residual are taken
     on a random subsample of n_tcoll steps (stochastic time collocation), so the residual's
     cost is decoupled from T. Returns (residual_loss, jump_loss, ic_loss, data_nll)."""
-    T, B, K = z_col.shape
+    T, B, K, d = z_col.shape
     ctx = model.context(xs, mask)                                  # (T,B,C)
 
     # ---- cheap path (no autodiff): basis at all steps; coeffs at the interval ends s=0,1
-    tau = model.trunk(z_col.reshape(-1, 1)).reshape(T, B, K, -1)   # (T,B,K,p)
+    tau = model.trunk(z_col.reshape(-1, d)).reshape(T, B, K, -1)   # (T,B,K,p)
     b_ends = model.coeffs(ctx, torch.tensor([0.0, 1.0], device=z_col.device))   # (T,B,2,p)
     ell0 = torch.einsum("tbp,tbkp->tbk", b_ends[:, :, 0], tau) + model.bias   # post-update (s=0)
 
-    if decode is None:                                                # 1D direct obs: h(z) = z
-        loglik = -0.5 * (xs[..., 0].unsqueeze(-1) - z_col) ** 2 / noise_std ** 2   # (T,B,K)
+    if decode is None:                                                # direct obs h(z) = z (D = d)
+        loglik = -0.5 * ((xs.unsqueeze(2) - z_col) ** 2).sum(-1) / noise_std ** 2   # (T,B,K)
     else:                                                             # high-D obs: lik = N(y; h(z), sigma^2 I)
         loglik = -0.5 * ((xs.unsqueeze(2) - decode(z_col)) ** 2).sum(-1) / noise_std ** 2   # (T,B,K)
     m = mask[..., 0]                                                   # (T,B)
@@ -102,20 +103,24 @@ def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_pri
     ti = (torch.randperm(T, device=z_col.device)[:n_tcoll] if n_tcoll and n_tcoll < T
           else torch.arange(T, device=z_col.device))
     b_s, ds_b = model.coeffs_dtime(ctx[ti], s_coll)                   # (Ts,B,Ns,p)
-    tau_s, dz_tau, d2z_tau = model.trunk_zderivs(z_col[ti])           # (Ts,B,K,p)
-    dz_ell = torch.einsum("tbsp,tbkp->tbsk", b_s, dz_tau)
-    d2z_ell = torch.einsum("tbsp,tbkp->tbsk", b_s, d2z_tau)
+    tau_s, grad_tau, lap_tau = model.trunk_zderivs(z_col[ti])         # (Ts,B,K,p),(...,K,d,p),(...,K,p)
+    grad_ell = torch.einsum("tbsp,tbkdp->tbskd", b_s, grad_tau)       # (Ts,B,Ns,K,d)  grad ell
+    grad_ell_sq = grad_ell.pow(2).sum(-1)                             # (Ts,B,Ns,K)    |grad ell|^2
+    lap_ell = torch.einsum("tbsp,tbkp->tbsk", b_s, lap_tau)           # (Ts,B,Ns,K)    Laplacian ell
     ds_ell = torch.einsum("tbsp,tbkp->tbsk", ds_b, tau_s)
-    f, df = drift(z_col[ti])                                          # analytic at samples
-    f = f.unsqueeze(2); df = df.unsqueeze(2)                          # (Ts,B,1,K)
-    if callable(sigma):                                              # state-dependent g^2(z)
-        g2, dg2, d2g2 = sigma(z_col[ti])                             # (Ts,B,K) each
+    f, div_f = drift(z_col[ti])                                       # f (Ts,B,K,d), div f (Ts,B,K)
+    f_dot = torch.einsum("tbskd,tbkd->tbsk", grad_ell, f)            # f . grad ell  (Ts,B,Ns,K)
+    divf = div_f.unsqueeze(2)                                        # (Ts,B,1,K)
+    if callable(sigma):                                             # state-dependent g^2(z) -- 1-D only (g_net)
+        g2, dg2, d2g2 = sigma(z_col[ti])                            # (Ts,B,K) each (DiffusionNet.diffusion is 1-D)
         g2 = g2.unsqueeze(2); dg2 = dg2.unsqueeze(2); d2g2 = d2g2.unsqueeze(2)
+        dz_ell = grad_ell[..., 0]                                   # d==1 gradient component
         # 1/2 d^2_z(g^2 rho) in log-space: 1/2 (g^2)'' + (g^2)' ell' + 1/2 g^2 (ell'^2 + ell'')
-        rhs = (-(df + f * dz_ell)
-               + 0.5 * d2g2 + dg2 * dz_ell + 0.5 * g2 * (dz_ell ** 2 + d2z_ell))
-    else:                                                            # constant scalar g
-        rhs = -(df + f * dz_ell) + 0.5 * sigma ** 2 * (dz_ell ** 2 + d2z_ell)
+        rhs = (-(divf + f_dot)
+               + 0.5 * d2g2 + dg2 * dz_ell + 0.5 * g2 * (grad_ell_sq + lap_ell))
+    else:                                                          # constant scalar g (isotropic D = g^2 I)
+        # d-D FP in log-space: -(div f + f . grad ell) + 1/2 g^2 (|grad ell|^2 + Laplacian ell)
+        rhs = -(divf + f_dot) + 0.5 * sigma ** 2 * (grad_ell_sq + lap_ell)
     res2 = (ds_ell / dt - rhs) ** 2                                   # (Ts,B,Ns,K)
     # SCALE-INVARIANT residual (over-dispersion fix): in LOG space the FP terms scale as ~1/sigma^2,
     # so for a SHARP density the L2 residual EXPLODES at collocation samples far from the mode
@@ -187,14 +192,14 @@ def pinn_adjoint_loss(model_b, xs, mask, z_col, log_q, s_coll, drift, sigma,
     Returns (res_b, jump_b, tc_b). Reuses sample_collocation's z_col/log_q, res_mode, and (via
     accumulate_adjoint_grads) w_res. The smoothed readout is gamma_t proportional to
     alpha_t * msg_t / lik_t (see mstep.log_smoothed)."""
-    T, B, K = z_col.shape
+    T, B, K, d = z_col.shape
     ctx = model_b.context(xs, mask)                                # (T,B,C) anti-causal
-    tau = model_b.trunk(z_col.reshape(-1, 1)).reshape(T, B, K, -1)  # (T,B,K,p)
+    tau = model_b.trunk(z_col.reshape(-1, d)).reshape(T, B, K, -1)  # (T,B,K,p)
     b_ends = model_b.coeffs(ctx, torch.tensor([0.0, 1.0], device=z_col.device))   # (T,B,2,p)
     lmsg0 = torch.einsum("tbp,tbkp->tbk", b_ends[:, :, 0], tau) + model_b.bias     # (T,B,K) msg, s=0
 
-    if decode is None:                                             # 1D direct obs: h(z) = z
-        loglik = -0.5 * (xs[..., 0].unsqueeze(-1) - z_col) ** 2 / noise_std ** 2   # (T,B,K)
+    if decode is None:                                             # direct obs h(z) = z (D = d)
+        loglik = -0.5 * ((xs.unsqueeze(2) - z_col) ** 2).sum(-1) / noise_std ** 2   # (T,B,K)
     else:                                                          # high-D: lik = N(y; C z + d, sigma^2 I)
         loglik = -0.5 * ((xs.unsqueeze(2) - decode(z_col)) ** 2).sum(-1) / noise_std ** 2
     m = mask[..., 0]                                               # (T,B)
@@ -215,17 +220,19 @@ def pinn_adjoint_loss(model_b, xs, mask, z_col, log_q, s_coll, drift, sigma,
     ti = (torch.randperm(T, device=z_col.device)[:n_tcoll] if n_tcoll and n_tcoll < T
           else torch.arange(T, device=z_col.device))
     b_s, ds_b = model_b.coeffs_dtime(ctx[ti], s_coll)             # (Ts,B,Ns,p)
-    tau_s, dz_tau, d2z_tau = model_b.trunk_zderivs(z_col[ti])     # (Ts,B,K,p)
-    dz_lm = torch.einsum("tbsp,tbkp->tbsk", b_s, dz_tau)
-    d2z_lm = torch.einsum("tbsp,tbkp->tbsk", b_s, d2z_tau)
+    tau_s, grad_tau, lap_tau = model_b.trunk_zderivs(z_col[ti])   # (Ts,B,K,p),(...,K,d,p),(...,K,p)
+    grad_lm = torch.einsum("tbsp,tbkdp->tbskd", b_s, grad_tau)   # (Ts,B,Ns,K,d)
+    grad_lm_sq = grad_lm.pow(2).sum(-1)                          # (Ts,B,Ns,K)
+    lap_lm = torch.einsum("tbsp,tbkp->tbsk", b_s, lap_tau)       # (Ts,B,Ns,K)
     ds_lm = torch.einsum("tbsp,tbkp->tbsk", ds_b, tau_s)
-    f, _ = drift(z_col[ti])                                       # backward generator uses f (NOT f')
-    f = f.unsqueeze(2)                                            # (Ts,B,1,K)
-    if callable(sigma):                                          # state-dependent g^2(z)
+    f, _ = drift(z_col[ti])                                       # backward GENERATOR uses f (not div f)
+    f_dot = torch.einsum("tbskd,tbkd->tbsk", grad_lm, f)         # f . grad lmsg  (Ts,B,Ns,K)
+    if callable(sigma):                                          # state-dependent g^2(z) -- 1-D only (g_net)
         g2 = sigma(z_col[ti])[0].unsqueeze(2)
-        rhs = f * dz_lm + 0.5 * g2 * (dz_lm ** 2 + d2z_lm)        # NO d2g2/dg2 (generator, not FP adjoint)
-    else:                                                        # constant scalar g
-        rhs = f * dz_lm + 0.5 * sigma ** 2 * (dz_lm ** 2 + d2z_lm)
+        rhs = f_dot + 0.5 * g2 * (grad_lm_sq + lap_lm)           # NO d2g2/dg2 (generator, not FP adjoint)
+    else:                                                        # constant scalar g (isotropic)
+        # d-D backward generator: f . grad lmsg + 1/2 g^2 (|grad lmsg|^2 + Laplacian lmsg)
+        rhs = f_dot + 0.5 * sigma ** 2 * (grad_lm_sq + lap_lm)
     res2 = (ds_lm / dt - rhs) ** 2                                # (Ts,B,Ns,K)
     if res_mode == "rel":                                         # scale-invariant residual (as forward)
         scale = rhs.detach() ** 2 + (ds_lm / dt).detach() ** 2 + 1.0

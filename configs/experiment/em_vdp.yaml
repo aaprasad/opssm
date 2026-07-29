@@ -1,0 +1,16 @@
+# @package _global_
+# Multi-D latent milestone: Van der Pol (2-D). Learn f, g, and the D x d Stiefel sensor from a high-D
+# linear sensor of a 2-D latent. No KL (the O(N^d) grid oracle is deferred); scored by the Procrustes
+# lat_rmse_aln + drift_l2_aln + principal-angle c_cos. Watch the logged `ess` (SNIS curse of dim).
+defaults:
+  - override /data: vanderpol
+model:
+  learn_obs: true
+  data_size: 10
+  latent_dim: 2       # MUST match the datamodule's system dim (vanderpol -> 2)
+  w_res: 0.4          # high-D sweet spot (as in em_highd): a higher-D sensor sharpens the true posterior
+  n_colloc: 256       # bumped from 128 -- SNIS ESS decays with latent dim (E-step residual is chunked)
+  n_mean: 384         # modest bump from 256 (mesh-free E[z|y] / joint-g sample count). The M-step readouts
+                      #   are (T,B,K,p) and NOT chunked, so K is the memory driver -> keep it moderate; watch
+                      #   the logged `ess` and raise with chunk_size if SNIS ESS is low.
+  chunk_size: 8       # halved vs default 16 -- the d=2 FP residual grad_tau is (...,d,p), i.e. 2x the memory
