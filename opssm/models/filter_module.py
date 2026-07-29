@@ -60,14 +60,17 @@ class ZakaiFilterModule(pl.LightningModule):
                  g_init=1.0, learn_dynamics=True, learn_g=True, g_net=False, learn_obs=False,
                  pca_init=True, c_stable_tol=0.05, meshfree_mean=True, n_mean=256,
                  res_mode="rel", w_res=0.2, learn_smoother=False, joint_g=False,
+                 encoder="gru", encoder_kwargs=None,
                  loss="zakai", train_dir="./dump/nzf"):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
         h = self.hparams
-        self.model = OperatorFilter(h.data_size, h.gru_hidden, h.ctx_dim, h.p)
+        self.model = OperatorFilter(h.data_size, h.gru_hidden, h.ctx_dim, h.p,
+                                    encoder=h.encoder, encoder_kwargs=h.encoder_kwargs)
         # backward adjoint-Zakai twin for the two-filter smoother (default off => byte-identical filter)
-        self.model_b = OperatorBackward(h.data_size, h.gru_hidden, h.ctx_dim, h.p) \
+        self.model_b = OperatorBackward(h.data_size, h.gru_hidden, h.ctx_dim, h.p,
+                                        encoder=h.encoder, encoder_kwargs=h.encoder_kwargs) \
             if h.learn_smoother else None
         self.drift_net = DriftNet(h.drift_hidden); self.drift_net.requires_grad_(False)
         self.diff_net = None

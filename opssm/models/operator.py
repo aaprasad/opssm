@@ -19,6 +19,7 @@ import torch
 from torch import nn
 from torch.func import jvp
 
+from opssm.models.encoders import make_encoder
 from opssm.models.nn import mlp
 
 
@@ -38,21 +39,28 @@ class OperatorFilter(nn.Module):
     Euler (see pinn_zakai_loss)."""
 
     def __init__(self, data_size=1, gru_hidden=64, ctx_dim=64, p=64,
-                 branch_hidden=128, trunk_hidden=64, trunk_layers=3):
+                 branch_hidden=128, trunk_hidden=64, trunk_layers=3,
+                 encoder="gru", encoder_kwargs=None, reverse=False):
         super().__init__()
-        # input = [obs (zeroed where missing), observed-mask] so the GRU knows when
-        # to update vs predict-only through an observation gap.
-        self.gru = nn.GRU(input_size=data_size + 1, hidden_size=gru_hidden)
-        self.to_ctx = nn.Linear(gru_hidden, ctx_dim)
+        # CAUSAL context encoder: packs [obs (zeroed where missing), observed-mask] -> (T,B,ctx_dim), so it
+        # knows when to update vs predict-only through a gap. Pluggable (encoder=gru|tcn|transformer|...);
+        # built FIRST so the default gru keeps the original init RNG order (byte-identical). `gru_hidden`
+        # doubles as the generic encoder hidden width.
+        enc_kwargs = {"hidden": gru_hidden, **(encoder_kwargs or {})}   # encoder_kwargs may override hidden
+        self.encoder = make_encoder(encoder, data_size + 1, ctx_dim, **enc_kwargs)
+        self.reverse = reverse                                       # True = anti-causal (backward twin)
         self.branch = mlp([ctx_dim + 1, branch_hidden, p])           # (context, time) -> coeffs
         self.trunk = mlp([1] + [trunk_hidden] * trunk_layers + [p])  # query z -> state basis
         self.bias = nn.Parameter(torch.zeros(()))
 
     def context(self, xs, mask):
-        """xs (T,B,M), mask (T,B,1) observed-indicator -> causal context (T,B,C)."""
+        """xs (T,B,M), mask (T,B,1) observed-indicator -> context (T,B,C). reverse=False: CAUSAL, ctx[t]
+        summarizes y_{0:t}. reverse=True (backward twin): ANTI-CAUSAL via flip -> causal encoder -> flip,
+        so ctx[t] summarizes y_{t:T} (inclusive) -- generic over ANY causal encoder."""
         inp = torch.cat([xs * mask, mask], dim=-1)         # (T,B,M+1)
-        h, _ = self.gru(inp)                               # (T,B,gru_hidden)
-        return self.to_ctx(h)                              # (T,B,C)
+        if self.reverse:
+            return self.encoder(inp.flip(0)).flip(0)       # (T,B,C); ctx[t] <- y_{t:T}
+        return self.encoder(inp)                           # (T,B,C); ctx[t] <- y_{0:t}
 
     def coeffs(self, ctx, s):
         """Branch coefficients b(c, s) at within-interval times s (Ns,) -> (T,B,Ns,p)."""
@@ -94,19 +102,17 @@ class OperatorFilter(nn.Module):
 class OperatorBackward(OperatorFilter):
     """ANTI-CAUSAL twin of OperatorFilter for the BACKWARD adjoint-Zakai smoother. Identical DeepONet
     machinery (trunk / branch / coeffs / coeffs_dtime / trunk_zderivs) with its OWN weights; only the
-    context differs -- an anti-causal GRU. log_density(ctx_b, z, s=0) = log msg_t(z), the (unnormalized)
-    post-update backward MESSAGE msg_t(z) = p(y_{t:T} | z_t) (INCLUDES obs t, mirroring the forward
-    post-update pi_t = p(z_t | y_{0:t}); s>0 transports it backward (adjoint FP) toward obs t-1, and the
-    jump ties it to msg_{t-1} via lik_{t-1} -- see pinn_adjoint_loss). The smoothed posterior is
-    gamma_t(z) = p(z_t | y_{0:T}) proportional to alpha_t(z) * beta_t(z) = alpha_t * msg_t / lik_t, i.e.
-    softmax_z( ell_forward + log msg - loglik_t ) (see mstep.log_smoothed)."""
+    context differs -- anti-causal, via reverse=True (flip -> causal encoder -> flip, so ctx[t] summarizes
+    y_{t:T} INCLUDING obs t). log_density(ctx_b, z, s=0) = log msg_t(z), the (unnormalized) post-update
+    backward MESSAGE msg_t(z) = p(y_{t:T} | z_t) (mirroring the forward post-update pi_t = p(z_t | y_{0:t});
+    s>0 transports it backward (adjoint FP) toward obs t-1, and the jump ties it to msg_{t-1} via lik_{t-1}
+    -- see pinn_adjoint_loss). The smoothed posterior is gamma_t(z) = p(z_t | y_{0:T}) proportional to
+    alpha_t(z) * beta_t(z) = alpha_t * msg_t / lik_t, i.e. softmax_z( ell_forward + log msg - loglik_t )
+    (see mstep.log_smoothed)."""
 
-    def context(self, xs, mask):
-        """xs (T,B,M), mask (T,B,1) -> ANTI-CAUSAL context (T,B,C): ctx[t] summarizes y_{t:T} (INCLUDING
-        obs t), so s=0 represents the post-update backward message msg_t(z) = p(y_{t:T} | z_t)."""
-        inp = torch.cat([xs * mask, mask], dim=-1)         # (T,B,M+1)
-        h, _ = self.gru(inp.flip(0))                       # causal GRU on the reversed seq = anti-causal
-        return self.to_ctx(h.flip(0))                      # (T,B,C); ctx[t] summarizes y_{t:T}
+    def __init__(self, *args, **kwargs):
+        kwargs["reverse"] = True                           # anti-causal: context = flip -> encoder -> flip
+        super().__init__(*args, **kwargs)
 
     def log_msg(self, xs, mask, z):
         """Normalized backward-message log-density at s=0 on grid z (for viz; the normalizer is
