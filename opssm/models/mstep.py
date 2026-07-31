@@ -26,6 +26,7 @@ import math
 import torch
 
 from opssm.models.obs import make_decode, zhat_from_obs
+from opssm.models.losses import sample_collocation
 
 
 @torch.no_grad()
@@ -296,19 +297,45 @@ def log_smoothed(model, model_b, x, mask, z_grid):
     return log_g - torch.logsumexp(log_g, dim=-1, keepdim=True)
 
 
-def fit_drift(drift_net, dr_opt, zc, dz, reg_lambda, m_inner):
-    """Regress f_theta(z) ~ dz (d-D: fit ||f - dz||^2 over d). Smoothness via L2 weight decay on the net
-    -- the 1-D finite-diff H2 grid penalty has no mesh-free d-D analog (a sampled-point Jacobian-norm
-    penalty is a future option). Updates drift_net in place. zc, dz: (N,d)."""
+def fit_dynamics(drift_net, dr_opt, zc, dz, g_cur, dt, reg_lambda, m_inner, *,
+                 w_em=1.0, w_inv=0.0, inv=None, g_lr=1e-2):
+    """JOINTLY fit the drift f (DriftNet) AND the diffusion g^2 (a scalar) by gradient descent on a WEIGHTED
+    loss -- the two co-adapt to the physics each step, not alternated or switched:
+        loss = w_em  * ||f(z_t) - dz||^2                                  (EM: filter-MEAN increment; f only)
+             + w_inv * (ds_ell/dt + div f + f.grad ell - g^2 B)^2         (FP residual for f AND g^2; the Zakai
+             + reg_lambda * ||f||^2                                        PDE coefficient the density implies)
+    with B = 1/2(|grad ell|^2 + Laplacian ell) the diffusion signature. The FP residual is BILINEAR in f and
+    g^2, so f and g^2 step TOGETHER. The increment pins the ROTATIONAL (divergence-free) drift the residual
+    leaves free at d>=2; the residual is free of the 1/dt increment amplification and supplies g from the
+    LAPLACIAN signature (not the drift-limited increment variance g_est^2 = g^2 + drift_rmse^2*dt). `inv =
+    (z_col, grad_ell, ds_ell, lap_ell)` the precomputed operator derivatives (detached, from _fp_residual_terms)
+    or None to skip the FP term. Returns the fitted scalar g if learned here (w_inv>0 with inv), else None.
+    Updates drift_net in place. zc, dz: (N,d)."""
+    dev = zc.device
+    learn_g_here = w_inv > 0 and inv is not None
+    g = torch.tensor(max(float(g_cur), 1e-3), device=dev, requires_grad=learn_g_here)   # the FACTOR g (not g^2)
+    g_opt = torch.optim.Adam([g], lr=g_lr) if learn_g_here else None
     drift_net.requires_grad_(True)
     for _ in range(m_inner):
         dr_opt.zero_grad()
-        f = drift_net.net(zc)                                       # (N,d)
-        fit = ((f - dz) ** 2).sum(-1).mean()
-        reg = sum(p.pow(2).sum() for p in drift_net.net.parameters())
-        (fit + reg_lambda * reg).backward()
+        if g_opt is not None:
+            g_opt.zero_grad()
+        loss = reg_lambda * sum(p.pow(2).sum() for p in drift_net.net.parameters())   # l_reg
+        if w_em > 0:                                                # l_em: filter-mean increment regression (f)
+            loss = loss + w_em * ((drift_net.net(zc) - dz) ** 2).sum(-1).mean()
+        if learn_g_here:                                           # l_inv: FP residual (f AND g jointly)
+            z_col, grad_ell, ds_ell, lap_ell = inv
+            f, div_f = drift_net.drift(z_col)                       # (T,B,K,d), (T,B,K)  WITH grad (div f too)
+            f_dot = torch.einsum("tbskd,tbkd->tbsk", grad_ell, f)  # (T,B,Ns,K)  f . grad ell
+            Bsig = 0.5 * (grad_ell.pow(2).sum(-1) + lap_ell)       # (T,B,Ns,K)  diffusion signature
+            res = ds_ell / dt + div_f.unsqueeze(2) + f_dot - g ** 2 * Bsig   # g^2 in the FP term; g is the param
+            loss = loss + w_inv * res.pow(2).mean()
+        loss.backward()
         dr_opt.step()
+        if g_opt is not None:
+            g_opt.step()
     drift_net.requires_grad_(False)
+    return float(g.detach().abs().clamp_min(0.05)) if learn_g_here else None   # report |g| (sign-symmetric)
 
 
 def fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,
@@ -354,6 +381,24 @@ def fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,
 
 
 @torch.no_grad()
+def _fp_residual_terms(model, x, mask, n_colloc, near_std, broad_std, center=None, n_scoll=4):
+    """Shared FP-residual pieces for the inverse-problem dynamics fit: sample collocation and return the
+    operator's DENSITY DERIVATIVES at those points, all DETACHED (the density is fixed for the M-step). Computed
+    ONCE per M-step and handed to fit_dynamics as `inv`. Returns (z_col, grad_ell, ds_ell, lap_ell) with shapes
+    (T,B,K,d), (T,B,Ns,K,d), (T,B,Ns,K), (T,B,Ns,K). Mirrors the FP-residual derivative block of pinn_zakai_loss."""
+    dev = x.device
+    s_coll = torch.linspace(0.0, 1.0, n_scoll, device=dev)
+    z_col, _ = sample_collocation(x, mask, n_colloc, near_std, broad_std, center)   # (T,B,K,d)
+    ctx = model.context(x, mask)
+    b_s, ds_b = model.coeffs_dtime(ctx, s_coll)                       # (T,B,Ns,p)
+    tau_s, grad_tau, lap_tau = model.trunk_zderivs(z_col)             # (T,B,K,p),(...,K,d,p),(...,K,p)
+    grad_ell = torch.einsum("tbsp,tbkdp->tbskd", b_s, grad_tau)      # (T,B,Ns,K,d)  grad ell
+    ds_ell = torch.einsum("tbsp,tbkp->tbsk", ds_b, tau_s)           # (T,B,Ns,K)  d_s ell
+    lap_ell = torch.einsum("tbsp,tbkp->tbsk", b_s, lap_tau)         # (T,B,Ns,K)  Laplacian ell
+    return z_col, grad_ell, ds_ell, lap_ell
+
+
+@torch.no_grad()
 def fit_obs_map_stiefel(z_hat, y, C_cur):
     """High-D Stiefel observation map (orthogonal Procrustes): C = unit direction of the cross-covariance
     of y and the inferred latent; d is the intercept. Obs are standardized upstream so the decode has no
@@ -375,7 +420,7 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
           learn_g, g_net, reg_lambda, reg_lambda_g, m_inner,
           learn_obs=False, c_stable_tol=0.05, C_cur=None, d_cur=None,
           meshfree_mean=False, n_mean=256, near_std=0.3, broad_std=1.6, mean_method="fixed", mala=None,
-          joint_g=False, noise_std=None, g_cur_in=None):
+          joint_g=False, noise_std=None, g_cur_in=None, w_em=1.0, w_inv=0.0, g_lr=1e-2, n_colloc=None):
     """One EM M-step. Order: posterior-mean increments -> (high-D) Stiefel obs-map + cstab ->
     drift GATED on `cstab < c_stable_tol` -> diffusion. In 1-D (learn_obs=False) cstab==0, so the
     gate is always open and this reduces to the plain f,g M-step. `meshfree_mean` replaces the grid
@@ -395,7 +440,7 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
     else:
         z_hat = posterior_mean(model, x, mask, z_grid)                # (T, B) -- 1-D grid only
     pair = None                                                       # filter lag-one joint for g (drift stays on the mean)
-    if joint_g and learn_g:
+    if joint_g and learn_g and w_inv == 0:                            # only the increment g-path uses the pair
         g_j = g_cur_in if g_cur_in is not None else 0.5
         if mean_method == "mala":                                     # MCMC joint (Rao-Blackwellized; no SNIS collapse)
             mk = {k: mala[k] for k in ("n_chains", "n_steps", "rng")} if mala else {}
@@ -415,10 +460,14 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
     cstab = 0.0
     if learn_obs:
         C_cur, d_cur, cstab = fit_obs_map_stiefel(z_hat, x, C_cur)
-    if cstab < c_stable_tol:                                          # sensor-before-dynamics gate
-        fit_drift(drift_net, dr_opt, zc, dz, reg_lambda, m_inner)
+    g_joint = None
+    if cstab < c_stable_tol:                                          # sensor-before-dynamics gate: fit f (+ g jointly)
+        inv = _fp_residual_terms(model, x, mask, n_colloc if n_colloc is not None else n_mean,
+                                 near_std, broad_std, center) if w_inv > 0 else None
+        g_joint = fit_dynamics(drift_net, dr_opt, zc, dz, g_cur_in if g_cur_in is not None else 0.5, dt,
+                               reg_lambda, m_inner, w_em=w_em, w_inv=w_inv, inv=inv, g_lr=g_lr)
     g_cur = None
-    if learn_g:
-        g_cur = fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,
-                              g_net, reg_lambda_g, m_inner, pair=pair)
+    if learn_g:                                                      # g_joint set iff w_inv>0 (fit WITH f); else increment
+        g_cur = g_joint if g_joint is not None else fit_diffusion(
+            diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt, g_net, reg_lambda_g, m_inner, pair=pair)
     return dict(g_cur=g_cur, C_cur=C_cur, d_cur=d_cur, cstab=cstab, ess=ess, accept=accept)
