@@ -18,13 +18,45 @@ drift-limited mean-increment regression (`fit_drift`):
 - `_fp_residual_terms` computes the operator density-derivatives once per M-step (detached, mirrors the FP block
   of `pinn_zakai_loss`). `mstep.py` commits: b585791 (joint fit) + 5eef11d (increment-g init).
 
-## Running now (workstation, task bycvcugid)
+## d=1 RESULT (2026-07-31): NEGATIVE -- the naive joint FP-inverse DIVERGES
 
-d=1 A/B on `em_highd` (exact-filter KL as ground truth), 14000 steps each, chained one-at-a-time:
-`em` (w_em=1,w_inv=0) -> `blend` (1,1) -> `inv` (0,1). EM baseline was ~8.75 it/s.
-Logs: `dump/fpinv_highd_{em,blend,inv}.log` (+ `dump/fpinv_highd_chain.log`). These logs are LOCAL to the
-workstation (dump/ is gitignored) -- read them there when the chain finishes. Quick read:
-`for f in dump/fpinv_highd_*.log; do echo $f; tr '\r' '\n' <$f | grep -oE "kl=[0-9.]+|drift_rel=[0-9.]+|g_rel=[0-9.]+" | tail -3; done`
+d=1 A/B on `em_highd` (exact-filter KL ground truth), 14000 steps, `mean_method=mala`:
+
+    config                     kl      drift_rel   g_rel    lat_rel
+    em    (w_em=1, w_inv=0)    0.355   0.257       0.914    0.116     <- EM baseline (good, stable)
+    blend (w_em=1, w_inv=1)    0.767   1.440       0.507    0.129     <- WORSE, and DIVERGING
+    inv   (w_em=0, w_inv=1)    0.756   1.390       0.508    0.129     <- WORSE, and DIVERGING
+
+Trajectories (per validation) show it DRIFTS AWAY over training, not a plateau:
+- `kl`:        blend/inv 0.36 -> 0.50 -> 0.62 -> 0.69 -> 0.77   (EM: 0.36 -> 0.355 stable)
+- `drift_rel`: blend/inv 1.0 -> 1.15 -> 1.24 -> 1.36 -> 1.44    (EM: 1.0 -> 0.26 converges)
+- `g_rel`:     blend/inv 0.65 -> 0.60 -> 0.56 -> 0.53 -> 0.51   (g SHRINKS -- under-reads)
+Even the BLEND (increment anchor on f) diverges, so anchoring f alone is not enough.
+
+**Diagnosis -- co-adaptation / g-runaway.** The FP residual is now minimized by BOTH the E-step (w.r.t. `ell`)
+AND the M-step (w.r.t. `f,g`). It's under-determined, so with only a weak data anchor (jump/IC vs `w_res=0.2`)
+they co-adapt to a DEGENERATE self-consistent solution: `g` shrinks -> the density sharpens -> the residual's
+`g`-fit shrinks `g` further -> `f` compensates toward a wrong drift -> `ell` drifts off the true filter (`kl`
+climbs). The E-step's `w_res` already lets the residual bend `ell`; the M-step residual-fit adds pressure the
+anchor can't hold. This is exactly the "keep `ell` data-driven" caveat -- it wasn't held.
+
+## Things to try next (prioritized)
+
+1. **Stronger data anchor:** lower `w_res` (e.g. 0.05) so the E-step keeps `ell` data-driven; the M-step then
+   fits `f,g` to a TRUE filter, not a co-adapted one. (Config-only; the cheapest test of the diagnosis.)
+2. **Weak inverse regularizer:** `w_inv` small (0.1-0.3) on top of EM (`w_em=1`) -- a gentle physics nudge that
+   may not overpower the anchor. If this beats EM without diverging, it's the usable regime.
+3. **Fix the g-runaway:** fit `f` from the residual but keep `g` from the INCREMENT (don't jointly fit `g`).
+   Needs a small flag in `fit_dynamics`/`mstep` (fit `f` only via the FP term, `g` via `fit_diffusion`). Tests
+   whether `g` is the driver.
+4. Deeper: the residual-fit assumes `ell` is the TRUE data-driven filter; the E-step training `ell` to satisfy
+   the SAME residual makes it circular. May need to fit `f,g` against `ell` derivatives that are anchored purely
+   by jump/IC (or a smoother/held-out `ell`), not the residual-trained one.
+
+## Local runs (workstation)
+
+Logs: `dump/fpinv_highd_{em,blend,inv}.log` (dump/ is gitignored, so LOCAL to the workstation). Quick read:
+`for f in dump/fpinv_highd_*.log; do echo $f; tr '\r' '\n' <$f | grep -oE "kl=[0-9.]+|drift_rel=[0-9.]+|g_rel=[0-9.]+" | tail -1; done`
 
 ## Baselines to beat
 
