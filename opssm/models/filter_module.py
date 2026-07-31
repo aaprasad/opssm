@@ -33,7 +33,8 @@ from torch import optim
 
 from opssm.models.operator import OperatorFilter, OperatorBackward
 from opssm.models.dynamics import DriftNet, DiffusionNet
-from opssm.models.losses import accumulate_pinn_grads, accumulate_adjoint_grads, kl_target_pred
+from opssm.models.losses import (accumulate_pinn_grads, accumulate_adjoint_grads, kl_target_pred,
+                                 sample_collocation)
 from opssm.models.mstep import mstep, log_smoothed
 from opssm.models.obs import make_decode, zhat_from_obs
 from opssm.models.mstep import filter_mean
@@ -289,6 +290,18 @@ class ZakaiFilterModule(pl.LightningModule):
         if h.learn_obs and dm.C_true is not None:                   # c_cos: mean principal-angle cosine (any d)
             Cn = dm.C_true / dm.C_true.norm(dim=0, keepdim=True)
             logs["c_cos"] = float(torch.linalg.svdvals(self.C_cur.t() @ Cn).clamp(max=1.0).mean())
+        # collocation SNIS health: ESS FRACTION of the E-step posterior weights W = softmax(ell0 - log_q) over
+        # the proposal points -- the importance-sampling analog of the (now-MALA) mean readout's `ess`. Watches
+        # whether the curse of dimensionality collapses the COLLOCATION weights as d grows (the Phase-3
+        # MCMC-collocation decision: is SNIS actually degrading here the way the mean readout was?).
+        with torch.no_grad():
+            _, ctr_c = self._decode_center(x)
+            z_col, log_q = sample_collocation(x, mask, h.n_colloc, h.near_std, h.broad_std, ctr_c)
+            b0_c = self.model.coeffs(self.model.context(x, mask), torch.zeros(1, device=x.device))[:, :, 0]
+            tau_c = self.model.trunk(z_col.reshape(-1, z_col.shape[-1])).reshape(*z_col.shape[:3], -1)
+            ell0_c = torch.einsum("tbp,tbkp->tbk", b0_c, tau_c) + self.model.bias
+            Wc = torch.softmax(ell0_c - log_q, dim=-1)               # (T,B,K) SNIS posterior weights
+            logs["ess_coll"] = float((1.0 / (h.n_colloc * Wc.pow(2).sum(-1))).mean())
         s_fit = None                                                # PROCRUSTES gauge-aligned metrics (well-posed)
         if h.learn_obs and dm.z_val_true is not None:
             al = self._gauge_aligned(log_pi, filt, m_op_al, dm.z_val_true)
