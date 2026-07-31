@@ -12,4 +12,4 @@ model:
   w_res: 0.4          # high-D sweet spot (as in em_highd / em_vdp)
   n_colloc: 384       # bumped for the d=3 SNIS load (E-step residual is chunked, so this is memory-cheap)
   n_mean: 512         # mesh-free E[z|y] / joint-g sample count
-  chunk_size: 4       # the d=3 FP residual grad_tau is (...,d,p) = 3x the 1-D memory -> smaller chunk
+  anim_posterior: true  # render the animated posterior scatter p(z1,z2,z3 | y_{0:t}) colored by p, over time

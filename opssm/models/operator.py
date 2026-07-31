@@ -17,7 +17,7 @@ filter, and its anti-causal backward-message twin for the smoother)."""
 
 import torch
 from torch import nn
-from torch.func import jvp
+from torch.func import jvp, vmap
 
 from opssm.models.encoders import make_encoder
 from opssm.models.nn import mlp
@@ -81,19 +81,35 @@ class OperatorFilter(nn.Module):
 
     def trunk_zderivs(self, z):
         """State basis trunk(z) with its GRADIENT + LAPLACIAN by autodiff (mesh-free; z (...,d)) ->
-        tau (...,p), grad_tau (...,d,p) [d_i tau], lap_tau (...,p) [sum_i d_ii tau]. Per-axis FUSED
-        forward-over-forward jvp: one nested jvp along e_i yields BOTH d_i tau and d_ii tau (cost ~4d
-        forward passes, independent of p -- vs jacrev/hessian which scale with p, p*d)."""
+        tau (...,p), grad_tau (...,d,p) [d_i tau], lap_tau (...,p) [sum_i d_ii tau]. FUSED
+        forward-over-forward jvp along each unit tangent e_i yields BOTH d_i tau and d_ii tau; VMAPPED over
+        the d tangents (one batched op instead of a Python loop -- fewer kernel launches, d x peak memory).
+        Cost ~4d forward passes, independent of p -- vs jacrev/hessian which scale with p, p*d."""
         d = z.shape[-1]
         zin = z.reshape(-1, d)                                        # (N,d)
-        grads, lap, tau = [], 0.0, None
-        for i in range(d):
-            e = torch.zeros_like(zin); e[:, i] = 1.0                  # unit tangent along axis i
-            (tau, di), (_, dii) = jvp(lambda x: jvp(self.trunk, (x,), (e,)), (zin,), (e,))
-            grads.append(di); lap = lap + dii                        # d_i tau ; accumulate Laplacian
+        eye = torch.eye(d, device=z.device, dtype=z.dtype)           # (d,d) unit tangents
+
+        def along(e):                                               # e (d,) -> derivs along axis e
+            v = e.expand_as(zin)                                    # (N,d) tangent
+            (tau, di), (_, dii) = jvp(lambda x: jvp(self.trunk, (x,), (v,)), (zin,), (v,))
+            return tau, di, dii                                    # each (N,p)
+
+        tau, grad, lap_ax = vmap(along)(eye)                        # (d,N,p) each; tau identical over tangents
         shp = z.shape[:-1]
-        grad = torch.stack(grads, dim=-2)                            # (N,d,p)
-        return tau.reshape(*shp, -1), grad.reshape(*shp, d, -1), lap.reshape(*shp, -1)
+        return (tau[0].reshape(*shp, -1),                          # tau: take one copy
+                grad.movedim(0, -2).reshape(*shp, d, -1),          # (d,N,p) -> (N,d,p)
+                lap_ax.sum(0).reshape(*shp, -1))                   # sum axes -> Laplacian (N,p)
+
+    def trunk_grad(self, z):
+        """State basis trunk(z) with its GRADIENT only (no Laplacian) -> tau (...,p), grad_tau (...,d,p)
+        [d_i tau]. Single forward jvp per unit tangent, VMAPPED over the d tangents (= forward-mode
+        Jacobian) -- ~half the cost/memory of trunk_zderivs; used by the MALA readout (grad ell only)."""
+        d = z.shape[-1]
+        zin = z.reshape(-1, d)                                        # (N,d)
+        eye = torch.eye(d, device=z.device, dtype=z.dtype)          # (d,d) unit tangents
+        tau, grads = vmap(lambda e: jvp(self.trunk, (zin,), (e.expand_as(zin),)))(eye)   # (d,N,p) each
+        shp = z.shape[:-1]
+        return tau[0].reshape(*shp, -1), grads.movedim(0, -2).reshape(*shp, d, -1)
 
     def log_density(self, ctx, z, s=0.0):
         """ctx (T,B,C), z (Nz,) [1-D grid] or (Nz,d) at within-interval time s (scalar) -> ell (T,B,Nz)."""

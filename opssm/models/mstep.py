@@ -80,6 +80,89 @@ def posterior_mean_fixed(model, x, mask, center, n_samples, near_std, broad_std)
 
 
 @torch.no_grad()
+def _mala_chains(model, x, mask, center, n_chains, n_steps, broad_std, rng="stochastic",
+                 step_size=0.1, burn_in=None, init_std=0.0, adapt=True):
+    """Core sampler: T*B INDEPENDENT d-dim MALA chains on the per-time filter marginal pi_t ~ exp(ell_t) (the
+    marginals are independent across t -> fully parallel, no time recurrence). ell_t from b0 = coeffs(ctx,s=0);
+    grad ell = einsum(b0, grad_tau) via trunk_grad. Chains init AT the pseudo-inverse `center` (init_std=0 ->
+    the first Langevin step decorrelates them), BROAD (broad_std) only at unobserved sites; per-site step size
+    adapts toward the 0.574 MALA optimum during burn_in (default n_steps//3). `rng`: 'stochastic' = fresh each
+    call; 'crn' = fixed seed (deterministic); 'qmc' deferred. Returns (z_final (T,B,K,d) the final chain states
+    ~ pi_t, z_mean (T,B,d) post-burn-in chain mean, accept_frac). The mean readout uses z_mean; the lag-one
+    joint g uses z_final as samples from alpha_t."""
+    dev = center.device
+    T, B, d = center.shape
+    if burn_in is None:
+        burn_in = max(1, n_steps // 3)                              # auto: a third of the sweeps
+    if rng == "crn":
+        gen = torch.Generator(device=dev).manual_seed(0)            # fixed draws -> deterministic across M-steps
+    elif rng == "stochastic":
+        gen = None                                                  # default RNG -> fresh each M-step
+    else:
+        raise NotImplementedError(f"rng={rng!r}: qmc = Sobol across the chain ensemble; implement only if "
+                                  "stochastic diverges (plan Phase 1 fallback order stochastic->qmc->crn)")
+    randn = lambda *s: torch.randn(*s, device=dev, generator=gen)   # noqa: E731
+    rand = lambda *s: torch.rand(*s, device=dev, generator=gen)     # noqa: E731
+    ctx = model.context(x, mask)
+    b0 = model.coeffs(ctx, torch.zeros(1, device=dev))[:, :, 0]     # (T,B,p) log-density coeffs at s=0
+
+    def ell_grad(z):                                               # z (T,B,K,d) -> ell (T,B,K), grad (T,B,K,d)
+        tau, gtau = model.trunk_grad(z)                            # tau (T,B,K,p), gtau (T,B,K,d,p)
+        ell = torch.einsum("tbp,tbkp->tbk", b0, tau) + model.bias
+        return ell, torch.einsum("tbp,tbkdp->tbkd", b0, gtau)
+
+    obs = mask[..., 0]                                             # (T,B) observed indicator
+    c = (center * obs.unsqueeze(-1)).unsqueeze(2)                  # (T,B,1,d) zero the meaningless gap center
+    sd = (init_std * obs + broad_std * (1.0 - obs))[..., None, None]   # (T,B,1,1) BROAD init at gaps
+    z = c + sd * randn(T, B, n_chains, d)                         # (T,B,K,d) chain init
+    ell, grad = ell_grad(z)
+    eps = torch.full((T, B, 1, 1), float(step_size), device=dev)  # per-site step size
+    acc_sum, zsum, ncol = 0.0, torch.zeros_like(center), 0
+    for k in range(n_steps):
+        noise = randn(T, B, n_chains, d)
+        z_p = z + eps * grad + (2 * eps).sqrt() * noise           # Langevin proposal
+        ell_p, grad_p = ell_grad(z_p)
+        e4 = 4 * eps.squeeze(-1)                                   # (T,B,1)
+        log_q_fwd = -(z_p - z - eps * grad).pow(2).sum(-1) / e4    # log q(z'|z)  (T,B,K)
+        log_q_bwd = -(z - z_p - eps * grad_p).pow(2).sum(-1) / e4  # log q(z|z')
+        log_alpha = (ell_p - ell) + (log_q_bwd - log_q_fwd)       # (T,B,K) Metropolis ratio
+        acc = rand(T, B, n_chains).log() < log_alpha              # (T,B,K) accept
+        ae = acc.unsqueeze(-1)
+        z = torch.where(ae, z_p, z); ell = torch.where(acc, ell_p, ell); grad = torch.where(ae, grad_p, grad)
+        acc_sum += float(acc.float().mean())
+        if adapt and k < burn_in:                                 # per-site step adaptation toward 0.574 (deterministic)
+            ap = acc.float().mean(-1)[..., None, None]            # (T,B,1,1)
+            eps = (eps * (0.75 * (ap - 0.574)).exp()).clamp(1e-4, 2.0)
+        if k >= burn_in:
+            zsum = zsum + z.mean(2); ncol += 1                    # accumulate post-burn-in chain mean
+    return z, zsum / max(ncol, 1), acc_sum / max(n_steps, 1)      # (T,B,K,d) states, (T,B,d) mean, accept
+
+
+@torch.no_grad()
+def posterior_mean_mala(model, x, mask, center, n_chains, n_steps, broad_std, rng="stochastic",
+                        step_size=0.1, burn_in=None, init_std=0.0, adapt=True):
+    """MALA readout of the per-time filter mean E[z_t|y_{0:t}] (see _mala_chains). Gradient MCMC replaces SNIS
+    as the latent dim d grows (IS weights degenerate ~exp(-c d); MALA cost/eff-sample ~d^{1/3}). Only n_chains
+    / n_steps (compute budget) and rng are user-facing -- the rest self-tune. Returns (z_hat (T,B,d), accept)."""
+    _, z_mean, acc = _mala_chains(model, x, mask, center, n_chains, n_steps, broad_std, rng,
+                                  step_size, burn_in, init_std, adapt)
+    return z_mean, acc
+
+
+@torch.no_grad()
+def filter_mean(model, x, mask, center, *, method, n_mean, near_std, broad_std, mala=None):
+    """Selector for the mesh-free FILTER MEAN E[z_t|y_{0:t}] -> (z_hat (T,B,d), diag). method='fixed' =
+    deterministic fixed-node importance sampling (posterior_mean_fixed, diag={'ess':..}); method='mala' =
+    gradient MCMC (posterior_mean_mala, knobs in the `mala` dict, diag={'accept':..}). One seam for both the
+    M-step readout and the d>1 validation mean."""
+    if method == "mala":
+        z_hat, acc = posterior_mean_mala(model, x, mask, center, broad_std=broad_std, **(mala or {}))
+        return z_hat, {"accept": acc}
+    z_hat, ess = posterior_mean_fixed(model, x, mask, center, n_mean, near_std, broad_std)
+    return z_hat, {"ess": ess}
+
+
+@torch.no_grad()
 def smoother_mean_fixed(model, model_b, x, mask, center, n_samples, near_std, broad_std):
     """DETERMINISTIC mesh-free SMOOTHER MEAN E[z_t | y_{0:T}] on the same fixed-node CRN proposal, with
     the numerically STABLE predict*msg smoother weights
@@ -162,6 +245,33 @@ def filter_pair_fixed(model, x, mask, center, drift_net, g_cur, dt,
         loglik = -0.5 * ((xnext.unsqueeze(2) - decode(zt1)) ** 2).sum(-1) / noise_std ** 2
     W = torch.softmax((l_alpha - log_q[:-1]) + loglik, dim=-1)            # (T-1,B,K)
     return zt, zt1, W
+
+
+@torch.no_grad()
+def filter_pair_mala(model, x, mask, center, drift_net, g_cur, dt, noise_std, C_cur, d_cur,
+                     n_chains, n_steps, broad_std, rng="stochastic"):
+    """MCMC estimate of the FILTER lag-one joint p(z_t, z_{t+1} | y_{0:t+1}) for the diffusion g, replacing the
+    SNIS filter_pair_fixed. The SINGLE change vs filter_pair_fixed: sample z_t ~ alpha_t by MALA (EXACT) instead
+    of from a fixed-node proposal q_t. That removes the SNIS weight's `alpha_t/q_t` factor -- the piece that
+    COLLAPSES as d grows (ess ~exp(-c d)) and biases g at d=3 -- leaving only the MILD obs-likelihood weight.
+    Everything else matches filter_pair_fixed: z_{t+1}^k = z_t^k + f(z_t^k) dt + sqrt(g^2 dt) eps^k is the model
+    PREDICT (so the residual is the FRESH process noise -> square-then-average recovers g^2 dt, NOT the
+    obs-contracted filtered increment), and W_k = softmax_k loglik_{t+1}(z_{t+1}^k). Returns (zt, zt1, W) each
+    (T-1,B,K,.) for fit_diffusion. C_cur=None => direct obs (h(z)=z)."""
+    dev = center.device
+    d = center.shape[-1]
+    zt_all, _, _ = _mala_chains(model, x, mask, center, n_chains, n_steps, broad_std, rng)  # (T,B,K,d) ~ alpha_t EXACT
+    f_z = drift_net.drift(zt_all)[0]                             # (T,B,K,d) drift on the samples
+    gen = None if rng == "stochastic" else torch.Generator(device=dev).manual_seed(2)
+    eps = torch.randn(*zt_all.shape, device=dev, generator=gen)  # (T,B,K,d) fresh process noise
+    z_next = zt_all + f_z * dt + math.sqrt(max(float(g_cur), 1e-6) ** 2 * dt) * eps   # PREDICT (T,B,K,d)
+    zt, zt1 = zt_all[:-1], z_next[:-1]                          # pairs (t, t+1)  each (T-1,B,K,d)
+    xnext = x[1:]                                               # obs at t+1 (T-1,B,D), standardized
+    if C_cur is None:                                          # direct obs h(z)=z (D=d)
+        loglik = -0.5 * ((xnext.unsqueeze(2) - zt1) ** 2).sum(-1) / noise_std ** 2
+    else:                                                     # high-D: h(z) = C z + d
+        loglik = -0.5 * ((xnext.unsqueeze(2) - (zt1 @ C_cur.t() + d_cur)) ** 2).sum(-1) / noise_std ** 2
+    return zt, zt1, torch.softmax(loglik, dim=-1)             # (T-1,B,K,d), (T-1,B,K,d), (T-1,B,K)
 
 
 @torch.no_grad()
@@ -264,7 +374,7 @@ def fit_obs_map_stiefel(z_hat, y, C_cur):
 def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg, hr, *,
           learn_g, g_net, reg_lambda, reg_lambda_g, m_inner,
           learn_obs=False, c_stable_tol=0.05, C_cur=None, d_cur=None,
-          meshfree_mean=False, n_mean=256, near_std=0.3, broad_std=1.6,
+          meshfree_mean=False, n_mean=256, near_std=0.3, broad_std=1.6, mean_method="fixed", mala=None,
           joint_g=False, noise_std=None, g_cur_in=None):
     """One EM M-step. Order: posterior-mean increments -> (high-D) Stiefel obs-map + cstab ->
     drift GATED on `cstab < c_stable_tol` -> diffusion. In 1-D (learn_obs=False) cstab==0, so the
@@ -276,18 +386,26 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
     joint's square-then-average residual recovers it. DRIFT still uses the filter mean (the smoother mean
     is the wrong, over-smoothed drift target), so ONE posterior (the forward filter) feeds both moments.
     Returns updated {g_cur, C_cur, d_cur, cstab}."""
-    ess = None
+    ess = accept = None
     center = zhat_from_obs(x, C_cur, d_cur) if learn_obs else x       # (T,B,d) (obs standardized upstream)
-    if meshfree_mean:                                                 # grid-free E[z|y] via deterministic fixed-node mean
-        z_hat, ess = posterior_mean_fixed(model, x, mask, center, n_mean, near_std, broad_std)
+    if meshfree_mean:                                                 # grid-free E[z|y]: fixed-node IS or MALA
+        z_hat, diag = filter_mean(model, x, mask, center, method=mean_method, n_mean=n_mean,
+                                  near_std=near_std, broad_std=broad_std, mala=mala)
+        ess, accept = diag.get("ess"), diag.get("accept")
     else:
         z_hat = posterior_mean(model, x, mask, z_grid)                # (T, B) -- 1-D grid only
     pair = None                                                       # filter lag-one joint for g (drift stays on the mean)
     if joint_g and learn_g:
-        decode = make_decode(C_cur, d_cur) if learn_obs else None
-        pair = filter_pair_fixed(model, x, mask, center, drift_net,
-                                 g_cur_in if g_cur_in is not None else 0.5, dt,
-                                 n_mean, near_std, broad_std, noise_std, decode)
+        g_j = g_cur_in if g_cur_in is not None else 0.5
+        if mean_method == "mala":                                     # MCMC joint (Rao-Blackwellized; no SNIS collapse)
+            mk = {k: mala[k] for k in ("n_chains", "n_steps", "rng")} if mala else {}
+            pair = filter_pair_mala(model, x, mask, center, drift_net, g_j, dt, noise_std,
+                                    C_cur if learn_obs else None, d_cur if learn_obs else None,
+                                    broad_std=broad_std, **mk)
+        else:                                                         # fixed-node SNIS joint
+            decode = make_decode(C_cur, d_cur) if learn_obs else None
+            pair = filter_pair_fixed(model, x, mask, center, drift_net, g_j, dt,
+                                     n_mean, near_std, broad_std, noise_std, decode)
     m = mask[..., 0]
     valid = (m[:-1] * m[1:]).bool()                                   # data-anchored increments
     zc = z_hat[:-1][valid]                                            # (N,d)
@@ -303,4 +421,4 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
     if learn_g:
         g_cur = fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,
                               g_net, reg_lambda_g, m_inner, pair=pair)
-    return dict(g_cur=g_cur, C_cur=C_cur, d_cur=d_cur, cstab=cstab, ess=ess)
+    return dict(g_cur=g_cur, C_cur=C_cur, d_cur=d_cur, cstab=cstab, ess=ess, accept=accept)

@@ -36,7 +36,7 @@ from opssm.models.dynamics import DriftNet, DiffusionNet
 from opssm.models.losses import accumulate_pinn_grads, accumulate_adjoint_grads, kl_target_pred
 from opssm.models.mstep import mstep, log_smoothed
 from opssm.models.obs import make_decode, zhat_from_obs
-from opssm.models.mstep import posterior_mean_fixed
+from opssm.models.mstep import filter_mean
 from opssm.data.systems import make_drift
 from opssm.analysis import viz
 
@@ -62,7 +62,8 @@ class ZakaiFilterModule(pl.LightningModule):
                  pca_init=True, c_stable_tol=0.05, meshfree_mean=True, n_mean=256,
                  res_mode="rel", w_res=0.2, learn_smoother=False, joint_g=False,
                  encoder="gru", encoder_kwargs=None,
-                 latent_dim=1, loss="zakai", train_dir="./dump/nzf"):
+                 mean_method="fixed", mala_chains=64, mala_steps=30, mala_rng="stochastic",
+                 anim_posterior=False, latent_dim=1, loss="zakai", train_dir="./dump/nzf"):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
@@ -137,6 +138,10 @@ class ZakaiFilterModule(pl.LightningModule):
         sched = optim.lr_scheduler.ExponentialLR(opt, gamma=h.sched_gamma)
         return {"optimizer": opt, "lr_scheduler": sched}
 
+    def _mala_cfg(self):
+        h = self.hparams                                             # MALA readout knobs (used when mean_method="mala")
+        return dict(n_chains=h.mala_chains, n_steps=h.mala_steps, rng=h.mala_rng)  # step/burn/init/adapt are auto
+
     # -- helpers for the high-D decode / collocation-center hooks --------------------------------
     def _decode_center(self, x):
         if not self.hparams.learn_obs:
@@ -193,13 +198,15 @@ class ZakaiFilterModule(pl.LightningModule):
                     C_cur=self.C_cur, d_cur=self.d_cur,
                     meshfree_mean=h.meshfree_mean, n_mean=h.n_mean,
                     near_std=h.near_std, broad_std=h.broad_std,
+                    mean_method=h.mean_method, mala=self._mala_cfg(),
                     joint_g=h.joint_g, noise_std=self.noise_std, g_cur_in=self.g_cur)
         if out["g_cur"] is not None:
             self.g_cur = out["g_cur"]
         if h.learn_obs:
             self.C_cur, self.d_cur = out["C_cur"], out["d_cur"]
-        if out.get("ess") is not None:
-            self.log("ess", out["ess"], prog_bar=True)                  # SNIS health diagnostic
+        for key in ("ess", "accept"):                                   # readout health: SNIS ess or MALA acceptance
+            if out.get(key) is not None:
+                self.log(key, out[key], prog_bar=True)
 
     @torch.no_grad()
     def _gauge_aligned(self, log_pi, filt, m_op, z_true):
@@ -214,25 +221,42 @@ class ZakaiFilterModule(pl.LightningModule):
           and a sample-based KL once the LATENT model goes multi-dim; the metric code is not the blocker."""
         d = m_op.shape[-1] if m_op.dim() >= 3 else 1
         M = m_op.reshape(-1, d); Z = z_true.reshape(-1, d)                # inferred vs true latent points (N,d)
-        A = torch.linalg.lstsq(M, Z).solution                            # (d,d): Z ~ M @ A  (scalar for 1-D)
-        z_al = M @ A                                                     # aligned latent at the inferred points
-        # aligned DRIFT (dimension-agnostic, mesh-free): evaluate f_op at the inferred points and map to the
-        # true frame  F = f_op @ A ; compare to the benchmark's true drift at z_al. Works for a 1-D double-well
-        # or a 2-D Van der Pol / 3-D Lorenz latent given a matching d->d drift net; the true-drift form below
-        # is the ONLY per-benchmark piece (double-well a(z-z^3) here -- swap for VdP/Lorenz's field).
-        f_al = self.drift_net.drift(M)[0].reshape(-1, d) @ A
-        f_true = self.true_drift(z_al)                                 # ground-truth drift from the systems registry
+        # AFFINE Procrustes gauge z_true ~ A m_op + b. The OFFSET b is essential for offset latents (Lorenz
+        # z3 mean ~25): a purely LINEAR A cannot represent a mean shift, which floors lat_rmse at the offset
+        # (~25 even for a perfect latent) AND distorts A (inflating s_fit -> g_aln, drift_l2_aln). Centered
+        # latents (double-well, VdP) have b~0, so this is ~identical there. The DRIFT transforms under the
+        # LINEAR part A only -- an offset doesn't change velocities.
+        Mh = torch.cat([M, torch.ones_like(M[:, :1])], dim=-1)            # (N,d+1) design matrix [m, 1]
+        sol = torch.linalg.lstsq(Mh, Z).solution                         # (d+1,d): Z ~ [M,1] @ sol
+        A, b = sol[:d], sol[d]                                            # (d,d) linear part, (d,) offset
+        z_al = M @ A + b                                                 # aligned latent (offset-corrected)
+        f_al = self.drift_net.drift(M)[0].reshape(-1, d) @ A            # drift maps under A (offset-free); the
+        f_true = self.true_drift(z_al)                                  #   true-drift form is the per-benchmark piece
         on = (z_al.abs().le(1.5).all(-1) if d == 1                     # double-well data region; all points for d>1
               else torch.ones(z_al.shape[0], dtype=torch.bool, device=z_al.device))
         gscale = A.det().abs().pow(1.0 / d).item()                      # |A|^(1/d): scalar |A| for 1-D, dxd det
+        e_lat = (z_al - Z).pow(2).sum(-1)                              # (N,) per-point squared Euclidean latent error
+        e_drf = (f_al[on] - f_true[on]).pow(2).sum(-1)                # per-point squared drift error (on-data)
+        z_scale = (Z - Z.mean(0)).pow(2).sum(-1).mean().sqrt().clamp_min(1e-8)   # RMS spread of the true latent
+        f_scale = f_true[on].pow(2).sum(-1).mean().sqrt().clamp_min(1e-8)        # RMS magnitude of the true drift
+        # THREE flavors per quantity (all mean-over-N -> time-length invariant): l2 = Euclidean-norm RMS (sum over
+        # d dims, so ~sqrt(d)); rmse = per-DIM RMSE (= l2/sqrt(d), dimensionality-normalized); rel = RELATIVE
+        # (l2 / true-scale, dimensionless -> comparable across benchmarks AND dims, since BOTH the sqrt(d) and the
+        # system magnitude cancel). `rel` is the honest cross-benchmark number: Lorenz's drift is ~100x the
+        # double-well's, so absolute l2 is NOT comparable, but rel is (Lorenz drift ~0.6, latent ~0.06).
         out = {"s_fit": float(A.reshape(-1)[0]) if d == 1 else gscale,  # signed 1-D scale (viz) / geo-mean scale
-               "lat_rmse": (M - Z).pow(2).sum(-1).mean().sqrt().item(),          # RAW (unaligned)
-               "lat_rmse_aln": (z_al - Z).pow(2).sum(-1).mean().sqrt().item(),   # aligned
-               "drift_l2_aln": (f_al[on] - f_true[on]).pow(2).sum(-1).mean().sqrt().item(),
-               "g_aln": gscale * float(self.g_cur)}                     # isotropic g scales by |A|^(1/d)
+               "lat_l2_raw": (M - Z).pow(2).sum(-1).mean().sqrt().item(),      # RAW (unaligned) Euclidean
+               "lat_l2_aln": e_lat.mean().sqrt().item(),                       # aligned latent: Euclidean L2
+               "lat_rmse_aln": (e_lat.mean() / d).sqrt().item(),               #   per-dim RMSE (= l2/sqrt(d))
+               "lat_rel": (e_lat.mean().sqrt() / z_scale).item(),              #   relative (÷ true latent scale)
+               "drift_l2_aln": e_drf.mean().sqrt().item(),                     # aligned drift: Euclidean L2
+               "drift_rmse_aln": (e_drf.mean() / d).sqrt().item(),             #   per-dim RMSE
+               "drift_rel": (e_drf.mean().sqrt() / f_scale).item(),            #   relative (÷ true drift magnitude)
+               "g_aln": gscale * float(self.g_cur),                    # isotropic g gauge-scaled by |A|^(1/d) -> true frame
+               "g_rel": gscale * float(self.g_cur) / max(float(self.sigma), 1e-8)}   # g_aln / true sigma (1.0 = perfect)
         if d == 1:                                                       # KL: grid-bound (1-D oracle only)
-            s = float(A.reshape(-1)[0]); zg = self.z_grid
-            pi_al = _interp1d(log_pi.exp(), zg, zg / s).clamp_min(0) / abs(s)   # push posterior to true frame
+            s = float(A.reshape(-1)[0]); b0 = float(b.reshape(-1)[0]); zg = self.z_grid
+            pi_al = _interp1d(log_pi.exp(), zg, (zg - b0) / s).clamp_min(0) / abs(s)   # z_op=(z_true-b)/s -> true frame
             pi_al = pi_al / pi_al.sum(-1, keepdim=True).clamp_min(1e-12)
             out["kl_aln"] = kl_target_pred(filt, pi_al.clamp_min(1e-20).log()).item()
         return out
@@ -260,7 +284,8 @@ class ZakaiFilterModule(pl.LightningModule):
             m_op_al = m_op                                          # (T,B) -> _gauge_aligned (d==1)
         else:                                                       # MESH-FREE mean for d>1 (no grid)
             _, center = self._decode_center(x)
-            m_op_al, _ = posterior_mean_fixed(self.model, x, mask, center, h.n_mean, h.near_std, h.broad_std)  # (T,B,d)
+            m_op_al, _ = filter_mean(self.model, x, mask, center, method=h.mean_method, n_mean=h.n_mean,
+                                     near_std=h.near_std, broad_std=h.broad_std, mala=self._mala_cfg())  # (T,B,d)
         if h.learn_obs and dm.C_true is not None:                   # c_cos: mean principal-angle cosine (any d)
             Cn = dm.C_true / dm.C_true.norm(dim=0, keepdim=True)
             logs["c_cos"] = float(torch.linalg.svdvals(self.C_cur.t() @ Cn).clamp(max=1.0).mean())
@@ -292,3 +317,7 @@ class ZakaiFilterModule(pl.LightningModule):
         elif d in (2, 3) and dm.z_val_true is not None:
             vis = viz.vis_latent2d if d == 2 else viz.vis_latent3d
             vis(self.drift_net, m_op_al, dm.z_val_true, dm.ts, self.true_drift, self.g_cur, img)
+            if h.anim_posterior:                                   # animated posterior p(z|y_{0:t}) over time
+                anim = viz.anim_posterior2d if d == 2 else viz.anim_posterior3d
+                anim(self.model, x, mask, m_op_al, dm.z_val_true,
+                     os.path.join(h.train_dir, "posterior_anim.mp4"))   # overwritten each validation

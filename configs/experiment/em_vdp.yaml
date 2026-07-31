@@ -13,4 +13,4 @@ model:
   n_mean: 384         # modest bump from 256 (mesh-free E[z|y] / joint-g sample count). The M-step readouts
                       #   are (T,B,K,p) and NOT chunked, so K is the memory driver -> keep it moderate; watch
                       #   the logged `ess` and raise with chunk_size if SNIS ESS is low.
-  chunk_size: 8       # halved vs default 16 -- the d=2 FP residual grad_tau is (...,d,p), i.e. 2x the memory
+  anim_posterior: true  # render the animated posterior surface p(z1,z2 | y_{0:t}) over time

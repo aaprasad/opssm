@@ -334,6 +334,18 @@ def vis_highd(model, drift_net, diff_net, y_val, mask_val, z_val_true, filt_val,
     plt.tight_layout(); plt.savefig(img_path); plt.close()
 
 
+def _affine_gauge(m_op, z_true):
+    """Affine Procrustes gauge z_true ~ A m_op + b. The offset b is essential for OFFSET latents (Lorenz z3
+    mean ~25); a linear A alone cannot represent a mean shift. Returns A (d,d) linear part, b (d,) offset,
+    A_inv (d,d). Map true->operator frame as (z - b) @ A_inv; the drift transforms under A only (an offset
+    doesn't change velocities)."""
+    d = z_true.shape[-1]
+    M = m_op.reshape(-1, d); Z = z_true.reshape(-1, d)
+    Mh = torch.cat([M, torch.ones_like(M[:, :1])], dim=-1)          # (N,d+1) design matrix [m, 1]
+    sol = torch.linalg.lstsq(Mh, Z).solution                       # (d+1,d): Z ~ [M,1] @ sol
+    return sol[:d], sol[d], torch.linalg.pinv(sol[:d])
+
+
 @torch.no_grad()
 def vis_latent2d(drift_net, m_op, z_true, ts, true_drift, g_scalar, img_path, n_traj=4, ng=32):
     """Phase-plane visualization for a 2-D latent (Van der Pol). The DRIFT field is shown as a STREAMPLOT
@@ -344,20 +356,22 @@ def vis_latent2d(drift_net, m_op, z_true, ts, true_drift, g_scalar, img_path, n_
     trajectories, (c) latent recovery (true vs aligned-inferred). m_op / z_true are (T,B,2)."""
     import numpy as np
     dev = m_op.device
-    M = m_op.reshape(-1, 2); Z = z_true.reshape(-1, 2)               # inferred vs true latent points (N,2)
-    A = torch.linalg.lstsq(M, Z).solution                           # (2,2): Z ~ M @ A (the Procrustes gauge)
-    A_inv = torch.linalg.pinv(A)                                     # pinv: robust if A is ill-conditioned early
-    z_al = m_op @ A                                                 # aligned inferred latent (T,B,2), true frame
+    A, b, A_inv = _affine_gauge(m_op, z_true)                        # AFFINE Procrustes z_true ~ A m_op + b
+    Z = z_true.reshape(-1, 2)                                        # true latent points (N,2)
+    z_al = m_op @ A + b                                             # aligned inferred latent (T,B,2), true frame
 
-    lo = Z.min(0).values; hi = Z.max(0).values                      # plane extent from the true latent + margin
-    pad = 0.2 * (hi - lo).clamp_min(1e-3)
+    # DATA-REGIME extent (1-99 percentile of the true latent, robust to transients) + small margin -- restrict
+    # to where the latent actually lives (cf. Duncker Fig 2, [-2,2]). Off-data corners are pure MLP
+    # extrapolation (the true VdP field blows up cubically there) and would dominate the color scale.
+    lo = Z.quantile(0.01, dim=0); hi = Z.quantile(0.99, dim=0)
+    pad = 0.1 * (hi - lo).clamp_min(1e-3)
     lo = (lo - pad).cpu().numpy(); hi = (hi + pad).cpu().numpy()
     xs = torch.linspace(float(lo[0]), float(hi[0]), ng, device=dev)
     ys = torch.linspace(float(lo[1]), float(hi[1]), ng, device=dev)
     GX, GY = torch.meshgrid(xs, ys, indexing="xy")                  # (ng,ng); streamplot wants U,V as (Ny,Nx)
     P = torch.stack([GX.reshape(-1), GY.reshape(-1)], dim=-1)       # (ng*ng, 2) true-frame grid points
     FT = true_drift(P)                                             # true drift on the grid (ng*ng, 2)
-    FL = drift_net.drift(P @ A_inv)[0] @ A                          # learned drift mapped into the true frame
+    FL = drift_net.drift((P - b) @ A_inv)[0] @ A                    # learned drift -> true frame (offset-corrected)
     xs_np, ys_np = xs.cpu().numpy(), ys.cpu().numpy()
 
     def _stream(ax, F, title):
@@ -401,14 +415,15 @@ def vis_latent3d(drift_net, m_op, z_true, ts, true_drift, g_scalar, img_path, n_
     arrows are normalized to DIRECTION (magnitude agreement is the drift_l2_aln metric). m_op/z_true (T,B,3)."""
     import numpy as np
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the 3d projection)
-    M = m_op.reshape(-1, 3); Z = z_true.reshape(-1, 3)
-    A = torch.linalg.lstsq(M, Z).solution                          # (3,3) gauge Z ~ M @ A
-    A_inv = torch.linalg.pinv(A)
-    z_al = m_op @ A                                                # aligned inferred latent (T,B,3)
+    A, b, A_inv = _affine_gauge(m_op, z_true)                      # AFFINE gauge z_true ~ A m_op + b (offset b)
+    Z = z_true.reshape(-1, 3)
+    z_al = m_op @ A + b                                            # aligned inferred latent (T,B,3)
+    lo = Z.quantile(0.01, dim=0).cpu().numpy(); hi = Z.quantile(0.99, dim=0).cpu().numpy()   # data-REGIME bounds
+    pad = 0.1 * (hi - lo); lo, hi = lo - pad, hi + pad             # restrict plotting to where the latent lives
     sub = max(1, Z.shape[0] // n_arrows)
     P = Z[::sub]                                                   # sampled true-frame attractor points
     FT = true_drift(P)                                            # true drift there
-    FL = drift_net.drift(P @ A_inv)[0] @ A                         # learned drift mapped to the true frame
+    FL = drift_net.drift((P - b) @ A_inv)[0] @ A                   # learned drift -> true frame (offset-corrected)
     p = P.cpu().numpy()
     ftn = (FT / FT.norm(dim=-1, keepdim=True).clamp_min(1e-9)).cpu().numpy()   # unit directions
     fln = (FL / FL.norm(dim=-1, keepdim=True).clamp_min(1e-9)).cpu().numpy()
@@ -423,6 +438,7 @@ def vis_latent3d(drift_net, m_op, z_true, ts, true_drift, g_scalar, img_path, n_
                  label="true" if j == 0 else None)
     ax0.set_xlabel("$z_1$"); ax0.set_ylabel("$z_2$"); ax0.set_zlabel("$z_3$")
     ax0.set_title("latent recovery (3-D attractor)"); ax0.legend(fontsize=8)
+    ax0.set_xlim(lo[0], hi[0]); ax0.set_ylim(lo[1], hi[1]); ax0.set_zlim(lo[2], hi[2])   # clip inferred spikes
     for ax, (i, k), name in zip([fig.add_subplot(1, 4, c) for c in (2, 3, 4)],
                                 [(0, 1), (0, 2), (1, 2)], ["z1-z2", "z1-z3", "z2-z3"]):
         ax.quiver(p[:, i], p[:, k], ftn[:, i], ftn[:, k], color="0.5", alpha=0.7,
@@ -431,5 +447,82 @@ def vis_latent3d(drift_net, m_op, z_true, ts, true_drift, g_scalar, img_path, n_
                   angles="xy", scale=28, width=0.004, label="learned")
         ax.set_xlabel(fr"$z_{{{i + 1}}}$"); ax.set_ylabel(fr"$z_{{{k + 1}}}$")
         ax.set_title(f"drift dirs ({name})"); ax.legend(fontsize=8)
+        ax.set_xlim(lo[i], hi[i]); ax.set_ylim(lo[k], hi[k])       # data-regime extent (match panel 0)
     fig.suptitle(fr"Lorenz 3-D latent -- learned $g$={float(g_scalar):.3f}", fontsize=13, y=1.01)
     plt.tight_layout(); plt.savefig(img_path); plt.close()
+
+
+def _posterior_grid(model, x, mask, m_op, z_true, traj, ng):
+    """Shared setup for the posterior animations: gauge A (z_true ~ A m_op), a DATA-REGIME grid over the
+    latent (true frame), and the normalized filtering posterior p(z|y_{0:t}) on it for one trajectory.
+    Returns (grid_pts_true (ng^d, d), p (T, ng^d), lo, hi, true_path (T,d), d). Density is evaluated by
+    mapping the true-frame grid to the operator frame via A^-1 and calling model.log_posterior."""
+    dev = x.device
+    d = z_true.shape[-1]
+    A, b, A_inv = _affine_gauge(m_op, z_true)                       # AFFINE gauge z_true ~ A m_op + b
+    Z = z_true.reshape(-1, d)
+    lo = Z.quantile(0.01, 0); hi = Z.quantile(0.99, 0)             # data-regime bounds (where the latent lives)
+    pad = 0.1 * (hi - lo).clamp_min(1e-3); lo, hi = lo - pad, hi + pad
+    axes = [torch.linspace(float(lo[i]), float(hi[i]), ng, device=dev) for i in range(d)]
+    G = torch.meshgrid(*axes, indexing="ij")
+    grid = torch.stack([g.reshape(-1) for g in G], dim=-1)         # (ng^d, d) true-frame grid
+    log_pi = model.log_posterior(x[:, traj:traj + 1], mask[:, traj:traj + 1], (grid - b) @ A_inv)[:, 0]  # (T, ng^d)
+    return grid, log_pi.exp(), lo, hi, z_true[:, traj], d          # p normalized over the grid
+
+
+@torch.no_grad()
+def anim_posterior2d(model, x, mask, m_op, z_true, img_path, traj=0, ng=50, n_frames=60, fps=12):
+    """Animate the VdP (d=2) filtering posterior p(z|y_{0:t}) as a 3-D SURFACE over the latent plane
+    (x,y = z1,z2; height = p), evolving through time, with the true latent point overlaid."""
+    import numpy as np
+    from matplotlib import animation
+    grid, p, lo, hi, zt, _ = _posterior_grid(model, x, mask, m_op, z_true, traj, ng)
+    GX = grid[:, 0].reshape(ng, ng).cpu().numpy(); GY = grid[:, 1].reshape(ng, ng).cpu().numpy()
+    p = p.reshape(-1, ng, ng).cpu().numpy(); zt = zt.cpu().numpy()
+    T = p.shape[0]; frames = np.linspace(0, T - 1, min(n_frames, T)).astype(int)
+    fig = plt.figure(figsize=(7, 6)); ax = fig.add_subplot(111, projection="3d")
+
+    def draw(fi):
+        t = frames[fi]; ax.clear()
+        s = p[t] / max(float(p[t].max()), 1e-12)                  # PER-FRAME normalized height (a peaked posterior
+        ax.plot_surface(GX, GY, s, cmap="viridis", linewidth=0, antialiased=True, vmin=0, vmax=1)   # else flattens)
+        ax.scatter([zt[t, 0]], [zt[t, 1]], [1.02], color="r", s=30, label="true $z$")
+        ax.set_xlim(float(lo[0]), float(hi[0])); ax.set_ylim(float(lo[1]), float(hi[1])); ax.set_zlim(0, 1.05)
+        ax.set_xlabel("$z_1$"); ax.set_ylabel("$z_2$"); ax.set_zlabel(r"$p(z\,|\,y_{0:t})\,/\,\max$")
+        ax.set_title(f"VdP posterior, frame {t}/{T}"); ax.legend(fontsize=8, loc="upper right")
+
+    animation.FuncAnimation(fig, draw, frames=len(frames), blit=False).save(img_path, writer="ffmpeg", fps=fps, dpi=90)
+    plt.close(fig)
+
+
+@torch.no_grad()
+def anim_posterior3d(model, x, mask, m_op, z_true, img_path, traj=0, ng=40, n_frames=50, fps=12):
+    """Animate the Lorenz (d=3) posterior p(z|y_{0:t}) as a 3-D density cloud over the latent volume (x,y,z =
+    z1,z2,z3), evolving through time. The filtering posterior is a PEAKED blob, so points are drawn with
+    per-point ALPHA proportional to the PER-FRAME-normalized density (p/max at each t) -- the blob glows and
+    the tails fade, robust whether the posterior is sharp or diffuse (a global fixed threshold hides a sharp
+    peak). Fine grid to resolve the peak. True latent path-so-far + current point overlaid."""
+    import numpy as np
+    from matplotlib import animation
+    grid, p, lo, hi, zt, _ = _posterior_grid(model, x, mask, m_op, z_true, traj, ng)
+    pts = grid.cpu().numpy(); p = p.cpu().numpy(); zt = zt.cpu().numpy()
+    lo, hi = lo.cpu().numpy(), hi.cpu().numpy()
+    T = p.shape[0]; frames = np.linspace(0, T - 1, min(n_frames, T)).astype(int)
+    fig = plt.figure(figsize=(7.5, 6)); ax = fig.add_subplot(111, projection="3d")
+    sm = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(0, 1)); sm.set_array([])
+    fig.colorbar(sm, ax=ax, shrink=0.6, label=r"$p(z\,|\,y_{0:t})\,/\,\max$ (per frame)")
+
+    def draw(fi):
+        t = frames[fi]; ax.clear()
+        a = p[t] / max(float(p[t].max()), 1e-12)                  # PER-FRAME normalized density in [0,1]
+        sel = a > 0.03                                            # drop near-zero grid points (speed)
+        rgba = plt.cm.viridis(a[sel]); rgba[:, 3] = a[sel] ** 0.6  # alpha ~ density -> glowing blob
+        ax.scatter(pts[sel, 0], pts[sel, 1], pts[sel, 2], color=rgba, s=18, edgecolors="none")
+        ax.plot(zt[:t + 1, 0], zt[:t + 1, 1], zt[:t + 1, 2], color="0.5", lw=0.4, alpha=0.3)   # true path so far
+        ax.scatter([zt[t, 0]], [zt[t, 1]], [zt[t, 2]], color="r", s=30, label="true $z$")
+        ax.set_xlim(lo[0], hi[0]); ax.set_ylim(lo[1], hi[1]); ax.set_zlim(lo[2], hi[2])
+        ax.set_xlabel("$z_1$"); ax.set_ylabel("$z_2$"); ax.set_zlabel("$z_3$")
+        ax.set_title(f"Lorenz posterior, frame {t}/{T}"); ax.legend(fontsize=8, loc="upper left")
+
+    animation.FuncAnimation(fig, draw, frames=len(frames), blit=False).save(img_path, writer="ffmpeg", fps=fps, dpi=90)
+    plt.close(fig)

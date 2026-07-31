@@ -34,7 +34,20 @@ pca_init: false          # HONEST default: learn the sensor direction C from a R
 c_stable_tol: 0.05
 meshfree_mean: true       # M-step E[z|y]: true = deterministic mesh-free fixed-node IS (default; scales to
                           #   high-D latent, drift/sensor good, g mildly over-estimated); false = grid quadrature
-n_mean: 256               # fixed-node sample count when meshfree_mean=true
+n_mean: 256               # fixed-node sample count when meshfree_mean=true (also drives joint_g's pair sampler)
+mean_method: fixed        # filter-mean readout: fixed = deterministic fixed-node importance sampling (default);
+                          #   mala = gradient MCMC (Metropolis-adjusted Langevin) -- scales to high-D latent
+                          #   where SNIS ess collapses. The mala_* knobs apply only when mean_method=mala.
+                          #   Because MALA samples the posterior directly, step size / burn-in / init are all
+                          #   self-tuning (internal); only the compute budget + rng are exposed.
+mala_chains: 64           # parallel MALA chains per (t,b) site (MALA moves samples -> far fewer than n_mean)
+mala_steps: 30            # total MALA sweeps (burn-in = a third; step size auto-adapts to 0.574 acceptance)
+mala_rng: stochastic      # stochastic = fresh RNG each M-step; crn = fixed-seed deterministic; qmc = deferred.
+                          #   Phase-1 experiment: try stochastic FIRST (MALA self-corrects, may not diverge
+                          #   like SNIS); fall back stochastic -> qmc -> crn only if g runs away.
+anim_posterior: false     # d>1 only: also render an ANIMATED posterior p(z|y_{0:t}) over time to
+                          #   <train_dir>/posterior_anim.mp4 each validation (VdP = 3-D surface, Lorenz = 3-D
+                          #   scatter colored by p). ~3-7s/render; off by default (diagnostic).
 res_mode: rel             # FP residual reduction: "rel" = scale-invariant (residual / local FP magnitude)
                           #   -- fixes over-dispersion by removing the sharp-density tail blow-up of the
                           #   absolute "l2" residual (which biases the operator WIDE); "log1p" = log-compress
@@ -50,11 +63,13 @@ learn_smoother: false     # two-filter backward-SPDE smoother: false = filter on
 latent_dim: 1             # LATENT state dim d (SEPARATE from data_size = obs dim D). 1 = the double-well;
                           #   2 = Van der Pol, 3 = Lorenz. The trunk/drift/collocation are all (...,d);
                           #   d=1 is the special case gated to reproduce the em_1d/em_highd baselines.
-joint_g: true             # estimate g from the FILTER lag-one joint (filter_pair_fixed) instead of the
-                          #   filter-mean increment. The mean drops the increment VARIANCE so g under-reads
-                          #   (~0.54 vs true 0.60 high-D); the joint's square-then-average residual recovers
-                          #   E[(dz)^2|y] -- VALIDATED: g_aln 0.544 -> 0.605 high-D, drift/c_cos held. DRIFT
-                          #   stays on the filter mean -> ONE posterior feeds both moments. forward-only (no
-                          #   backward operator). false = the old (under-reading) filter-mean g.
+joint_g: false            # g estimator. false = filter-MEAN increment (marginal); true = FILTER lag-one joint
+                          #   (filter_pair_fixed SNIS, or filter_pair_mala when mean_method=mala). PHASE-2 FINDING:
+                          #   g is DRIFT-LIMITED, not sampler-limited -- g_est^2 = g_true^2 + drift_rmse^2*dt, so
+                          #   EVERY estimator lands at the same g (Lorenz marginal/SNIS/MALA-joint all g_rel~4; the
+                          #   drift-residual term 131 dwarfs true g^2 9). The MARGINAL wins at d=2 (g_rel 1.2 vs the
+                          #   joints' 1.6-1.9), ties at d=3, and is the simplest -> DEFAULT. The joint only helped
+                          #   the d=1 baseline (g_aln 0.544->0.605, tiny drift error); at d>1 it just adds over-read.
+                          #   To actually tighten g, fix the DRIFT (higher-order increment / finer dt), not the sampler.
 loss: zakai
 train_dir: ${train_dir}
