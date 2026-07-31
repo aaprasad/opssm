@@ -464,7 +464,12 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
     if cstab < c_stable_tol:                                          # sensor-before-dynamics gate: fit f (+ g jointly)
         inv = _fp_residual_terms(model, x, mask, n_colloc if n_colloc is not None else n_mean,
                                  near_std, broad_std, center) if w_inv > 0 else None
-        g_joint = fit_dynamics(drift_net, dr_opt, zc, dz, g_cur_in if g_cur_in is not None else 0.5, dt,
+        g_init = g_cur_in if g_cur_in is not None else 0.5
+        if w_inv > 0 and learn_g:                                    # warm-start g from the classic increment M-step
+            with torch.no_grad():                                    #   estimate, then let the FP residual refine its bias
+                r = dz - 0.5 * (drift_net.net(zc) + drift_net.net(zc_next))   # trapezoidal increment residual
+                g_init = float((r.pow(2).sum(-1).mean() * dt / r.shape[-1]).sqrt().clamp(min=0.05))
+        g_joint = fit_dynamics(drift_net, dr_opt, zc, dz, g_init, dt,
                                reg_lambda, m_inner, w_em=w_em, w_inv=w_inv, inv=inv, g_lr=g_lr)
     g_cur = None
     if learn_g:                                                      # g_joint set iff w_inv>0 (fit WITH f); else increment
