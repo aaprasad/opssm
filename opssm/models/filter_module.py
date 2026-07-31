@@ -62,7 +62,7 @@ class ZakaiFilterModule(pl.LightningModule):
                  g_init=1.0, learn_dynamics=True, learn_g=True, g_net=False, learn_obs=False,
                  pca_init=True, c_stable_tol=0.05, meshfree_mean=True, n_mean=256,
                  res_mode="rel", w_res=0.2, learn_smoother=False, joint_g=False,
-                 w_em=1.0, w_inv=0.0, g_lr=1e-2,
+                 w_em=1.0, w_inv=0.0, g_lr=1e-2, w_g=0.0,
                  encoder="gru", encoder_kwargs=None,
                  mean_method="fixed", mala_chains=64, mala_steps=30, mala_rng="stochastic",
                  anim_posterior=False, latent_dim=1, loss="zakai", train_dir="./dump/nzf"):
@@ -202,7 +202,7 @@ class ZakaiFilterModule(pl.LightningModule):
                     near_std=h.near_std, broad_std=h.broad_std,
                     mean_method=h.mean_method, mala=self._mala_cfg(),
                     joint_g=h.joint_g, noise_std=self.noise_std, g_cur_in=self.g_cur,
-                    w_em=h.w_em, w_inv=h.w_inv, g_lr=h.g_lr, n_colloc=h.n_colloc)
+                    w_em=h.w_em, w_inv=h.w_inv, g_lr=h.g_lr, w_g=h.w_g, n_colloc=h.n_colloc)
         if out["g_cur"] is not None:
             self.g_cur = out["g_cur"]
         if h.learn_obs:

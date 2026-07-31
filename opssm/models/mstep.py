@@ -298,7 +298,7 @@ def log_smoothed(model, model_b, x, mask, z_grid):
 
 
 def fit_dynamics(drift_net, dr_opt, zc, dz, g_cur, dt, reg_lambda, m_inner, *,
-                 w_em=1.0, w_inv=0.0, inv=None, g_lr=1e-2):
+                 w_em=1.0, w_inv=0.0, inv=None, g_lr=1e-2, w_g=0.0):
     """JOINTLY fit the drift f (DriftNet) AND the diffusion g^2 (a scalar) by gradient descent on a WEIGHTED
     loss -- the two co-adapt to the physics each step, not alternated or switched:
         loss = w_em  * ||f(z_t) - dz||^2                                  (EM: filter-MEAN increment; f only)
@@ -313,7 +313,8 @@ def fit_dynamics(drift_net, dr_opt, zc, dz, g_cur, dt, reg_lambda, m_inner, *,
     Updates drift_net in place. zc, dz: (N,d)."""
     dev = zc.device
     learn_g_here = w_inv > 0 and inv is not None
-    g = torch.tensor(max(float(g_cur), 1e-3), device=dev, requires_grad=learn_g_here)   # the FACTOR g (not g^2)
+    g_anchor = max(float(g_cur), 1e-3)                                # increment-g estimate: g init AND data anchor
+    g = torch.tensor(g_anchor, device=dev, requires_grad=learn_g_here)   # the FACTOR g (not g^2)
     g_opt = torch.optim.Adam([g], lr=g_lr) if learn_g_here else None
     drift_net.requires_grad_(True)
     for _ in range(m_inner):
@@ -330,6 +331,10 @@ def fit_dynamics(drift_net, dr_opt, zc, dz, g_cur, dt, reg_lambda, m_inner, *,
             Bsig = 0.5 * (grad_ell.pow(2).sum(-1) + lap_ell)       # (T,B,Ns,K)  diffusion signature
             res = ds_ell / dt + div_f.unsqueeze(2) + f_dot - g ** 2 * Bsig   # g^2 in the FP term; g is the param
             loss = loss + w_inv * res.pow(2).mean()
+            if w_g > 0:                                            # DATA ANCHOR for g: pull toward the increment-g
+                loss = loss + w_g * (g - g_anchor) ** 2            #   (our stand-in for the paper's observed WIDTH;
+                #   points don't pin the posterior width the way densities do, so g-from-FP alone runs away).
+                #   NB own weight w_g -- the anchor & FP-residual live at very different scales.
         loss.backward()
         dr_opt.step()
         if g_opt is not None:
@@ -420,7 +425,7 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
           learn_g, g_net, reg_lambda, reg_lambda_g, m_inner,
           learn_obs=False, c_stable_tol=0.05, C_cur=None, d_cur=None,
           meshfree_mean=False, n_mean=256, near_std=0.3, broad_std=1.6, mean_method="fixed", mala=None,
-          joint_g=False, noise_std=None, g_cur_in=None, w_em=1.0, w_inv=0.0, g_lr=1e-2, n_colloc=None):
+          joint_g=False, noise_std=None, g_cur_in=None, w_em=1.0, w_inv=0.0, g_lr=1e-2, w_g=0.0, n_colloc=None):
     """One EM M-step. Order: posterior-mean increments -> (high-D) Stiefel obs-map + cstab ->
     drift GATED on `cstab < c_stable_tol` -> diffusion. In 1-D (learn_obs=False) cstab==0, so the
     gate is always open and this reduces to the plain f,g M-step. `meshfree_mean` replaces the grid
@@ -470,7 +475,7 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
                 r = dz - 0.5 * (drift_net.net(zc) + drift_net.net(zc_next))   # trapezoidal increment residual
                 g_init = float((r.pow(2).sum(-1).mean() * dt / r.shape[-1]).sqrt().clamp(min=0.05))
         g_joint = fit_dynamics(drift_net, dr_opt, zc, dz, g_init, dt,
-                               reg_lambda, m_inner, w_em=w_em, w_inv=w_inv, inv=inv, g_lr=g_lr)
+                               reg_lambda, m_inner, w_em=w_em, w_inv=w_inv, inv=inv, g_lr=g_lr, w_g=w_g)
     g_cur = None
     if learn_g:                                                      # g_joint set iff w_inv>0 (fit WITH f); else increment
         g_cur = g_joint if g_joint is not None else fit_diffusion(

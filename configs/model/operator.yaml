@@ -71,6 +71,11 @@ joint_g: false            # g estimator. false = filter-MEAN increment (marginal
                           #   joints' 1.6-1.9), ties at d=3, and is the simplest -> DEFAULT. The joint only helped
                           #   the d=1 baseline (g_aln 0.544->0.605, tiny drift error); at d>1 it just adds over-read.
                           #   To actually tighten g, fix the DRIFT (higher-order increment / finer dt), not the sampler.
+w_g: 0.0                  # weight on the DATA ANCHOR for g in the FP-inverse fit: pull g toward the increment-g
+                          #   estimate (the diffusion the inferred trajectory implies) -- our stand-in for the
+                          #   FPE-NN paper's OBSERVED density width. Point obs don't pin the posterior WIDTH, so
+                          #   g-from-FP alone runs away; w_g anchors it while w_inv (FP residual) refines. Needs
+                          #   its OWN weight (anchor vs residual are at very different scales). 0 = no anchor.
 w_em: 1.0                 # M-step dynamics fit is a WEIGHTED blend (fit_dynamics): w_em on the EM increment
 w_inv: 0.0                #   ||f - dz||^2, w_inv on the FP-INVERSE residual (ds_ell/dt + div f + f.grad ell -
 g_lr: 1.0e-2              #   g^2 * 1/2(|grad ell|^2 + Delta ell))^2 -- f AND g fit JOINTLY (bilinear residual).

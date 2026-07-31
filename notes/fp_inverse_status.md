@@ -40,6 +40,20 @@ they co-adapt to a DEGENERATE self-consistent solution: `g` shrinks -> the densi
 climbs). The E-step's `w_res` already lets the residual bend `ell`; the M-step residual-fit adds pressure the
 anchor can't hold. This is exactly the "keep `ell` data-driven" caveat -- it wasn't held.
 
+## UPDATE: the paper fits g from the FPE too -- the real issue is the WIDTH anchor
+
+Re-reading Liu et al: their gh-step fits BOTH drift AND diffusion from the FPE, and it's stable -- because they
+OBSERVE the density, so its WIDTH (which g controls) is data-pinned (P^0). We observe only point locations, so
+the jump/IC pin the posterior LOCATION but NOT its WIDTH -> g-from-FP is under-determined -> the runaway. This
+is a limit of our OBSERVATION MODEL (points vs densities), not a wrong choice to fit g from the FP.
+
+**Fix implemented -- OPTION 1 (symmetric g anchor), config `w_g`:** give g the same two-term treatment as f --
+a DATA anchor (`w_g` * (g - g_increment)^2, the increment-g being our stand-in for the paper's observed width)
+PLUS the FP residual (`w_inv`). The anchor stops the runaway; the residual refines. `w_g` has its OWN weight
+because the anchor and the residual are at very different scales (rough analysis: w_g ~ 10s to balance w_inv).
+Default `w_g=0` (off). TODO test: `experiment=em_highd model.mean_method=mala model.w_em=1 model.w_inv=1
+model.w_g={1,10,50}` -- find the w_g that tames g_rel without over-pinning to the (biased) increment.
+
 ## Things to try next (prioritized)
 
 1. **Stronger data anchor:** lower `w_res` (e.g. 0.05) so the E-step keeps `ell` data-driven; the M-step then
