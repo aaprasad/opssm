@@ -54,6 +54,39 @@ because the anchor and the residual are at very different scales (rough analysis
 Default `w_g=0` (off). TODO test: `experiment=em_highd model.mean_method=mala model.w_em=1 model.w_inv=1
 model.w_g={1,10,50}` -- find the w_g that tames g_rel without over-pinning to the (biased) increment.
 
+## RESULTS (2026-08-11): the anchors DON'T fix it -- divergence is robust
+
+Two fixes tested on em_highd d=1, BOTH NEGATIVE:
+
+    config                              kl      drift_rel   g_rel     vs EM (0.355 / 0.257 / 0.914)
+    w_res=0.05 (strong ell anchor)      0.99    1.46        0.49      still DIVERGES
+    w_g=1   (w_em=1, w_inv=1)           0.755   1.56        0.505     still DIVERGES
+    w_g=10                              0.754   1.48        0.507     still DIVERGES
+    w_g=50                              0.748   1.39        0.510     still DIVERGES
+
+`g_rel` trajectory is **IDENTICAL** across w_g=1/10/50: `4.04 -> 2.01 -> 0.654 -> 0.600 -> 0.561 -> 0.532 ->
+0.505`. `drift_rel` climbs `1.0 -> 1.4` for every setting. The w_g anchor is essentially inert.
+
+**Reads:**
+1. w_g inert across a 50x range => it isn't controlling `g`. Likely cause: `g_opt` is Adam (per-parameter
+   scale-normalized), so scaling the anchor weight barely changes `g`'s step -- a hard clamp / SGD-for-`g`
+   would test it. But secondary (see 3).
+2. Neither the `ell` anchor (`w_res`) NOR the `g` anchor (`w_g`) stops the divergence => not a simple
+   anchor-strength problem. The Tikhonov / regularized-inverse framing was right in spirit but doesn't bite here.
+3. **The real driver is the DRIFT `f`, not `g`.** `drift_rel` climbs `1.0 -> 1.4` regardless of the anchors,
+   EVEN WITH the increment anchor on `f` (`w_em=1`). So the `w_inv=1` FP-residual term **OVERPOWERS** the
+   `w_em` increment anchor and drives `f` wrong; the E-step `ell` and M-step `f` co-adapt on the shared
+   residual and the strong `w_inv` wins. `g` is a passenger.
+
+**Bottom line:** the FP-inverse as a STRONG term (`w_inv ~ 1`) diverges robustly at d=1; anchoring `ell` or `g`
+does not rescue it.
+
+**Key untested knob -> WEAK `w_inv` (0.1-0.2):** the residual as a gentle regularizer ON TOP of the
+increment-dominated EM, so it cannot overpower the `w_em` data anchor on `f`. The `winv02` run (`w_inv=0.2`)
+was queued but KILLED before it finished -- RE-RUN it: `experiment=em_highd model.mean_method=mala model.w_em=1
+model.w_inv=0.2`. If even a weak `w_inv` fails to beat EM, the FP-inverse for the drift is a dead end in this
+setup, and the drift bottleneck stays open -> fall back to higher-order / finer-dt increment (notes/TODO.md).
+
 ## Things to try next (prioritized)
 
 1. **Stronger data anchor:** lower `w_res` (e.g. 0.05) so the E-step keeps `ell` data-driven; the M-step then
