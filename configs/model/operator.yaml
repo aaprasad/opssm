@@ -71,6 +71,12 @@ joint_g: false            # g estimator. false = filter-MEAN increment (marginal
                           #   joints' 1.6-1.9), ties at d=3, and is the simplest -> DEFAULT. The joint only helped
                           #   the d=1 baseline (g_aln 0.544->0.605, tiny drift error); at d>1 it just adds over-read.
                           #   To actually tighten g, fix the DRIFT (higher-order increment / finer dt), not the sampler.
+inv_mode: fp              # which residual the FP-inverse f,g fit minimizes. fp = within-interval FP FLOW
+                          #   (ds_ell/dt = L*(f,g)) -- NO data, f,g under-determined, DIVERGES (see
+                          #   notes/fp_inverse_status.md). zakai = the full ONE-STEP Zakai residual
+                          #   (ell_{t+1}-ell_t)/dt = L*(f,g) + loglik/dt -- INCLUDES the observation, so f,g are
+                          #   fit to the observed density change minus the likelihood update; the known obs
+                          #   noise in loglik supplies the width reference g lacks under `fp`.
 w_g: 0.0                  # weight on the DATA ANCHOR for g in the FP-inverse fit: pull g toward the increment-g
                           #   estimate (the diffusion the inferred trajectory implies) -- our stand-in for the
                           #   FPE-NN paper's OBSERVED density width. Point obs don't pin the posterior WIDTH, so

@@ -404,6 +404,33 @@ def _fp_residual_terms(model, x, mask, n_colloc, near_std, broad_std, center=Non
 
 
 @torch.no_grad()
+def _zakai_step_terms(model, x, mask, dt, noise_std, C_cur, d_cur, n_colloc, near_std, broad_std, center=None):
+    """FP-inverse terms for the full ONE-STEP ZAKAI residual (INCLUDES the observation): fit f,g to reproduce
+    the DATA-anchored density change MINUS the likelihood update --
+        (ell_{t+1} - ell_t)/dt  =  L*(ell_t; f,g)  +  loglik_{t+1}/dt.
+    Unlike _fp_residual_terms (within-interval FP flow, NO data), the `ds_ell` slot here carries the observed
+    step: `(ell_{t+1} - ell_t) - loglik_{t+1}`, so fit_dynamics's `ds_ell/dt` gives (ell_{t+1}-ell_t)/dt -
+    loglik/dt (i.e. `A` in `res = A + div f + f.grad ell - g^2 Bsig`) -- injecting the observation (and its
+    KNOWN noise scale) into the f,g fit. Same (Ns=1) shapes as _fp_residual_terms so fit_dynamics is unchanged.
+    Densities are s=0 (post-update); ell_{t+1} evaluated at z_col[t] (shared support). C_cur=None => direct obs.
+    All DETACHED (ell fixed for the M-step)."""
+    dev = x.device
+    z_col, _ = sample_collocation(x, mask, n_colloc, near_std, broad_std, center)   # (T,B,K,d)
+    ctx = model.context(x, mask)
+    b0 = model.coeffs(ctx, torch.zeros(1, device=dev))[:, :, 0]       # (T,B,p) post-update coeffs (s=0)
+    tau, grad_tau, lap_tau = model.trunk_zderivs(z_col)               # (T,B,K,p),(...,K,d,p),(...,K,p)
+    ell0 = torch.einsum("tbp,tbkp->tbk", b0, tau) + model.bias        # (T,B,K)   ell_t at z_col[t]
+    grad_ell = torch.einsum("tbp,tbkdp->tbkd", b0, grad_tau)         # (T,B,K,d) grad ell_t
+    lap_ell = torch.einsum("tbp,tbkp->tbk", b0, lap_tau)            # (T,B,K)   Laplacian ell_t
+    ell_next = torch.einsum("tbp,tbkp->tbk", b0[1:], tau[:-1]) + model.bias   # (T-1,B,K) ell_{t+1} @ z_col[t]
+    z = z_col[:-1]                                                   # (T-1,B,K,d)
+    hz = z if C_cur is None else (z @ C_cur.t() + d_cur)            # (T-1,B,K,D)
+    loglik = -0.5 * ((x[1:].unsqueeze(2) - hz) ** 2).sum(-1) / noise_std ** 2   # (T-1,B,K) loglik_{t+1} @ z_col[t]
+    ds_slot = (ell_next - ell0[:-1] - loglik).unsqueeze(2)          # (T-1,B,1,K); /dt in fit_dynamics -> A
+    return z, grad_ell[:-1].unsqueeze(2), ds_slot, lap_ell[:-1].unsqueeze(2)   # (Ns=1) match _fp_residual_terms
+
+
+@torch.no_grad()
 def fit_obs_map_stiefel(z_hat, y, C_cur):
     """High-D Stiefel observation map (orthogonal Procrustes): C = unit direction of the cross-covariance
     of y and the inferred latent; d is the intercept. Obs are standardized upstream so the decode has no
@@ -425,7 +452,8 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
           learn_g, g_net, reg_lambda, reg_lambda_g, m_inner,
           learn_obs=False, c_stable_tol=0.05, C_cur=None, d_cur=None,
           meshfree_mean=False, n_mean=256, near_std=0.3, broad_std=1.6, mean_method="fixed", mala=None,
-          joint_g=False, noise_std=None, g_cur_in=None, w_em=1.0, w_inv=0.0, g_lr=1e-2, w_g=0.0, n_colloc=None):
+          joint_g=False, noise_std=None, g_cur_in=None, w_em=1.0, w_inv=0.0, g_lr=1e-2, w_g=0.0,
+          inv_mode="fp", n_colloc=None):
     """One EM M-step. Order: posterior-mean increments -> (high-D) Stiefel obs-map + cstab ->
     drift GATED on `cstab < c_stable_tol` -> diffusion. In 1-D (learn_obs=False) cstab==0, so the
     gate is always open and this reduces to the plain f,g M-step. `meshfree_mean` replaces the grid
@@ -467,8 +495,14 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
         C_cur, d_cur, cstab = fit_obs_map_stiefel(z_hat, x, C_cur)
     g_joint = None
     if cstab < c_stable_tol:                                          # sensor-before-dynamics gate: fit f (+ g jointly)
-        inv = _fp_residual_terms(model, x, mask, n_colloc if n_colloc is not None else n_mean,
-                                 near_std, broad_std, center) if w_inv > 0 else None
+        nc = n_colloc if n_colloc is not None else n_mean
+        if w_inv <= 0:
+            inv = None
+        elif inv_mode == "zakai":                                    # full one-step Zakai residual (INCLUDES loglik)
+            inv = _zakai_step_terms(model, x, mask, dt, noise_std, C_cur if learn_obs else None,
+                                    d_cur if learn_obs else None, nc, near_std, broad_std, center)
+        else:                                                        # within-interval FP flow (no data)
+            inv = _fp_residual_terms(model, x, mask, nc, near_std, broad_std, center)
         g_init = g_cur_in if g_cur_in is not None else 0.5
         if w_inv > 0 and learn_g:                                    # warm-start g from the classic increment M-step
             with torch.no_grad():                                    #   estimate, then let the FP residual refine its bias
