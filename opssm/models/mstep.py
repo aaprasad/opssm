@@ -311,6 +311,29 @@ def fit_drift(drift_net, dr_opt, zc, dz, reg_lambda, m_inner):
     drift_net.requires_grad_(False)
 
 
+def ito_correction(drift_net, z, g, dt, chunk=100000):
+    """Ito-Taylor bias correction  (dt/2)( (grad f) f + (g^2/2) Lap f )  at z (N,d), DETACHED, using the
+    CURRENT drift net. The forward increment E[(z_{t+1}-z_t)/dt | z_t] = f(z_t) + (dt/2) L f + O(dt^2) with
+    generator  L f = (grad f) f + (g^2/2) Lap f, so subtracting this correction removes the O(dt) forward-
+    difference bias -- WITHOUT the midpoint's errors-in-variables, because the input stays the noise-free
+    z_t and the correction is a deterministic function of z_t (no dW). Self-consistent: computed from the
+    current f each M-step, so it converges over the warm-started M-step sequence. g: scalar diffusion est."""
+    g2 = float(g) ** 2
+    outs = []
+    with torch.enable_grad():
+        for zc in z.split(chunk):
+            zc = zc.detach().requires_grad_(True)
+            f = drift_net.net(zc)                                     # (n,d)
+            gff = torch.zeros_like(f); lap = torch.zeros_like(f)
+            for i in range(f.shape[-1]):
+                gi = torch.autograd.grad(f[:, i].sum(), zc, create_graph=True)[0]   # grad f_i (n,d)
+                gff[:, i] = (gi * f).sum(-1)                          # (grad f_i) . f
+                for j in range(zc.shape[-1]):                         # Lap f_i = sum_j d2 f_i / dz_j^2
+                    lap[:, i] = lap[:, i] + torch.autograd.grad(gi[:, j].sum(), zc, retain_graph=True)[0][:, j]
+            outs.append((0.5 * dt * (gff + 0.5 * g2 * lap)).detach())
+    return torch.cat(outs)
+
+
 def fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,
                   g_net, reg_lambda_g, m_inner, pair=None):
     """Diffusion from the increment residual after the trapezoidal drift
@@ -375,7 +398,7 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
           learn_g, g_net, reg_lambda, reg_lambda_g, m_inner,
           learn_obs=False, c_stable_tol=0.05, C_cur=None, d_cur=None,
           meshfree_mean=False, n_mean=256, near_std=0.3, broad_std=1.6, mean_method="fixed", mala=None,
-          joint_g=False, noise_std=None, g_cur_in=None):
+          joint_g=False, noise_std=None, g_cur_in=None, drift_target="forward"):
     """One EM M-step. Order: posterior-mean increments -> (high-D) Stiefel obs-map + cstab ->
     drift GATED on `cstab < c_stable_tol` -> diffusion. In 1-D (learn_obs=False) cstab==0, so the
     gate is always open and this reduces to the plain f,g M-step. `meshfree_mean` replaces the grid
@@ -416,7 +439,11 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
     if learn_obs:
         C_cur, d_cur, cstab = fit_obs_map_stiefel(z_hat, x, C_cur)
     if cstab < c_stable_tol:                                          # sensor-before-dynamics gate
-        fit_drift(drift_net, dr_opt, zc, dz, reg_lambda, m_inner)
+        dz_fit = dz
+        if drift_target == "ito":                                     # remove the O(dt) forward-diff bias
+            g_corr = g_cur_in if g_cur_in is not None else 0.5        #   (self-consistent, uses current f,g)
+            dz_fit = dz - ito_correction(drift_net, zc, g_corr, dt)
+        fit_drift(drift_net, dr_opt, zc, dz_fit, reg_lambda, m_inner)
     g_cur = None
     if learn_g:
         g_cur = fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,
