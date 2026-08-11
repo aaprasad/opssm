@@ -81,11 +81,24 @@ Two fixes tested on em_highd d=1, BOTH NEGATIVE:
 **Bottom line:** the FP-inverse as a STRONG term (`w_inv ~ 1`) diverges robustly at d=1; anchoring `ell` or `g`
 does not rescue it.
 
-**Key untested knob -> WEAK `w_inv` (0.1-0.2):** the residual as a gentle regularizer ON TOP of the
-increment-dominated EM, so it cannot overpower the `w_em` data anchor on `f`. The `winv02` run (`w_inv=0.2`)
-was queued but KILLED before it finished -- RE-RUN it: `experiment=em_highd model.mean_method=mala model.w_em=1
-model.w_inv=0.2`. If even a weak `w_inv` fails to beat EM, the FP-inverse for the drift is a dead end in this
-setup, and the drift bottleneck stays open -> fall back to higher-order / finer-dt increment (notes/TODO.md).
+**Weak `w_inv` tested (0.1, 0.2) -> ALSO DIVERGES.** `w_inv=0.1`: drift_rel climbs `1.0 -> 1.31`, kl 0.72
+(vs EM 0.26 / 0.355). `w_inv=0.2`: drift_rel climbing `1.0 -> 1.14` by mid-run. Even a gentle physics nudge
+on top of EM co-adapts and drives the drift wrong. So the last knob is exhausted.
+
+## CONCLUSION: FP-inverse for the drift is a DEAD END in this setup
+
+Every setting tried on em_highd d=1 diverges (drift_rel climbs 1.0 -> 1.3-1.6, kl 0.72-0.99, vs EM's stable
+0.26 / 0.355): strong `w_inv=1`, weak `w_inv=0.1/0.2`, strong `ell` anchor `w_res=0.05`, `g` anchor `w_g` in
+{1,10,50}. The failure is structural, not a tuning miss: fitting `f` from the Zakai residual co-adapts with the
+residual-trained `ell` (they minimize the SAME under-determined objective), and NO weighting/anchoring keeps
+`f` on the data. Root cause vs the FPE-NN paper: they OBSERVE the density (so it's a fixed data anchor and the
+inverse is well-posed); we INFER it from point observations, so `ell` is free to slide with `f,g`.
+
+**Do not keep pushing this.** The drift bottleneck (g_est^2 = g^2 + drift_rmse^2*dt) stays open; the remaining
+levers are the INCREMENT-side ones in notes/TODO.md -- higher-order / central / temporal-FD-conv increment
+target (kills the O(dt) forward-difference bias) and finer dt. Those keep the data-driven `f` (which is stable)
+and just reduce its differentiation error, rather than fighting the ill-posed density inference. The FP-inverse
+code stays on this branch as a documented negative; the `fp-inverse` branch should NOT merge into main.
 
 ## Things to try next (prioritized)
 
