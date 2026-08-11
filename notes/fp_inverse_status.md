@@ -85,14 +85,45 @@ does not rescue it.
 (vs EM 0.26 / 0.355). `w_inv=0.2`: drift_rel climbing `1.0 -> 1.14` by mid-run. Even a gentle physics nudge
 on top of EM co-adapts and drives the drift wrong. So the last knob is exhausted.
 
-## CONCLUSION: FP-inverse for the drift is a DEAD END in this setup
+## UPDATE (2026-08-11): the ZAKAI-STEP residual (with loglik) -- ALSO NEGATIVE, WORSE
 
-Every setting tried on em_highd d=1 diverges (drift_rel climbs 1.0 -> 1.3-1.6, kl 0.72-0.99, vs EM's stable
-0.26 / 0.355): strong `w_inv=1`, weak `w_inv=0.1/0.2`, strong `ell` anchor `w_res=0.05`, `g` anchor `w_g` in
-{1,10,50}. The failure is structural, not a tuning miss: fitting `f` from the Zakai residual co-adapts with the
-residual-trained `ell` (they minimize the SAME under-determined objective), and NO weighting/anchoring keeps
-`f` on the data. Root cause vs the FPE-NN paper: they OBSERVE the density (so it's a fixed data anchor and the
-inverse is well-posed); we INFER it from point observations, so `ell` is free to slide with `f,g`.
+The FP-flow residual (`inv_mode=fp`) never saw the data (the likelihood lives in the jump, not the flow), so
+the natural next idea was the user's: fit `f,g` to the FULL one-step Zakai residual, which INCLUDES the
+likelihood. `inv_mode=zakai` (`_zakai_step_terms`): `A = (ell_{t+1} - ell_t - loglik_{t+1})/dt`, then the same
+`res = A + div f + f.grad ell - g^2 Bsig`. Idea: the known obs-noise `sigma` in `loglik` supplies the WIDTH
+reference `g` lacked under `fp`.
+
+d=1 A/B on em_highd, 14000 steps, `mean_method=mala`, `w_inv=1`:
+
+    config                     kl      drift_rel   g (init->final)   vs EM (0.355 / 0.257 / 0.914)
+    zpure  (w_em=0)            1.03    243         4.6 -> 18.5        DIVERGES, g runs away UP
+    zblend (w_em=1)            1.05    222         4.3 -> 16.9        DIVERGES, g runs away UP
+
+WORSE than the FP-flow inverse (which crept g DOWN to 0.5, drift_rel to 1.4). Here `g` runs away UP to ~17 and
+`drift_rel` to ~220. The `w_em=1` increment anchor on `f` does not hold (same overpower pattern as `fp`).
+
+**Diagnosis -- the 1/dt amplification of the operator's imperfect jump reconstruction.** Conceptually
+`A = (ell_{t+1} - ell_t - loglik)/dt` should be `O(L*)`: IF the trained operator perfectly reproduces the
+discrete likelihood jump, then `ell_{t+1}`'s curvature cancels `loglik` and what's left is the FP flow
+(`ell_predict - ell_t = O(L*)`). In practice the operator only APPROXIMATELY reconstructs the sharp `O(1)`
+likelihood jump; the residual curvature that survives the cancellation is a `1/dt`-amplified spatial function,
+and the `g^2 Bsig` term inflates to absorb it -> `g` blows up. This is STRUCTURALLY MORE FRAGILE than the
+FP-flow mode: it demands the operator perfectly represent a DISCRETE `O(1)` jump and then divides the leftover
+by `dt`, whereas the flow residual reads a native within-interval `s`-derivative (already `O(L*)`, no `1/dt`
+amplification of a jump). NOT a per-step-constant issue -- the survivor is loglik CURVATURE (quadratic in z),
+so centering/variance (the Phase-3 consistency trick, which only quotients a per-step CONSTANT) would not
+rescue it.
+
+## CONCLUSION: FP-inverse for the drift is a DEAD END in this setup (BOTH residual modes)
+
+BOTH residual modes fail on em_highd d=1. **FP-flow (`inv_mode=fp`):** every setting diverges (drift_rel
+1.0 -> 1.3-1.6, kl 0.72-0.99, vs EM's stable 0.26 / 0.355): strong `w_inv=1`, weak `w_inv=0.1/0.2`, strong
+`ell` anchor `w_res=0.05`, `g` anchor `w_g` in {1,10,50}. `f` co-adapts with the residual-trained `ell` (they
+minimize the SAME under-determined objective); no weighting/anchoring keeps `f` on the data (the FPE-NN paper
+is well-posed BECAUSE they OBSERVE the density; we INFER it from point obs, so `ell` slides with `f,g`).
+**Zakai-step (`inv_mode=zakai`, adds the loglik):** diverges HARDER -- g runs away UP to ~17, drift_rel ~220,
+because `A=(ell_{t+1}-ell_t-loglik)/dt` amplifies the operator's imperfect reconstruction of the discrete
+likelihood jump by `1/dt`. The failure is structural in both, not a tuning miss.
 
 **Do not keep pushing this.** The drift bottleneck (g_est^2 = g^2 + drift_rmse^2*dt) stays open; the remaining
 levers are the INCREMENT-side ones in notes/TODO.md -- higher-order / central / temporal-FD-conv increment
