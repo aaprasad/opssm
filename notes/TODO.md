@@ -2,51 +2,32 @@
 
 Cross-session task tracker for follow-up work that doesn't belong in the current PR.
 
-## Fit drift/diffusion as an FP INVERSE PROBLEM (NEXT major work, after the MCMC ladder)
+## ~~Fit drift/diffusion as an FP INVERSE PROBLEM~~ -- TRIED, DEAD END (2026-08-11)
 
-**Motivation (Phase-2 finding).** The M-step fits `f` by regressing the filter-MEAN increment
-`(ẑ_{t+1}-ẑ_t)/dt`, i.e. it DIFFERENTIATES the mean path -- the `1/dt` amplification is why `drift_rel`
-~57% at Lorenz from only ~6% `lat_rel`, and `g` inherits the leftover: measured `g_est^2 = g_true^2 +
-drift_rmse^2*dt` (VdP 0.35 vs 0.36; Lorenz 11.8 vs 11.3; Lorenz drift-residual term 131 >> true g^2 9). So
-`g` is DRIFT-LIMITED, not sampler-limited -- see the `g-is-drift-limited` memory. The fix is to stop
-differentiating the mean and instead recover `f,g` as the unknown COEFFICIENTS of the PDE the density
-already satisfies (a PINN inverse problem).
+**CONCLUDED NEGATIVE. Do not re-attempt.** Full write-up + numbers: `notes/fp_inverse_status.md` (branch
+`fp-inverse`, do NOT merge); memory `fp-inverse-drift-dead-end`. Both residual modes diverge on em_highd d=1:
+- **FP-flow** (`inv_mode=fp`, `d_t ell = L*(f,g)`, no data): `f,g` never see the observations (the likelihood
+  lives in the jump, not the flow), so they co-adapt with the residual-trained `ell` and slide off the true
+  filter. drift_rel 1.0->1.4, kl 0.72-0.99. NO weighting/anchoring (`w_res`, `w_g`) rescues it.
+- **Zakai-step** (`inv_mode=zakai`, adds the loglik so `f,g` DO see data): diverges HARDER -- g runs away UP to
+  ~17, drift_rel ~220. `A=(ell_{t+1}-ell_t-loglik)/dt` divides the discrete O(1) likelihood jump by dt, so the
+  operator's imperfect jump reconstruction is amplified 1/dt and `g^2` inflates to absorb it.
 
-**Reference.** Liu, Kou, Park, Lee, "Solving the inverse problem of time independent Fokker-Planck equation
-with a self supervised neural network method", Sci. Reports 11:15540 (2021), doi:10.1038/s41598-021-94712-5.
-FPE-NN embeds the FP terms as trainable weights and recovers them from observed densities by ALTERNATING
-(a) fit terms with density frozen, (b) denoise density with terms frozen -- structurally our EM (M-step /
-E-step). Findings: (1) recovers BOTH drift and diffusion (as functions of state); (2) alternating, NOT
-one-shot -- a single linear-least-squares fit on the smoothed-noisy pdf fails badly (their Fig 4), the terms
-only come out once the density is DENOISED in the loop (their `L_P` data-anchor is what gives the residual
-teeth); (3) they are 1-D, so they DODGE the rotational-current non-identifiability that bites us at d>=2.
+Root cause vs the FPE-NN paper (Liu et al 2021, Sci Reports 11:15540): they OBSERVE the density (fixed
+data anchor incl. its WIDTH -> well-posed inverse); we INFER it from noisy POINT obs, so `ell` is free to slide
+with `f,g` and the width `g` sets is unobserved. The drift bottleneck below stays open; the LIVE lever is the
+increment-side work (keep the stable data-driven `f`, cut its differentiation error), not the inverse.
 
-**How it maps onto us (small change -- ~90% is built).** `pinn_zakai_loss` already computes the log-space
-residual `d_t ell = -(div f + f.grad ell) + 1/2 g^2 (|grad ell|^2 + Laplacian ell)`; today its gradient
-flows only to `ell` (`f,g` detached from the regression M-step). The change: STOP detaching -- fit `f,g` to
-this residual in the M-step (DriftNet via autograd; scalar `g` in closed form). We are strictly better-
-equipped than the paper: mesh-free + exact autodiff + CONTINUOUS-time residual (no x-grid, no finite-diff, no
-multi-step Euler truncation -> not stuck in 1-D), and our density is already data-anchored by the jump/IC
-(observation-likelihood) terms = the analog of their `L_P` safeguard.
-- **Closed-form `g^2`** (residual is linear in `g^2`): `g^2 = <A,B>/<B,B>`, `A = d_t ell + div f + f.grad ell`,
-  `B = 1/2 (|grad ell|^2 + Laplacian ell)`, summed over collocation points. Fits `g` to the LAPLACIAN physics
-  signature, not the leftover increment variance -> dissolves the `g_est^2 = g^2 + drift_rmse^2*dt` coupling.
-- **Two things that decide whether it beats regression:**
-  1. **Identifiability at d>=2 (the gauge the paper dodges via 1-D).** The FP residual pins the compressive/
-     gradient drift + `g` cleanly but leaves the divergence-free (ROTATIONAL) current free -- exactly the
-     Helmholtz-SDE rotational-drift gauge (see the divergence-free diagnostic idea below). Increments DO see
-     rotation. So the likely winner is a HYBRID: residual for the clean part + `g`, increments (or the Zakai
-     observation term, which the free-FP argument ignores) for the rotational part. Test residual-only vs
-     hybrid.
-  2. **Keep `ell` DATA-driven, not term-driven.** If the E-step bends `ell` too hard toward the current
-     (wrong) `f,g` (`w_res` too high vs jump/IC), the M-step residual-fit just confirms them (co-adaptation
-     fixed point). The jump/IC anchor prevents runaway; the `w_res` balance is the knob to watch.
+## Drift bottleneck (OPEN) -- the live lever is INCREMENT-side, not the inverse
 
-**Plan.** Start d=1 on `em_highd` -- the paper's exact regime (no rotational gauge) + we have the exact-filter
-KL as ground truth. A/B the residual-fit `f,g` (closed-form `g^2` FIRST -- a few lines, directly tests "does
-physics-`g` beat increment-`g`") vs the regression M-step. If it wins at d=1 (it should), go to d=2 (VdP) /
-d=3 (Lorenz) where the rotational-gauge question decides residual-only vs hybrid. Subsumes the deferred drift
-work (higher-order increment / finer dt below stay as complementary levers for the rotational part).
+The M-step fits `f` by regressing the filter-MEAN increment `(ẑ_{t+1}-ẑ_t)/dt`, i.e. it DIFFERENTIATES the
+mean path -- the `1/dt` amplification is why `drift_rel` ~57% at Lorenz from only ~6% `lat_rel`, and `g`
+inherits the leftover: `g_est^2 = g_true^2 + drift_rmse^2*dt` (VdP 0.35 vs 0.36; Lorenz 11.8 vs 11.3). So `g`
+is DRIFT-LIMITED, not sampler-limited (memory `g-is-drift-limited`). The FP-inverse was the attempt to escape
+the `1/dt` by fitting `f,g` as PDE coefficients instead -- DEAD (above). What remains is to keep the stable
+data-driven increment `f` and REDUCE its differentiation error: the **Temporal FD-conv / higher-order dz/dt
+target** and **finer dt** in "Ideas / future directions" below (central/higher-order stencil kills the O(dt)
+forward-difference bias). Cheap to A/B on Lorenz; MEASURE `drift_l2_aln`, don't assume.
 
 ## Fix the `nll` gradient detach (dormant; do before enabling Stage-3 NLL training)
 
