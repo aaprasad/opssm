@@ -71,8 +71,9 @@ joint_g: false            # g estimator. false = filter-MEAN increment (marginal
                           #   joints' 1.6-1.9), ties at d=3, and is the simplest -> DEFAULT. The joint only helped
                           #   the d=1 baseline (g_aln 0.544->0.605, tiny drift error); at d>1 it just adds over-read.
                           #   To actually tighten g, fix the DRIFT (higher-order increment / finer dt), not the sampler.
-drift_target: forward     # drift M-step increment target. forward = f(z_t) ~ (z_{t+1}-z_t)/dt (1st order, O(dt)
-                          #   bias -- default). ito = TARGET-side debias f(z_t) ~ (z_{t+1}-z_t)/dt - (dt/2) L f,
+drift_target: det_mid     # drift M-step increment target. DEFAULT det_mid (robust 2nd-order, see below).
+                          #   forward = f(z_t) ~ (z_{t+1}-z_t)/dt (1st order, O(dt) bias -- legacy/reproduction).
+                          #   ito = TARGET-side debias f(z_t) ~ (z_{t+1}-z_t)/dt - (dt/2) L f,
                           #   L f = (grad f)f + (g^2/2) Lap f (2nd order, noise-free input). WINS d=1/d=2 but the
                           #   O(|f|^2 dt) correction OVERTAKES f on stiff Lorenz (|f|~123, |L f|~3700) -> DIVERGES.
                           #   det_mid = INPUT-side: eval f at the RK2 predicted midpoint z_t + (dt/2) f(z_t) instead
