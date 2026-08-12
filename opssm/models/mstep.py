@@ -439,11 +439,14 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
     if learn_obs:
         C_cur, d_cur, cstab = fit_obs_map_stiefel(z_hat, x, C_cur)
     if cstab < c_stable_tol:                                          # sensor-before-dynamics gate
-        dz_fit = dz
-        if drift_target == "ito":                                     # remove the O(dt) forward-diff bias
-            g_corr = g_cur_in if g_cur_in is not None else 0.5        #   (self-consistent, uses current f,g)
+        zc_fit, dz_fit = zc, dz
+        if drift_target == "ito":                                     # TARGET-side debias: dz - (dt/2) L f
+            g_corr = g_cur_in if g_cur_in is not None else 0.5        #   (self-consistent; O(|f|^2 dt) -- can blow up stiff)
             dz_fit = dz - ito_correction(drift_net, zc, g_corr, dt)
-        fit_drift(drift_net, dr_opt, zc, dz_fit, reg_lambda, m_inner)
+        elif drift_target == "det_mid":                              # INPUT-side: eval f at RK2 predicted midpoint
+            with torch.no_grad():                                   #   z_t + (dt/2) f(z_t) -- noise-free, |shift| BOUNDED by
+                zc_fit = zc + 0.5 * dt * drift_net.net(zc)          #   (dt/2)|f| (not the quadratic (dt/2)|grad f . f|)
+        fit_drift(drift_net, dr_opt, zc_fit, dz_fit, reg_lambda, m_inner)
     g_cur = None
     if learn_g:
         g_cur = fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,
