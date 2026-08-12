@@ -79,5 +79,12 @@ drift_target: forward     # drift M-step increment target. forward = f(z_t) ~ (z
                           #   (target unchanged). Also 2nd order + noise-free, but the shift is BOUNDED by (dt/2)|f|,
                           #   so it stays stable for stiff systems (oracle Lorenz 0.31). Both self-consistent (current
                           #   f,g), converge over the warm-started M-steps. Removes the coarse-dt drift bias.
+                          #   A/B (dt=0.1, home benchmarks): drift_rel forward/ito/det_mid = dw 0.257/0.157/0.207,
+                          #   vdp 0.254/0.211/0.185, lorenz 0.579/DIVERGES/0.211 (det_mid also moved the long-stuck
+                          #   Lorenz g_rel 3.81->2.45). det_mid = robust winner (improves all 3, never diverges).
+                          #   DEFERRED "clipped-ito": cap the ito correction at ~RMS|f| (GLOBAL scale, not per-point
+                          #   |f| -- that zeros it at fixed points) -> ito's precision where the correction is small
+                          #   + det_mid stability where it's large. Recovers the dw 0.207->0.157 gap, but adds a clip
+                          #   hyperparameter, so not worth it unless the last bit of drift accuracy matters.
 loss: zakai
 train_dir: ${train_dir}
