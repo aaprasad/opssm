@@ -1,0 +1,19 @@
+_target_: opssm.data.doublewell.datamodule.DoubleWellDataModule
+# Duncker et al. 2019 double-well: f(x)=4x(1-x^2) (a=4), Sigma=I (sigma=1), N=15 linear-Gaussian sensor,
+# obs-noise var 0.25 (std 0.5). DENSE obs (every step) + LONG trajectories for coverage (T=30 -> 32*30=960).
+a: 4.0
+sigma: 1.0
+noise_std: 0.5
+num_steps: 300         # obs dt = t1/num_steps = 0.1
+t0: 0.0
+t1: 30.0
+batch_size: 40         # 32 train + 8 val
+n_val: 8
+n_sub: 10              # inner dt = 0.01 (stable for a=4, sigma=1)
+Nz: 200
+zmax: 3.0
+num_iters: ${trainer.max_steps}
+highd: true            # 1-D latent + high-D sensor + exact-filter grid KL oracle
+obs_dim: 15
+c_scale: 1.0
+train_dir: ${train_dir}

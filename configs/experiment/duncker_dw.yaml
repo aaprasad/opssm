@@ -1,0 +1,11 @@
+# @package _global_
+# Duncker 2019 double-well in a WELL-COVERED regime (T=30, 32 trials -> coverage 960, off the drift floor).
+# 1-D latent + high-D (N=15) sensor -> exact-filter grid KL oracle. det_mid drift (main default).
+defaults:
+  - override /data: duncker_dw
+model:
+  learn_obs: true
+  data_size: 15
+  latent_dim: 1
+  w_res: 0.4
+  mean_method: mala
