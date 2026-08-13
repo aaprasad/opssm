@@ -52,6 +52,14 @@ def vanderpol(z, mu=1.5):
     return torch.stack([v, mu * (1.0 - x ** 2) * v - x], dim=-1)
 
 
+@register_system("vanderpol_duncker", dim=2, defaults={"tau": 10.0, "mu": 2.0})
+def vanderpol_duncker(z, tau=10.0, mu=2.0):
+    """z=(x1,x2) (...,2) -> (...,2). Duncker et al. 2019 Lienard-form VdP (their Eq. 25, rho==mu):
+    f1 = tau*mu*(x1 - x1^3/3 - x2),  f2 = tau*(x1/mu). tau multiplies -> FAST relaxation oscillator."""
+    x1, x2 = z[..., 0], z[..., 1]
+    return torch.stack([tau * mu * (x1 - x1 ** 3 / 3 - x2), tau * (x1 / mu)], dim=-1)
+
+
 @register_system("lorenz", dim=3, defaults={"s": 10.0, "r": 28.0, "b": 8.0 / 3.0})
 def lorenz(z, s=10.0, r=28.0, b=8.0 / 3.0):
     """z=(x,y,w) (...,3) -> (...,3). Lorenz attractor (chaotic)."""
@@ -70,7 +78,7 @@ def make_drift(name, **params):
 
 @torch.no_grad()
 def simulate(name, batch_size, num_steps, dt, sigma, n_sub=5, params=None,
-             init_std=1.0, burn_in=0, device="cpu", seed=0):
+             init_std=1.0, burn_in=0, x0_uniform=None, device="cpu", seed=0):
     """Euler-Maruyama a latent system -> z (num_steps, batch_size, d). Isotropic diffusion `sigma`.
     `burn_in` extra sub-integrated steps before t=0 (lets chaotic/limit-cycle systems reach their
     attractor before the recorded window)."""
@@ -84,7 +92,10 @@ def simulate(name, batch_size, num_steps, dt, sigma, n_sub=5, params=None,
             zz = zz + drift(zz) * sub + sigma * rt * torch.randn(batch_size, d, device=device, generator=gen)
         return zz
 
-    zz = init_std * torch.randn(batch_size, d, device=device, generator=gen)
+    if x0_uniform is not None:                                        # x0 ~ U[-x0_uniform, x0_uniform]^d (Duncker VdP)
+        zz = (torch.rand(batch_size, d, device=device, generator=gen) * 2 - 1) * x0_uniform
+    else:
+        zz = init_std * torch.randn(batch_size, d, device=device, generator=gen)
     for _ in range(burn_in):
         zz = step(zz)
     z = torch.zeros(num_steps, batch_size, d, device=device)

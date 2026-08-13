@@ -118,6 +118,26 @@ observation/output space. Add the same, ALONGSIDE the aligned latent metrics:
 Frame-free (the sensor absorbs the latent gauge), robust to offset/anisotropy, and make us directly comparable
 to the Helmholtz-SDE / SING / SDE-Matching numbers.
 
+## Duncker/Linderman benchmark suite — BUILT; deferred follow-ups
+
+The three Duncker et al. 2019 systems are implemented and run (`configs/experiment/duncker_{dw,vdp,lorenz}.yaml`;
+`vanderpol_duncker` drift + `x0_uniform` in `systems.py`; full results + settings + deviations in
+`notes/duncker_bench.md`). Run in a well-covered dense-obs regime: Lorenz strong (`lat_rel 0.010`, `drift_rel
+0.176`), VdP decent (0.18 / 0.45), double-well healthy at a=1 (0.406). Three follow-ups to make this a real
+head-to-head:
+
+1. **Obs-space gauge-invariant metrics FIRST** (see the section above). The Duncker/Helmholtz numbers are
+   obs-space; our latent-gauge `drift_rel`/`lat_rel` are NOT directly comparable. Wire the obs-space metrics into
+   the `duncker_*` experiments -> then the comparison is meaningful. This is the gating dependency for the
+   Baselines below.
+2. **Sparse/irregular-obs ablation.** Our runs (and the drift oracle) use DENSE regular obs; Duncker observes at
+   ~20 random uneven time-points/trial. Add a random observation `mask` + operator variable-dt support, then
+   compare dense vs sparse. This is the regime where their GP-smoothed continuous-time approach earns its keep.
+3. **a=4 double-well at finer obs dt.** Duncker's steep `4x(1-x^2)` breaks the drift M-step at obs dt=0.1
+   (`|f|*dt=0.75`, large-step; both forward AND det_mid; a quick dt=0.025 test destabilized). A careful dt sweep
+   with stable `n_sub` to see whether resolution alone rescues it, or whether the sharp 1-D well needs a
+   structural fix (coverage/importance). Details in `notes/duncker_bench.md`.
+
 ## Baselines
 
 External baselines to benchmark against once the MCMC ladder + obs-space metrics land.

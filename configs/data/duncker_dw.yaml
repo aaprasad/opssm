@@ -1,0 +1,22 @@
+_target_: opssm.data.doublewell.datamodule.DoubleWellDataModule
+# Double-well in the Duncker framing (Sigma=I sigma=1, N=15 sensor, obs-noise var 0.25 std 0.5, DENSE obs,
+# LONG trajectories T=30 -> coverage 960). USES a=1 (opssm's original well), NOT Duncker's steep a=4:
+# a=4 -> |f|<=7.5 -> |f|*dt=0.75 at obs dt=0.1 (large-step regime) -> the drift M-step breaks end-to-end
+# (drift_rel 1.3-2.6, both forward AND det_mid), while a=1 works (0.318). Duncker used dt=0.001 for exactly
+# this; opssm at dt=0.1 can't resolve the steep well. a=4 + finer dt is deferred (a=4 dt=0.025 destabilized).
+a: 1.0
+sigma: 1.0
+noise_std: 0.5
+num_steps: 300         # obs dt = t1/num_steps = 0.1
+t0: 0.0
+t1: 30.0
+batch_size: 40         # 32 train + 8 val
+n_val: 8
+n_sub: 10              # inner dt = 0.01 (stable for a=4, sigma=1)
+Nz: 200
+zmax: 3.0
+num_iters: ${trainer.max_steps}
+highd: true            # 1-D latent + high-D sensor + exact-filter grid KL oracle
+obs_dim: 15
+c_scale: 1.0
+train_dir: ${train_dir}

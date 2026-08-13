@@ -1,0 +1,14 @@
+# @package _global_
+# Lorenz (Duncker/Li regime: sigma=0.15, tiny obs noise 0.01) in a WELL-COVERED regime (T=30, 32 trials).
+# 3-D latent + high-D (N=20) sensor. det_mid drift (main default) -- the case where it beat forward most.
+defaults:
+  - override /data: duncker_lorenz
+model:
+  learn_obs: true
+  data_size: 20
+  latent_dim: 3
+  w_res: 0.4
+  n_colloc: 384
+  n_mean: 512
+  mean_method: mala
+  anim_posterior: false

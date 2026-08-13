@@ -1,0 +1,23 @@
+_target_: opssm.data.doublewell.datamodule.DoubleWellDataModule
+# Duncker et al. 2019 Van der Pol (Lienard form, tau=10 mu=2), Sigma=I (sigma=1), N=20 sensor, obs-noise
+# var 2.25 (std 1.5), x0 ~ U[-3,3]^2. DENSE obs + LONG trajectories (T=30 -> coverage 960).
+system: vanderpol_duncker
+a: 1.0                 # unused (drift comes from the registry) -- kept for datamodule compat
+sigma: 1.0
+noise_std: 1.5
+num_steps: 300         # obs dt = 0.1
+t0: 0.0
+t1: 30.0
+batch_size: 40         # 32 train + 8 val
+n_val: 8
+n_sub: 100             # inner dt = 0.001 (= Duncker's Delta t; the FAST tau=10 oscillator needs it)
+Nz: 200
+zmax: 3.0
+num_iters: ${trainer.max_steps}
+highd: false           # multi-D path (selected by system != doublewell)
+obs_dim: 20
+c_scale: 1.0
+init_std: 1.0          # overridden by x0_uniform
+burn_in: 0             # keep the uniform-IC spread (transient is part of the data, a la Duncker)
+x0_uniform: 3.0        # x0 ~ U[-3,3]^2
+train_dir: ${train_dir}

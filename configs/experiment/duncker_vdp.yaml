@@ -1,0 +1,14 @@
+# @package _global_
+# Duncker 2019 Van der Pol (Lienard, tau=10 mu=2) in a WELL-COVERED regime (T=30, 32 trials -> coverage 960).
+# 2-D latent + high-D (N=20) sensor. det_mid drift (main default).
+defaults:
+  - override /data: duncker_vdp
+model:
+  learn_obs: true
+  data_size: 20
+  latent_dim: 2
+  w_res: 0.4
+  n_colloc: 256
+  n_mean: 384
+  mean_method: mala
+  anim_posterior: false
