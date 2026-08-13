@@ -1,7 +1,10 @@
 _target_: opssm.data.doublewell.datamodule.DoubleWellDataModule
-# Duncker et al. 2019 double-well: f(x)=4x(1-x^2) (a=4), Sigma=I (sigma=1), N=15 linear-Gaussian sensor,
-# obs-noise var 0.25 (std 0.5). DENSE obs (every step) + LONG trajectories for coverage (T=30 -> 32*30=960).
-a: 4.0
+# Double-well in the Duncker framing (Sigma=I sigma=1, N=15 sensor, obs-noise var 0.25 std 0.5, DENSE obs,
+# LONG trajectories T=30 -> coverage 960). USES a=1 (opssm's original well), NOT Duncker's steep a=4:
+# a=4 -> |f|<=7.5 -> |f|*dt=0.75 at obs dt=0.1 (large-step regime) -> the drift M-step breaks end-to-end
+# (drift_rel 1.3-2.6, both forward AND det_mid), while a=1 works (0.318). Duncker used dt=0.001 for exactly
+# this; opssm at dt=0.1 can't resolve the steep well. a=4 + finer dt is deferred (a=4 dt=0.025 destabilized).
+a: 1.0
 sigma: 1.0
 noise_std: 0.5
 num_steps: 300         # obs dt = t1/num_steps = 0.1
