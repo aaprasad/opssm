@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from sklearn.svm import SVC
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
-from sklearn.model_selection import cross_val_predict, StratifiedKFold
+from sklearn.model_selection import cross_val_predict, KFold
 from sklearn.metrics import confusion_matrix, accuracy_score
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
@@ -61,14 +61,16 @@ def filter_full_trace(model, y_std, window, stride):
 
 
 def decode(Z, y, tag):
-    """5-fold stratified CV accuracy + confusion for SVM(rbf) and LDA on features Z -> labels y."""
-    cv = StratifiedKFold(5, shuffle=True, random_state=0)
+    """BLOCKED (contiguous-time) 5-fold CV accuracy + confusion for SVM(rbf) and LDA. Blocked, not random:
+    random folds leak through temporal autocorrelation (adjacent frames in train+test) and inflate accuracy
+    ~10 pts on this data -- contiguous time blocks are the honest estimate for a time series."""
+    cv = KFold(5, shuffle=False)
     out = {}
     for name, clf in [("SVM", SVC(C=2.0)), ("LDA", LDA())]:
         pred = cross_val_predict(clf, Z, y, cv=cv)
         out[name] = (accuracy_score(y, pred), confusion_matrix(y, pred, labels=np.unique(y)))
     base = np.bincount(y).max() / len(y)
-    print(f"  [{tag}] base-rate={base:.3f} | " + " | ".join(f"{k}={v[0]:.3f}" for k, v in out.items()))
+    print(f"  [{tag:16}] base={base:.3f} | " + " | ".join(f"{k}={v[0]:.3f}" for k, v in out.items()))
     return out, base
 
 
@@ -111,10 +113,13 @@ def main():
     keep = states < len(names)
     if "NOSTATE" in names:
         keep &= states != names.index("NOSTATE")
-    print("(B) behavior decoding (5-fold CV):")
+    print("(B) behavior decoding (BLOCKED 5-fold CV):")
     dz = np.gradient(z_hat, axis=0)                                          # latent derivative
-    dec_z, base = decode(z_hat[keep], states[keep], "latent z")
-    dec_dz, _ = decode(dz[keep], states[keep], "latent dz/dt")
+    dec_z, base = decode(z_hat[keep], states[keep], "model z_hat")
+    dec_dz, _ = decode(dz[keep], states[keep], "model dz/dt")
+    # baseline: PCA of the raw neural data (same dim) -- does the model's latent beat a linear projection?
+    pca_base = PCA(z_hat.shape[1]).fit_transform(y_std.numpy())
+    decode(pca_base[keep], states[keep], "PCA-of-data")
 
     # =================== figures ===================
     tvec = np.arange(T) * ckpt["dt"]
