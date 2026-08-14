@@ -52,6 +52,13 @@ def vanderpol(z, mu=1.5):
     return torch.stack([v, mu * (1.0 - x ** 2) * v - x], dim=-1)
 
 
+@register_system("none", dim=1, defaults={})
+def none_drift(z):
+    """Placeholder zero drift for REAL-data datamodules (no ground-truth SDE). Registered so
+    make_drift() doesn't KeyError at model setup; never actually called (all GT metrics are gated off)."""
+    return torch.zeros_like(z)
+
+
 @register_system("vanderpol_duncker", dim=2, defaults={"tau": 10.0, "mu": 2.0})
 def vanderpol_duncker(z, tau=10.0, mu=2.0):
     """z=(x1,x2) (...,2) -> (...,2). Duncker et al. 2019 Lienard-form VdP (their Eq. 25, rho==mu):

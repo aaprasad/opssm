@@ -1,0 +1,14 @@
+# @package _global_
+# opssm on REAL C. elegans whole-brain calcium (Kato 2015), per worm. Learn the linear sensor C from ~100
+# neurons + a latent_dim=10 nonlinear SDE. Ground-truth-free: GT metrics/figures auto-skip; the real-data
+# metric is recon_r2 (logged), with behavior decoding + latent/dynamics viz done post-hoc (scripts/eval_kato.py).
+# NB: model.data_size MUST equal the worm's neuron count N (WT_Stim worm0 = 107). Set per worm.
+defaults:
+  - override /data: kato
+model:
+  learn_obs: true
+  data_size: 107        # = N (this worm's neuron count); OVERRIDE per worm
+  latent_dim: 10
+  w_res: 0.4
+  mean_method: mala
+  anim_posterior: false
