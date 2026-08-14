@@ -210,6 +210,29 @@ class ZakaiFilterModule(pl.LightningModule):
             if out.get(key) is not None:
                 self.log(key, out[key], prog_bar=True)
 
+    def _save_ckpt(self):
+        """Persist for post-hoc eval (Lightning checkpointing is off; g_cur/C_cur/d_cur aren't in state_dict).
+        Called at every validation AND on train-end, so a mid-run crash still leaves a usable model.pt."""
+        dm = self.trainer.datamodule
+        torch.save({
+            "state_dict": self.state_dict(),                            # operator + drift_net + diff_net weights
+            "hparams": dict(self.hparams),                              # MODEL hparams (data_size, latent_dim, ...)
+            "data_hparams": dict(dm.hparams),                           # DATAMODULE hparams (mat_path, worm, window, ...)
+            "g_cur": float(self.g_cur),
+            "C_cur": None if self.C_cur is None else self.C_cur.detach().cpu(),
+            "d_cur": None if self.d_cur is None else self.d_cur.detach().cpu(),
+            "obs_mean": None if getattr(dm, "obs_mean", None) is None else dm.obs_mean.detach().cpu(),
+            "obs_scale": float(getattr(dm, "obs_scale", 1.0)),
+            "dt": float(self.dt), "latent_dim": self.model.latent_dim,
+        }, os.path.join(self.hparams.train_dir, "model.pt"))
+
+    def on_train_end(self):
+        self._save_ckpt()
+
+    def on_validation_end(self):
+        if self.hparams.learn_obs and self.C_cur is not None:   # crash-resilient: refresh model.pt each validation
+            self._save_ckpt()
+
     @torch.no_grad()
     def _gauge_aligned(self, log_pi, filt, m_op, z_true):
         """PROCRUSTES-aligned metrics. A latent SDE with linear-Gaussian obs is identifiable only up to a
@@ -274,7 +297,8 @@ class ZakaiFilterModule(pl.LightningModule):
         log_pi = None
         if d == 1:                                                   # 1-D GRID metrics (kl, drift_l2 on the grid)
             log_pi = self.model.log_posterior(x, mask, self.z_grid)
-            logs["kl"] = kl_target_pred(filt, log_pi).item()
+            if filt is not None:                                     # exact-filter KL (skip on real/no-oracle data)
+                logs["kl"] = kl_target_pred(filt, log_pi).item()
             m_op = (log_pi.exp() * self.z_grid).sum(-1)              # (T,B) grid-quadrature mean
             lo, hi = m_op.quantile(0.01), m_op.quantile(0.99)       # ON-DATA regime (the range the latent visits)
             on = (self.z_grid >= lo) & (self.z_grid <= hi)
@@ -291,6 +315,12 @@ class ZakaiFilterModule(pl.LightningModule):
         if h.learn_obs and dm.C_true is not None:                   # c_cos: mean principal-angle cosine (any d)
             Cn = dm.C_true / dm.C_true.norm(dim=0, keepdim=True)
             logs["c_cos"] = float(torch.linalg.svdvals(self.C_cur.t() @ Cn).clamp(max=1.0).mean())
+        if h.learn_obs and self.C_cur is not None and d > 1:        # RECONSTRUCTION R^2 (obs-only; real-data metric)
+            y_hat = m_op_al @ self.C_cur.t() + self.d_cur           # (T,B,D) = C z_hat + d (standardized units)
+            xf, yf = x.reshape(-1, x.shape[-1]), y_hat.reshape(-1, x.shape[-1])
+            ss_res = (xf - yf).pow(2).sum()                         # per-worm R^2 (affine-invariant -> std==phys)
+            ss_tot = (xf - xf.mean(0, keepdim=True)).pow(2).sum().clamp_min(1e-8)
+            logs["recon_r2"] = float(1.0 - ss_res / ss_tot)
         # collocation SNIS health: ESS FRACTION of the E-step posterior weights W = softmax(ell0 - log_q) over
         # the proposal points -- the importance-sampling analog of the (now-MALA) mean readout's `ess`. Watches
         # whether the curse of dimensionality collapses the COLLOCATION weights as d grows (the Phase-3

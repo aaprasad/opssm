@@ -1,0 +1,17 @@
+_target_: opssm.data.kato.datamodule.KatoDataModule
+# Kato 2015 C. elegans whole-brain calcium (per worm). Download via OSF osf.io/2395t; see opssm/data/kato/load.py.
+mat_path: /home/aaprasad/data/kato/WT_Stim.mat   # WT_Stim.mat (7 worms) | WT_NoStim.mat (5 worms)
+worm: 0
+window: 200            # window length (timesteps) -> the operator's T
+stride: 100            # window stride (< window = overlapping windows)
+val_frac: 0.2          # late fraction of the trace held out for val (recon_r2)
+noise_std: 0.5         # ASSUMED calcium obs-noise (standardized units) -- a real hyperparameter, TUNE
+clip_negative: true    # clip dF/F negatives -> 0 (as in dLDS preprocessing)
+subsample: 1           # temporal subsample factor (>1 shortens T, dt *= subsample)
+latent_dim: 10         # must match model.latent_dim (used for the obs-scale SVD)
+a: 1.0                 # placeholder (GT-free; unused at d>1)
+sigma: 0.1             # process-noise prior (only feeds the g_rel logging metric when learn_g=true)
+system: none           # placeholder registered zero-drift (GT metrics/figures are gated off)
+num_iters: ${trainer.max_steps}
+seed: 0
+train_dir: ${train_dir}
