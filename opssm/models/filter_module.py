@@ -210,12 +210,14 @@ class ZakaiFilterModule(pl.LightningModule):
             if out.get(key) is not None:
                 self.log(key, out[key], prog_bar=True)
 
-    def on_train_end(self):
-        """Persist for post-hoc eval (Lightning checkpointing is off; g_cur/C_cur/d_cur aren't in state_dict)."""
+    def _save_ckpt(self):
+        """Persist for post-hoc eval (Lightning checkpointing is off; g_cur/C_cur/d_cur aren't in state_dict).
+        Called at every validation AND on train-end, so a mid-run crash still leaves a usable model.pt."""
         dm = self.trainer.datamodule
         torch.save({
             "state_dict": self.state_dict(),                            # operator + drift_net + diff_net weights
-            "hparams": dict(self.hparams),
+            "hparams": dict(self.hparams),                              # MODEL hparams (data_size, latent_dim, ...)
+            "data_hparams": dict(dm.hparams),                           # DATAMODULE hparams (mat_path, worm, window, ...)
             "g_cur": float(self.g_cur),
             "C_cur": None if self.C_cur is None else self.C_cur.detach().cpu(),
             "d_cur": None if self.d_cur is None else self.d_cur.detach().cpu(),
@@ -223,6 +225,13 @@ class ZakaiFilterModule(pl.LightningModule):
             "obs_scale": float(getattr(dm, "obs_scale", 1.0)),
             "dt": float(self.dt), "latent_dim": self.model.latent_dim,
         }, os.path.join(self.hparams.train_dir, "model.pt"))
+
+    def on_train_end(self):
+        self._save_ckpt()
+
+    def on_validation_end(self):
+        if self.hparams.learn_obs and self.C_cur is not None:   # crash-resilient: refresh model.pt each validation
+            self._save_ckpt()
 
     @torch.no_grad()
     def _gauge_aligned(self, log_pi, filt, m_op, z_true):
