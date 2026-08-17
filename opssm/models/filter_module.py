@@ -235,56 +235,14 @@ class ZakaiFilterModule(pl.LightningModule):
 
     @torch.no_grad()
     def _gauge_aligned(self, log_pi, filt, m_op, z_true):
-        """PROCRUSTES-aligned metrics. A latent SDE with linear-Gaussian obs is identifiable only up to a
-        LINEAR-MAP gauge (z->A z, f->A f(A^-1 .), g->A g, s_scale absorbs it -- the data distribution is
-        unchanged), so scoring operator-z vs true-z on an absolute frame is ill-posed and inflates the gap.
-        Fit the best map A (least squares z_true ~ A m_op) and score in the aligned frame.
-          DIMENSION-AGNOSTIC (pure linear algebra, no grid): A is a SCALAR for a 1-D latent, a d x d matrix
-          for a multi-dim latent; `lat_rmse_aln` follows for any d.
-          1-D-MODEL-BOUND (guarded to d==1): drift/diffusion (the drift net is 1->1) and KL (needs the 1-D
-          grid oracle -- no analog for a multi-dim latent). These generalize by swapping in a d->d drift net
-          and a sample-based KL once the LATENT model goes multi-dim; the metric code is not the blocker."""
-        d = m_op.shape[-1] if m_op.dim() >= 3 else 1
-        M = m_op.reshape(-1, d); Z = z_true.reshape(-1, d)                # inferred vs true latent points (N,d)
-        # AFFINE Procrustes gauge z_true ~ A m_op + b. The OFFSET b is essential for offset latents (Lorenz
-        # z3 mean ~25): a purely LINEAR A cannot represent a mean shift, which floors lat_rmse at the offset
-        # (~25 even for a perfect latent) AND distorts A (inflating s_fit -> g_aln, drift_l2_aln). Centered
-        # latents (double-well, VdP) have b~0, so this is ~identical there. The DRIFT transforms under the
-        # LINEAR part A only -- an offset doesn't change velocities.
-        Mh = torch.cat([M, torch.ones_like(M[:, :1])], dim=-1)            # (N,d+1) design matrix [m, 1]
-        sol = torch.linalg.lstsq(Mh, Z).solution                         # (d+1,d): Z ~ [M,1] @ sol
-        A, b = sol[:d], sol[d]                                            # (d,d) linear part, (d,) offset
-        z_al = M @ A + b                                                 # aligned latent (offset-corrected)
-        f_al = self.drift_net.drift(M)[0].reshape(-1, d) @ A            # drift maps under A (offset-free); the
-        f_true = self.true_drift(z_al)                                  #   true-drift form is the per-benchmark piece
-        on = (z_al.abs().le(1.5).all(-1) if d == 1                     # double-well data region; all points for d>1
-              else torch.ones(z_al.shape[0], dtype=torch.bool, device=z_al.device))
-        gscale = A.det().abs().pow(1.0 / d).item()                      # |A|^(1/d): scalar |A| for 1-D, dxd det
-        e_lat = (z_al - Z).pow(2).sum(-1)                              # (N,) per-point squared Euclidean latent error
-        e_drf = (f_al[on] - f_true[on]).pow(2).sum(-1)                # per-point squared drift error (on-data)
-        z_scale = (Z - Z.mean(0)).pow(2).sum(-1).mean().sqrt().clamp_min(1e-8)   # RMS spread of the true latent
-        f_scale = f_true[on].pow(2).sum(-1).mean().sqrt().clamp_min(1e-8)        # RMS magnitude of the true drift
-        # THREE flavors per quantity (all mean-over-N -> time-length invariant): l2 = Euclidean-norm RMS (sum over
-        # d dims, so ~sqrt(d)); rmse = per-DIM RMSE (= l2/sqrt(d), dimensionality-normalized); rel = RELATIVE
-        # (l2 / true-scale, dimensionless -> comparable across benchmarks AND dims, since BOTH the sqrt(d) and the
-        # system magnitude cancel). `rel` is the honest cross-benchmark number: Lorenz's drift is ~100x the
-        # double-well's, so absolute l2 is NOT comparable, but rel is (Lorenz drift ~0.6, latent ~0.06).
-        out = {"s_fit": float(A.reshape(-1)[0]) if d == 1 else gscale,  # signed 1-D scale (viz) / geo-mean scale
-               "lat_l2_raw": (M - Z).pow(2).sum(-1).mean().sqrt().item(),      # RAW (unaligned) Euclidean
-               "lat_l2_aln": e_lat.mean().sqrt().item(),                       # aligned latent: Euclidean L2
-               "lat_rmse_aln": (e_lat.mean() / d).sqrt().item(),               #   per-dim RMSE (= l2/sqrt(d))
-               "lat_rel": (e_lat.mean().sqrt() / z_scale).item(),              #   relative (÷ true latent scale)
-               "drift_l2_aln": e_drf.mean().sqrt().item(),                     # aligned drift: Euclidean L2
-               "drift_rmse_aln": (e_drf.mean() / d).sqrt().item(),             #   per-dim RMSE
-               "drift_rel": (e_drf.mean().sqrt() / f_scale).item(),            #   relative (÷ true drift magnitude)
-               "g_aln": gscale * float(self.g_cur),                    # isotropic g gauge-scaled by |A|^(1/d) -> true frame
-               "g_rel": gscale * float(self.g_cur) / max(float(self.sigma), 1e-8)}   # g_aln / true sigma (1.0 = perfect)
-        if d == 1:                                                       # KL: grid-bound (1-D oracle only)
-            s = float(A.reshape(-1)[0]); b0 = float(b.reshape(-1)[0]); zg = self.z_grid
-            pi_al = _interp1d(log_pi.exp(), zg, (zg - b0) / s).clamp_min(0) / abs(s)   # z_op=(z_true-b)/s -> true frame
-            pi_al = pi_al / pi_al.sum(-1, keepdim=True).clamp_min(1e-12)
-            out["kl_aln"] = kl_target_pred(filt, pi_al.clamp_min(1e-20).log()).item()
-        return out
+        """Procrustes-aligned latent/drift/g/kl metrics. Thin wrapper over the model-agnostic
+        `opssm.eval.core.gauge_aligned` (single source of truth, shared with the baselining harness so
+        opssm and every baseline are scored by identical code). See that function for the math."""
+        from opssm.eval.core import gauge_aligned
+        return gauge_aligned(m_op, z_true,
+                             drift_fn=lambda z: self.drift_net.drift(z)[0], true_drift=self.true_drift,
+                             g=float(self.g_cur), sigma=float(self.sigma),
+                             log_pi=log_pi, filt=filt, z_grid=self.z_grid)
 
     # -- validation: KL vs the exact filter, drift L2, C cos, + a figure -------------------------
     @torch.no_grad()
