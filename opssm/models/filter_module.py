@@ -63,7 +63,7 @@ class ZakaiFilterModule(pl.LightningModule):
                  pca_init=True, c_stable_tol=0.05, meshfree_mean=True, n_mean=256,
                  res_mode="rel", w_res=0.2, learn_smoother=False, joint_g=False, drift_target="forward",
                  encoder="gru", encoder_kwargs=None,
-                 mean_method="fixed", mala_chains=64, mala_steps=30, mala_rng="stochastic",
+                 mean_method="mala", mala_chains=64, mala_steps=30, mala_rng="stochastic",
                  anim_posterior=False, latent_dim=1, loss="zakai", train_dir="./dump/nzf"):
         super().__init__()
         self.save_hyperparameters()

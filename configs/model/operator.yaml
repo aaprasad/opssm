@@ -35,9 +35,12 @@ c_stable_tol: 0.05
 meshfree_mean: true       # M-step E[z|y]: true = deterministic mesh-free fixed-node IS (default; scales to
                           #   high-D latent, drift/sensor good, g mildly over-estimated); false = grid quadrature
 n_mean: 256               # fixed-node sample count when meshfree_mean=true (also drives joint_g's pair sampler)
-mean_method: fixed        # filter-mean readout: fixed = deterministic fixed-node importance sampling (default);
-                          #   mala = gradient MCMC (Metropolis-adjusted Langevin) -- scales to high-D latent
-                          #   where SNIS ess collapses. The mala_* knobs apply only when mean_method=mala.
+mean_method: mala         # filter-mean readout E[z|y] (used by the M-step's drift target + validation, NOT the
+                          #   E-step): mala = gradient MCMC (Metropolis-adjusted Langevin), the robust DEFAULT.
+                          #   fixed = deterministic fixed-node SNIS -- cheaper but at large g the broad proposal's
+                          #   weights collapse onto a far outlier, dragging E[z|y] off the manifold (a "fly-off"
+                          #   artifact that corrupts the drift regression -- see the vdp mean_method post-mortem).
+                          #   The mala_* knobs apply only when mean_method=mala.
                           #   Because MALA samples the posterior directly, step size / burn-in / init are all
                           #   self-tuning (internal); only the compute budget + rng are exposed.
 mala_chains: 64           # parallel MALA chains per (t,b) site (MALA moves samples -> far fewer than n_mean)
