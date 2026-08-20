@@ -24,6 +24,7 @@ class Result:
     y_hat: np.ndarray                                   # (T, N) reconstruction in STANDARDIZED obs units
     drift_fn: Optional[Callable] = None                 # z (...,d)->(...,d), model's latent frame (in-process models)
     drift_at_zhat: Optional[np.ndarray] = None          # (T, d) drift evaluated at z_hat (cross-process seam)
+    z_cov: Optional[np.ndarray] = None                  # (T,[B,]d,d) posterior covariance -> tr(S) latents RMSE
     g: Optional[float] = None                           # isotropic process-noise scalar, model's frame
     posterior_type: str = "filter"                      # 'filter' | 'smoother'  (fairness tag)
     window_mode: str = "whole"                          # 'windowed' | 'whole'
@@ -83,7 +84,7 @@ def _interp1d(vals, grid, query):
 
 @torch.no_grad()
 def gauge_aligned(z_hat, z_true, *, drift_fn=None, drift_at_zhat=None, true_drift=None,
-                  g=None, sigma=None, log_pi=None, filt=None, z_grid=None):
+                  g=None, sigma=None, z_cov=None, log_pi=None, filt=None, z_grid=None):
     """PROCRUSTES-aligned latent/drift/g metrics (moved verbatim from ZakaiFilterModule._gauge_aligned).
 
     A latent SDE with linear-Gaussian obs is identifiable only up to a LINEAR-MAP gauge, so scoring
@@ -118,6 +119,17 @@ def gauge_aligned(z_hat, z_true, *, drift_fn=None, drift_at_zhat=None, true_drif
            "lat_rmse_aln": (e_lat.mean() / d).sqrt().item(),
            "lat_rel": (e_lat.mean().sqrt() / z_scale).item()}
 
+    # Hu/Bartosh latents RMSE: sqrt(mean_t E_q||x-x_true||^2) with E_q||x-x_true||^2 = tr(S) + ||m-x_true||^2,
+    # aligned (posterior cov -> A^T S A), TOTAL over dims (not per-dim). Reported both in the true gauge and
+    # standardized (÷ per-dim true std) since their exact normalization isn't in the paper body.
+    if z_cov is not None:
+        Sc = _t(z_cov, device=M.device).reshape(-1, d, d)
+        S_al = torch.einsum('ip,nij,jq->npq', A, Sc, A)          # cov of z_al = z_hat @ A
+        dgS = S_al.diagonal(dim1=-2, dim2=-1).clamp_min(0)       # (N,d) aligned per-dim posterior variance
+        out["lat_rmse_trS"] = (e_lat + dgS.sum(-1)).mean().sqrt().item()
+        sd2 = (Z - Z.mean(0)).pow(2).mean(0).clamp_min(1e-12)    # per-dim true variance
+        out["lat_rmse_trS_std"] = ((((z_al - Z).pow(2) + dgS) / sd2).sum(-1)).mean().sqrt().item()
+
     # drift metrics -- need the model's drift at z_hat mapped through A, vs the true drift at z_al
     if (drift_fn is not None or drift_at_zhat is not None) and true_drift is not None:
         f_M = _t(drift_at_zhat, device=M.device).reshape(-1, d) if drift_at_zhat is not None \
@@ -127,10 +139,14 @@ def gauge_aligned(z_hat, z_true, *, drift_fn=None, drift_at_zhat=None, true_drif
         on = (z_al.abs().le(1.5).all(-1) if d == 1
               else torch.ones(z_al.shape[0], dtype=torch.bool, device=z_al.device))
         e_drf = (f_al[on] - f_true[on]).pow(2).sum(-1)
-        f_scale = f_true[on].pow(2).sum(-1).mean().sqrt().clamp_min(1e-8)
+        f_sq = f_true[on].pow(2).sum(-1)
+        f_scale = f_sq.mean().sqrt().clamp_min(1e-8)
         out.update({"drift_l2_aln": e_drf.mean().sqrt().item(),
                     "drift_rmse_aln": (e_drf.mean() / d).sqrt().item(),
-                    "drift_rel": (e_drf.mean().sqrt() / f_scale).item()})
+                    "drift_rel": (e_drf.mean().sqrt() / f_scale).item(),
+                    # Hu/Bartosh "normalized dynamics RMSE": sqrt(mean_pts ||f_hat-f_true||^2 / ||f_true||^2),
+                    # normalized PER POINT (not the global RMS ratio drift_rel). Directly comparable to their tables.
+                    "drift_rmse_norm": (e_drf / f_sq.clamp_min(1e-12)).mean().sqrt().item()})
 
     # diffusion metrics
     if g is not None and sigma is not None:

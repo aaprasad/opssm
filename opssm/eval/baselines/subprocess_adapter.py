@@ -40,6 +40,8 @@ class SubprocessAdapter:
             noise_std_eff=np.float32(ctx.noise_std_eff),
             window=np.int64(ctx.window if ctx.window else -1),
             stride=np.int64(ctx.stride if ctx.stride else -1))
+        if getattr(ctx, "sigma_true", None) is not None:              # GT diffusion (synthetic); gpSLDS/SING-GP
+            payload["sigma_true"] = np.float32(ctx.sigma_true)        # set the fit's sigma to it, as their demo does
         payload.update({k: v for k, v in cfg.items() if np.isscalar(v) and k != "scratch_dir"})
         np.savez(fin, **payload)
 
@@ -55,6 +57,7 @@ class SubprocessAdapter:
         return Result(
             z_hat=d["z_hat"], y_hat=d["y_hat"],
             drift_at_zhat=d["drift_at_zhat"] if "drift_at_zhat" in d.files else None,
+            z_cov=d["z_cov"] if "z_cov" in d.files else None,
             g=float(d["g"]) if "g" in d.files else None,
             posterior_type=str(d["posterior_type"]) if "posterior_type" in d.files else self.posterior_type,
             window_mode=str(d["window_mode"]) if "window_mode" in d.files else "whole",

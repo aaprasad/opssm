@@ -54,8 +54,8 @@ class DoubleWellDataModule(pl.LightningDataModule):
     def __init__(self, a=1.0, sigma=0.6, noise_std=0.1, num_steps=100, t0=0.0, t1=10.0,
                  batch_size=256, n_val=32, n_sub=5, Nz=200, zmax=3.0, num_iters=14000,
                  gap_lo=0.5, gap_hi=0.5, highd=False, obs_dim=10, c_scale=1.0, seed=0,
-                 system="doublewell", init_std=1.0, burn_in=0, x0_uniform=None,
-                 train_dir="./dump/dw_data"):
+                 system="doublewell", init_std=1.0, burn_in=0, x0_uniform=None, mult_noise=False,
+                 std_then_noise=False, train_dir="./dump/dw_data"):
         super().__init__()
         self.save_hyperparameters()
 
@@ -94,11 +94,17 @@ class DoubleWellDataModule(pl.LightningDataModule):
             dt = (h.t1 - h.t0) / h.num_steps                       #   linear sensor, NO grid oracle (deferred)
             z_true = simulate(h.system, h.batch_size, h.num_steps, dt, h.sigma, h.n_sub,
                               init_std=h.init_std, burn_in=h.burn_in, x0_uniform=h.x0_uniform,
-                              device=dev, seed=h.seed)  # (T,B,d)
-            y, C_true, d_true = linear_sensor(z_true, h.obs_dim, h.noise_std, h.c_scale, dev, seed=h.seed + 1)
+                              mult_noise=h.mult_noise, device=dev, seed=h.seed)  # (T,B,d)
             ts = torch.linspace(h.t0, h.t1, h.num_steps, device=dev)
             mask = torch.ones(h.num_steps, h.batch_size, 1, device=dev)
-            y = self._standardize_obs(y, mask, h.n_val, self.latent_dim)                    # obs -> ~unit scale (s_scale removed)
+            if h.std_then_noise:                                  # notebook order: standardize CLEAN obs, THEN add noise
+                y, C_true, d_true = linear_sensor(z_true, h.obs_dim, 0.0, h.c_scale, dev, seed=h.seed + 1)
+                y = self._standardize_obs(y, mask, h.n_val, self.latent_dim)
+                y = y + h.noise_std * torch.randn(y.shape, device=dev)    # noise in standardized units
+                self.noise_std_eff = h.noise_std                  # already standardized -> noise_std IS the eff noise
+            else:                                                 # default: noise in raw units, then standardize
+                y, C_true, d_true = linear_sensor(z_true, h.obs_dim, h.noise_std, h.c_scale, dev, seed=h.seed + 1)
+                y = self._standardize_obs(y, mask, h.n_val, self.latent_dim)    # obs -> ~unit scale (s_scale removed)
             self.train_batch = (y[:, h.n_val:], mask[:, h.n_val:], None)   # filt=None (no d>1 oracle yet)
             self.val_batch = (y[:, :h.n_val], mask[:, :h.n_val], None)
             self.z_val_true, self.C_true, self.d_true = z_true[:, :h.n_val], C_true, d_true

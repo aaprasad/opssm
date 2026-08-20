@@ -17,4 +17,6 @@ obs_dim: 10           # sensor dim D (10 sensors observing the 3-D latent -> ove
 c_scale: 1.0
 init_std: 1.0         # burn_in sub-integrates onto the attractor before the recorded window
 burn_in: 50
+mult_noise: false     # multiplicative diffusion g=sigma*z (sde_matching Lorenz) vs constant isotropic sigma
+std_then_noise: false # standardize clean obs THEN add noise (noise_std IS the standardized noise) vs noise-then-std
 train_dir: ${train_dir}

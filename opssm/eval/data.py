@@ -21,6 +21,17 @@ DATASETS = {
     "doublewell": ("em_highd", []),
     "vanderpol":  ("em_vdp", []),
     "lorenz":     ("em_lorenz", []),
+    # SDE-Matching paper's stochastic-Lorenz benchmark (Bartosh Fig.7 / Li et al.): sigma=0.15, obs noise
+    # 0.01, T_max=1 on a dt=0.025 grid, sim dt=0.00025 (n_sub=100), x0~N(0,I), no burn-in, 10-D sensor.
+    "lorenz_sing": ("em_lorenz", ["data.sigma=0.15", "data.mult_noise=true", "data.std_then_noise=true",
+                                  "data.num_steps=40", "data.t1=1.0", "data.n_sub=100", "data.obs_dim=3",
+                                  "data.noise_std=0.01", "data.burn_in=0", "data.init_std=1.0",
+                                  "data.batch_size=64", "data.n_val=16"]),
+    # Fig-7 EXACT: 10-D Cx obs, 1024 total trials (their published SDE-Matching / SING benchmark)
+    "lorenz_sing10": ("em_lorenz", ["data.sigma=0.15", "data.mult_noise=true", "data.std_then_noise=true",
+                                    "data.num_steps=40", "data.t1=1.0", "data.n_sub=100", "data.obs_dim=10",
+                                    "data.noise_std=0.01", "data.burn_in=0", "data.init_std=1.0",
+                                    "data.batch_size=1008", "data.n_val=16"]),
     # noise_std=0.1 matches how the kato_stim0/nostim0 checkpoints were trained (config default is 0.5)
     "kato_stim0": ("kato", ["data.mat_path=/home/aaprasad/data/kato/WT_Stim.mat",
                             "data.worm=0", "model.data_size=107", "data.noise_std=0.1"]),
@@ -83,7 +94,7 @@ def _setup_dm(dm, device):
 def _build_context(dm, name) -> EvalContext:
     obs_mean = _np(getattr(dm, "obs_mean", None))
     obs_scale = float(getattr(dm, "obs_scale", 1.0))
-    common = dict(name=getattr(dm, "name", name), system=dm.hparams.get("system", "doublewell"),
+    common = dict(name=name or getattr(dm, "name", "data"), system=dm.hparams.get("system", "doublewell"),
                   dt=float(dm.dt), obs_mean=obs_mean, obs_scale=obs_scale,
                   noise_std_eff=float(dm.noise_std_eff),
                   obs_std_fit=_np(dm.train_batch[0]), mask_fit=_np(dm.train_batch[1]))
@@ -104,11 +115,16 @@ def _build_context(dm, name) -> EvalContext:
     # synthetic: ground truth available
     from opssm.data.systems import make_drift
     true_drift, _ = make_drift(dm.hparams.system)
+    # multiplicative noise g=sigma*z (sde_matching Lorenz): the "true diffusion" for a constant-sigma model
+    # like gpSLDS is the RMS effective value sigma*RMS(z), not the multiplier.
+    zt = _np(dm.z_val_true)
+    sig = float(dm.hparams.sigma)
+    sigma_true = sig * float(np.sqrt((zt ** 2).mean())) if getattr(dm.hparams, "mult_noise", False) else sig
     return EvalContext(
-        latent_dim=int(_np(dm.z_val_true).shape[-1]),
+        latent_dim=int(zt.shape[-1]),
         obs_std_eval=_np(dm.val_batch[0]), mask_eval=_np(dm.val_batch[1]),
         obs_raw_eval=None,
-        z_true=_np(dm.z_val_true), C_true=_np(dm.C_true), d_true=_np(dm.d_true),
-        true_drift=true_drift, sigma_true=float(dm.hparams.sigma),
+        z_true=zt, C_true=_np(dm.C_true), d_true=_np(dm.d_true),
+        true_drift=true_drift, sigma_true=sigma_true,
         z_grid=_np(dm.z_grid), filt=_np(dm.val_batch[2]),
         window=None, stride=None, **common)

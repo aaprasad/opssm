@@ -19,9 +19,9 @@ _JAX_PY = "~/venvs/jaxbaselines/bin/python"
 _SUBPROC = {
     "latent_sde": (_TORCH_PY, "latent_sde_worker.py", "smoother"),
     "visde":      (_TORCH_PY, "visde_worker.py", "smoother"),
+    "sdematching": (_TORCH_PY, "sdematching_worker.py", "smoother"),  # sim-free latent SDE (Bartosh 2025)
     "ekf":        (_JAX_PY, "ekf_worker.py", "filter"),
-    "rslds":      (_JAX_PY, "rslds_worker.py", "smoother"),
-    "sing":       (_JAX_PY, "sing_worker.py", "smoother"),
+    "gpslds":     (_JAX_PY, "gpslds_worker.py", "smoother"),  # SSL-kernel GP-SDE (Hu 2024), fit by SING
 }
 
 

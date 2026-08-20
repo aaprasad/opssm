@@ -85,7 +85,7 @@ def make_drift(name, **params):
 
 @torch.no_grad()
 def simulate(name, batch_size, num_steps, dt, sigma, n_sub=5, params=None,
-             init_std=1.0, burn_in=0, x0_uniform=None, device="cpu", seed=0):
+             init_std=1.0, burn_in=0, x0_uniform=None, mult_noise=False, device="cpu", seed=0):
     """Euler-Maruyama a latent system -> z (num_steps, batch_size, d). Isotropic diffusion `sigma`.
     `burn_in` extra sub-integrated steps before t=0 (lets chaotic/limit-cycle systems reach their
     attractor before the recorded window)."""
@@ -96,7 +96,8 @@ def simulate(name, batch_size, num_steps, dt, sigma, n_sub=5, params=None,
 
     def step(zz):
         for _ in range(n_sub):
-            zz = zz + drift(zz) * sub + sigma * rt * torch.randn(batch_size, d, device=device, generator=gen)
+            g = sigma * zz if mult_noise else sigma       # multiplicative g=sigma*z (sde_matching Lorenz) vs const
+            zz = zz + drift(zz) * sub + g * rt * torch.randn(batch_size, d, device=device, generator=gen)
         return zz
 
     if x0_uniform is not None:                                        # x0 ~ U[-x0_uniform, x0_uniform]^d (Duncker VdP)
