@@ -347,6 +347,36 @@ def _affine_gauge(m_op, z_true):
 
 
 @torch.no_grad()
+def vis_posterior_samples(z_samples, z_mean, z_true, ts, img_path, n_traj=3):
+    """MALA posterior samples over time (d==1): the per-time filter marginals pi_t whose SPREAD the mean-
+    field M-step discards (it fits f,g against E[z|y] only). z_samples (T,B,K,1), z_mean (T,B,1), z_true
+    (T,B,1), ts (T,). Samples are affine-gauge-aligned (Procrustes on the mean) into the true-z frame so the
+    overlay is comparable."""
+    import numpy as np
+    A, b, _ = _affine_gauge(z_mean, z_true)                        # z_true ~ A z_mean + b (model -> true frame)
+    al = lambda z: torch.einsum("ij,...j->...i", A, z) + b        # noqa: E731
+    zs = al(z_samples).squeeze(-1).cpu().numpy()                  # (T,B,K)
+    zm = al(z_mean).squeeze(-1).cpu().numpy()                     # (T,B)
+    zt = z_true.squeeze(-1).cpu().numpy()                         # (T,B)
+    tsn = ts.detach().cpu().numpy()
+    n = min(n_traj, zs.shape[1])
+    fig, axes = plt.subplots(n, 1, figsize=(9, 2.3 * n), squeeze=False, sharex=True)
+    for j in range(n):
+        ax = axes[j, 0]
+        p5, p95 = np.percentile(zs[:, j], [5, 95], axis=1)
+        ax.fill_between(tsn, p5, p95, color="C0", alpha=0.20, lw=0, label="5-95% posterior")
+        ax.plot(tsn, zs[:, j, :min(40, zs.shape[2])], color="C0", alpha=0.06, lw=0.5)   # thinned sample paths
+        ax.plot(tsn, zm[:, j], color="C0", lw=1.6, label="posterior mean E[z|y]")
+        ax.plot(tsn, zt[:, j], color="k", lw=1.5, ls="--", label="true z")
+        ax.set_ylabel(f"z  (traj {j})"); ax.grid(alpha=0.25)
+        if j == 0:
+            ax.legend(fontsize=8, ncol=3, loc="upper right")
+    axes[-1, 0].set_xlabel("time")
+    fig.suptitle("MALA posterior samples -- per-time filter marginals (spread the mean-field M-step drops)")
+    fig.tight_layout(); fig.savefig(img_path, dpi=120); plt.close(fig)
+
+
+@torch.no_grad()
 def vis_latent2d(drift_net, m_op, z_true, ts, true_drift, g_scalar, img_path, n_traj=4, ng=32):
     """Phase-plane visualization for a 2-D latent (Van der Pol). The DRIFT field is shown as a STREAMPLOT
     over the (z1,z2) plane. Because the latent SDE is identifiable only up to a linear-map gauge

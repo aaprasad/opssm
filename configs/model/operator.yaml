@@ -17,7 +17,9 @@ n_colloc: 128
 chunk_size: 16
 near_std: 0.3
 broad_std: 1.6
-warmup: 2000
+warmup: 0                # 0: the subspace init + bootstrap_mstep (below) replace the warmup -- the M-step
+                         #   starts from a usable z_hat immediately. NB warmups below m_every are no-ops
+                         #   (the first M-step lands at the same step regardless).
 m_every: 2000
 m_inner: 400
 reg_lambda: 3e-4
@@ -31,13 +33,22 @@ pca_init: false          # HONEST default: learn the sensor direction C from a R
                          #   recovers |cos|->1 from scratch). pca_init=true seeds C at the data's top-PC
                          #   (~= the true sensor direction) -- a data-driven head start that trivially
                          #   pre-solves the sensor, so it's not an honest test of sensor learning.
+init_method: subspace    # obs-model init: null (fall back to pca_init) | random | pca | subspace.
+                         #   'subspace' = temporal subspace-ID (also yields a dynamics matrix A). DEFAULT.
+init_dynamics: true      # also warm-start the drift net from the init's linear dynamics A (pca: A fit on
+                         #   PCA scores; subspace: A from the identification). false = drift stays zero-init.
+bootstrap_mstep: true    # with warmup=0: run one init-time M-step from the deterministic init projection
+                         #   (zhat_from_obs), so C/drift/g are fit from the init before any operator training.
 c_stable_tol: 0.05
 meshfree_mean: true       # M-step E[z|y]: true = deterministic mesh-free fixed-node IS (default; scales to
                           #   high-D latent, drift/sensor good, g mildly over-estimated); false = grid quadrature
 n_mean: 256               # fixed-node sample count when meshfree_mean=true (also drives joint_g's pair sampler)
-mean_method: fixed        # filter-mean readout: fixed = deterministic fixed-node importance sampling (default);
-                          #   mala = gradient MCMC (Metropolis-adjusted Langevin) -- scales to high-D latent
-                          #   where SNIS ess collapses. The mala_* knobs apply only when mean_method=mala.
+mean_method: mala         # filter-mean readout E[z|y] (used by the M-step's drift target + validation, NOT the
+                          #   E-step): mala = gradient MCMC (Metropolis-adjusted Langevin), the robust DEFAULT.
+                          #   fixed = deterministic fixed-node SNIS -- cheaper but at large g the broad proposal's
+                          #   weights collapse onto a far outlier, dragging E[z|y] off the manifold (a "fly-off"
+                          #   artifact that corrupts the drift regression -- see the vdp mean_method post-mortem).
+                          #   The mala_* knobs apply only when mean_method=mala.
                           #   Because MALA samples the posterior directly, step size / burn-in / init are all
                           #   self-tuning (internal); only the compute budget + rng are exposed.
 mala_chains: 64           # parallel MALA chains per (t,b) site (MALA moves samples -> far fewer than n_mean)
@@ -48,6 +59,8 @@ mala_rng: stochastic      # stochastic = fresh RNG each M-step; crn = fixed-seed
 anim_posterior: false     # d>1 only: also render an ANIMATED posterior p(z|y_{0:t}) over time to
                           #   <train_dir>/posterior_anim.mp4 each validation (VdP = 3-D surface, Lorenz = 3-D
                           #   scatter colored by p). ~3-7s/render; off by default (diagnostic).
+plot_samples: false       # d==1: also save step_NNNNN_samples.pdf -- MALA posterior samples over time
+                          #   (the per-time filter marginals' spread the mean-field M-step discards).
 res_mode: rel             # FP residual reduction: "rel" = scale-invariant (residual / local FP magnitude)
                           #   -- fixes over-dispersion by removing the sharp-density tail blow-up of the
                           #   absolute "l2" residual (which biases the operator WIDE); "log1p" = log-compress

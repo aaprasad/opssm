@@ -58,13 +58,14 @@ class ZakaiFilterModule(pl.LightningModule):
     def __init__(self, data_size=1, gru_hidden=64, ctx_dim=64, p=64, drift_hidden=64,
                  lr=2e-3, drift_lr=2e-3, sched_gamma=0.9998,
                  n_scoll=4, n_tcoll=24, n_colloc=128, chunk_size=16, near_std=0.3, broad_std=1.6,
-                 warmup=2000, m_every=2000, m_inner=400, reg_lambda=3e-4, reg_lambda_g=3e-3,
+                 warmup=0, m_every=2000, m_inner=400, reg_lambda=3e-4, reg_lambda_g=3e-3,
                  g_init=1.0, learn_dynamics=True, learn_g=True, g_net=False, learn_obs=False,
-                 pca_init=True, c_stable_tol=0.05, meshfree_mean=True, n_mean=256,
+                 pca_init=True, init_method="subspace", init_dynamics=True, bootstrap_mstep=True,
+                 c_stable_tol=0.05, meshfree_mean=True, n_mean=256,
                  res_mode="rel", w_res=0.2, learn_smoother=False, joint_g=False, drift_target="forward",
                  encoder="gru", encoder_kwargs=None,
-                 mean_method="fixed", mala_chains=64, mala_steps=30, mala_rng="stochastic",
-                 anim_posterior=False, latent_dim=1, loss="zakai", train_dir="./dump/nzf"):
+                 mean_method="mala", mala_chains=64, mala_steps=30, mala_rng="stochastic",
+                 anim_posterior=False, plot_samples=False, latent_dim=1, loss="zakai", train_dir="./dump/nzf"):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
@@ -110,11 +111,16 @@ class ZakaiFilterModule(pl.LightningModule):
         # high-D observation map init. Obs are standardized to ~unit scale at the dataloader level, so the
         # decode is h(z) = C z + d with NO scale factor (s_scale removed) -- C is a D x d Stiefel matrix and
         # d the (now ~zero) intercept.
+        self._A_init = None                                          # linear dynamics from subspace-ID (if any)
+        method = (h.init_method or ("pca" if h.pca_init else "random")) if h.learn_obs else None
         if h.learn_obs:
             obs_dim = dm.hparams.obs_dim
             Yc = dm.full_obs.reshape(-1, obs_dim)
             ybar = Yc.mean(0)
-            if h.pca_init:
+            if method == "subspace":                                 # temporal subspace-ID: C AND dynamics A
+                from opssm.models.init import subspace_id
+                self.C_cur, self._A_init = subspace_id(dm.full_obs, d, self.dt)
+            elif method == "pca":
                 _, _, Vt = torch.linalg.svd(Yc - ybar, full_matrices=False)
                 self.C_cur = Vt[:d].t().contiguous()                  # (D,d) top-d PCA directions as columns
             else:
@@ -125,6 +131,25 @@ class ZakaiFilterModule(pl.LightningModule):
         if self.diff_net is not None:
             self.dg_opt = optim.Adam(self.diff_net.parameters(), lr=h.drift_lr)
         os.makedirs(h.train_dir, exist_ok=True)
+        # NB: the drift warm-start + bootstrap M-step (which touch drift_net params + cuda data) run in
+        # on_train_start -- during setup the module params are not yet moved to the trainer device.
+
+    def on_train_start(self):
+        """Dynamics-init that needs the module on-device: drift warm-start (init_dynamics) and the
+        bootstrap M-step (bootstrap_mstep). Runs once, before the first E-step."""
+        h = self.hparams
+        if not h.learn_obs:
+            return
+        dm = self.trainer.datamodule
+        method = h.init_method or ("pca" if h.pca_init else "random")
+        if h.init_dynamics and method in ("pca", "subspace"):        # warm-start drift to the init's linear A
+            from opssm.models.init import linear_dynamics, warmstart_drift
+            A = self._A_init if self._A_init is not None else \
+                linear_dynamics(zhat_from_obs(dm.full_obs, self.C_cur, self.d_cur), self.dt)
+            warmstart_drift(self.drift_net, A)
+        if h.learn_dynamics and h.bootstrap_mstep:                   # one init-time M-step from the init projection
+            x0, mask0, _ = dm.train_batch
+            self._mstep(x0, mask0, bootstrap=True)
 
     def configure_optimizers(self):
         h = self.hparams
@@ -164,8 +189,9 @@ class ZakaiFilterModule(pl.LightningModule):
             self.log("kl_train", loss, prog_bar=True)
             return
         step = self.global_step + 1
+        zero_warm = step <= h.warmup and not h.init_dynamics          # keep a warm-started drift during warmup
         drift = (lambda z: (torch.zeros_like(z), torch.zeros(z.shape[:-1], device=z.device, dtype=z.dtype))) \
-            if step <= h.warmup else self.drift_net.drift
+            if zero_warm else self.drift_net.drift
         diffusion = self.diff_net.diffusion if (h.g_net and step > h.warmup) else self.g_cur
         decode, center = self._decode_center(x)
         opt.zero_grad()
@@ -185,12 +211,10 @@ class ZakaiFilterModule(pl.LightningModule):
             self.log_dict({"res_b": res_b, "jump_b": jump_b, "tc_b": tc_b}, prog_bar=False)
 
     # -- M-step ----------------------------------------------------------------------------------
-    def on_train_batch_end(self, outputs, batch, batch_idx):
+    def _mstep(self, x, mask, bootstrap=False):
+        """Run one EM M-step and absorb the updated EM state. bootstrap=True reads z_hat from the
+        deterministic init projection (zhat_from_obs) instead of the operator -- the no-warmup seed."""
         h = self.hparams
-        step = self.global_step
-        if not h.learn_dynamics or step <= h.warmup or step % h.m_every != 0:
-            return
-        x, mask, _ = batch
         out = mstep(self.model, x, mask, self.z_grid, self.dt, self.drift_net, self.dr_opt,
                     self.diff_net, self.dg_opt, self.z_reg, self.hr,
                     learn_g=h.learn_g, g_net=h.g_net, reg_lambda=h.reg_lambda,
@@ -201,11 +225,20 @@ class ZakaiFilterModule(pl.LightningModule):
                     near_std=h.near_std, broad_std=h.broad_std,
                     mean_method=h.mean_method, mala=self._mala_cfg(),
                     joint_g=h.joint_g, noise_std=self.noise_std, g_cur_in=self.g_cur,
-                    drift_target=h.drift_target)
+                    drift_target=h.drift_target, bootstrap=bootstrap)
         if out["g_cur"] is not None:
             self.g_cur = out["g_cur"]
         if h.learn_obs:
             self.C_cur, self.d_cur = out["C_cur"], out["d_cur"]
+        return out
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        h = self.hparams
+        step = self.global_step
+        if not h.learn_dynamics or step <= h.warmup or step % h.m_every != 0:
+            return
+        x, mask, _ = batch
+        out = self._mstep(x, mask)
         for key in ("ess", "accept"):                                   # readout health: SNIS ess or MALA acceptance
             if out.get(key) is not None:
                 self.log(key, out[key], prog_bar=True)
@@ -340,6 +373,9 @@ class ZakaiFilterModule(pl.LightningModule):
         if d == 1 and h.learn_smoother and getattr(dm, "smoothed_val", None) is not None:
             log_sm = log_smoothed(self.model, self.model_b, x, mask, self.z_grid)
             logs["kl_smooth"] = kl_target_pred(dm.smoothed_val, log_sm).item()
+            if h.learn_obs and dm.z_val_true is not None:         # smoother-mean latent (vs the FILTER's lat_rel)
+                m_sm = (log_sm.exp() * self.z_grid).sum(-1)       # (T,B) smoother posterior mean
+                logs["lat_rel_sm"] = self._gauge_aligned(None, None, m_sm, dm.z_val_true)["lat_rel"]
         self.log_dict(logs, prog_bar=True)
         # figure: 1-D the rich Duncker panels (raw + Procrustes-aligned), 2-D the phase-plane drift
         # STREAMPLOT, 3-D the attractor + projected drift quivers. d>3 has no figure.
@@ -365,3 +401,8 @@ class ZakaiFilterModule(pl.LightningModule):
                 anim = viz.anim_posterior2d if d == 2 else viz.anim_posterior3d
                 anim(self.model, x, mask, m_op_al, dm.z_val_true,
                      os.path.join(h.train_dir, "posterior_anim.mp4"))   # overwritten each validation
+        if h.plot_samples and d == 1 and h.learn_obs and dm.z_val_true is not None:
+            from opssm.models.mstep import _mala_chains            # MALA posterior samples (the spread the M-step drops)
+            _, center = self._decode_center(x)
+            z_s, z_m, _ = _mala_chains(self.model, x, mask, center, h.mala_chains, h.mala_steps, h.broad_std)
+            viz.vis_posterior_samples(z_s, z_m, dm.z_val_true, dm.ts, img.replace(".pdf", "_samples.pdf"))
