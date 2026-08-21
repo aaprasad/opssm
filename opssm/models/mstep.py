@@ -398,7 +398,7 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
           learn_g, g_net, reg_lambda, reg_lambda_g, m_inner,
           learn_obs=False, c_stable_tol=0.05, C_cur=None, d_cur=None,
           meshfree_mean=False, n_mean=256, near_std=0.3, broad_std=1.6, mean_method="fixed", mala=None,
-          joint_g=False, noise_std=None, g_cur_in=None, drift_target="forward"):
+          joint_g=False, noise_std=None, g_cur_in=None, drift_target="forward", bootstrap=False):
     """One EM M-step. Order: posterior-mean increments -> (high-D) Stiefel obs-map + cstab ->
     drift GATED on `cstab < c_stable_tol` -> diffusion. In 1-D (learn_obs=False) cstab==0, so the
     gate is always open and this reduces to the plain f,g M-step. `meshfree_mean` replaces the grid
@@ -411,7 +411,9 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
     Returns updated {g_cur, C_cur, d_cur, cstab}."""
     ess = accept = None
     center = zhat_from_obs(x, C_cur, d_cur) if learn_obs else x       # (T,B,d) (obs standardized upstream)
-    if meshfree_mean:                                                 # grid-free E[z|y]: fixed-node IS or MALA
+    if bootstrap:                                                    # no-warmup seed: fit from the deterministic
+        z_hat = center                                              #   init projection, skip the untrained operator
+    elif meshfree_mean:                                              # grid-free E[z|y]: fixed-node IS or MALA
         z_hat, diag = filter_mean(model, x, mask, center, method=mean_method, n_mean=n_mean,
                                   near_std=near_std, broad_std=broad_std, mala=mala)
         ess, accept = diag.get("ess"), diag.get("accept")

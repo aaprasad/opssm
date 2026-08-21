@@ -190,3 +190,20 @@ From the NKE and PINNs-Bayes reading (see `related_work.md`):
   which sub-generator acts), giving discrete regimes inside the Zakai/KFE machinery. Strategically relevant
   for neural-activity latents (up/down states, regime switches). NOT low-hanging: filtering can't threshold
   hidden jumps (NKE's mechanism needs observed increments), and Zakai-with-jumps is a PIDE-SPDE. Separate paper.
+- **True EM: an expected-NLL M-step over the posterior, not a plug-in mean (research spike).** The M-step
+  today is *approximate* (mean-field) EM. `fit_drift` / `fit_diffusion` / `fit_obs_map_stiefel` already
+  minimize the Gaussian complete-data NLL of the generative model `z_{t+1}|z_t ~ N(z_t + f(z_t) dt, g^2 dt)`,
+  `y_t|z_t ~ N(C z_t + d, sigma^2)` -- but evaluated at the SINGLE posterior mean `ẑ = E[z|y]`, not as
+  `E_q[.]` over the full posterior. That point-collapse is the entire gap to true EM and is what forces the
+  existing patches: it drops (a) the posterior covariance -> `g` under-reads (`g_est^2 = g^2 + drift_rmse^2
+  dt`; the `joint_g` workaround), and (b) `E[f(z)]` vs `f(E[z])` -> the Jensen / errors-in-variables bias (the
+  `det_mid` / `ito_correction` workarounds). Fix: fit `f, g, C` to posterior SAMPLES and average the NLL over
+  them (Monte-Carlo / stochastic EM) instead of collapsing to `ẑ` first -- the MALA chains in the E-step
+  ALREADY draw these samples; today they are averaged into `ẑ` before the fit. Use the JOINT `q(z_t, z_{t+1})`
+  (the `filter_pair_*` machinery) so the increment variance is what identifies `g`. Payoff: reintroducing the
+  spread should retire `joint_g` AND `det_mid`/`ito` together (all three claw back terms the mean-collapse
+  discards). Alt route (Duncker / gpSLDS style): keep a Gaussian `q` with an explicit covariance and take the
+  `E_q[.]` terms ANALYTICALLY rather than by sampling. Caveat: this is orthogonal to the filter-vs-smoother
+  approximation -- the E-step would still be the causal FILTER, not the smoother that exact EM for an SSM
+  wants; a faithful EM would need both fixes. See also the FP-inverse-problem section above (a different
+  attack on the same "stop differentiating the mean path" M-step problem).
