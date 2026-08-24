@@ -15,7 +15,7 @@ from jax.scipy.special import logsumexp
 
 def kl_target_pred(target, log_pred, eps=1e-12):
     """KL(target || pred), target a mass (T,B,Nz), log_pred the predicted log-mass."""
-    t = jnp.clip(target, a_min=eps)
+    t = jnp.maximum(target, eps)
     return (t * (jnp.log(t) - log_pred)).sum(axis=-1).mean()
 
 
