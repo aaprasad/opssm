@@ -12,8 +12,8 @@ import jax.numpy as jnp
 def plot_validation(op, drift_net, g_cur, C_cur, d_cur, refs, hp, step, fig_dir, metrics, m_op):
     """Dispatch the validation figure on latent_dim. m_op (T,B,d) = the (MALA/grid) filter mean."""
     d = hp["latent_dim"]
-    if refs.get("z_val_true") is None:                            # GT-free (Kato): no latent-recovery figure
-        return None
+    if refs.get("z_val_true") is None:                            # GT-free (Kato): recon + behavior manifold
+        return plot_kato(m_op, refs, C_cur, d_cur, step, fig_dir, metrics)
     if d == 1:
         return plot_em_highd_d1(op, drift_net, g_cur, C_cur, d_cur, refs, step, fig_dir, metrics)
     zt = np.asarray(refs["z_val_true"]); mo = np.asarray(m_op); ts = np.asarray(refs["ts"])
@@ -190,6 +190,69 @@ def plot_latent3d(drift_net, m_op, z_true, ts, true_drift, g_cur, step, fig_dir,
                  f"drift_rel={m.get('drift_rel',float('nan')):.3f} g_rel={m.get('g_rel',float('nan')):.3f} "
                  f"c_cos={m.get('c_cos',float('nan')):.3f} recon_r2={m.get('recon_r2',float('nan')):.3f} "
                  f"g={float(g_cur):.3f}", fontsize=12, y=1.02)
+    fig.tight_layout()
+    os.makedirs(fig_dir, exist_ok=True)
+    p = os.path.join(fig_dir, f"jax_step_{step:05d}.png")
+    fig.savefig(p, dpi=110, bbox_inches="tight"); plt.close(fig)
+    return (p,)
+
+
+def plot_kato(m_op, refs, C_cur, d_cur, step, fig_dir, metrics, n_neurons=6):
+    """GT-free Kato figure: (a) reconstruction (a few neurons: obs vs decode over one val window),
+    (b) latent manifold = PCA-2D of the val latent means colored by behavior state, (c) leading latent
+    dims over time. m_op (win,B,d) val filter means; obs from refs['x_val'] (win,B,N). No ground truth."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    xv = np.asarray(refs["x_val"])                               # (win,B,N) standardized obs
+    C = np.asarray(C_cur); d_off = np.asarray(d_cur)
+    z = np.asarray(m_op)                                         # (win,B,d)
+    win, B, dlat = z.shape
+    y_hat = z @ C.T + d_off                                      # (win,B,N) reconstruction
+    states = refs.get("states_val")                             # (win,B) int or None
+    names = refs.get("state_names")
+
+    fig = plt.figure(figsize=(18, 5.0))
+    # (a) reconstruction: a few neurons, window 0
+    axr = fig.add_subplot(1, 3, 1)
+    t = np.arange(win)
+    sel = np.linspace(0, xv.shape[-1] - 1, n_neurons).astype(int)
+    for i, n in enumerate(sel):
+        axr.plot(t, xv[:, 0, n] + i * 3, color="k", lw=0.9, alpha=0.7)
+        axr.plot(t, y_hat[:, 0, n] + i * 3, color="C3", lw=0.9, alpha=0.8)
+    axr.set_title(f"reconstruction (window 0, {n_neurons} neurons)\nblack=obs  red=decode  "
+                  f"recon_r2={metrics.get('recon_r2', float('nan')):.3f}")
+    axr.set_xlabel("t (window)"); axr.set_yticks([])
+
+    # (b) latent manifold: PCA-2D of all val latent means, colored by behavior
+    Z = z.reshape(-1, dlat)
+    Zc = Z - Z.mean(0)
+    U, S, Vt = np.linalg.svd(Zc, full_matrices=False)
+    P = Zc @ Vt[:2].T                                           # (N,2) top-2 PCs
+    axm = fig.add_subplot(1, 3, 2)
+    if states is not None:
+        sv = np.asarray(states).reshape(-1)
+        uq = np.unique(sv)
+        cmap = plt.get_cmap("tab10")
+        for j, s in enumerate(uq):
+            msk = sv == s
+            lbl = names[int(s)] if (names is not None and 0 <= int(s) < len(names)) else f"state {int(s)}"
+            axm.scatter(P[msk, 0], P[msk, 1], s=4, alpha=0.5, color=cmap(j % 10), label=lbl)
+        axm.legend(fontsize=7, markerscale=2, ncol=2)
+    else:
+        axm.scatter(P[:, 0], P[:, 1], s=4, alpha=0.5, c=np.tile(np.arange(win), B), cmap="viridis")
+    axm.set_xlabel("PC1"); axm.set_ylabel("PC2"); axm.set_title("latent manifold (PCA-2D of E[z|y])")
+
+    # (c) leading latent dims over time (window 0)
+    axl = fig.add_subplot(1, 3, 3)
+    for k in range(min(4, dlat)):
+        axl.plot(t, z[:, 0, k], lw=1.0, label=f"z{k+1}")
+    axl.set_xlabel("t (window)"); axl.set_ylabel("E[z|y]"); axl.set_title("leading latent dims (window 0)")
+    axl.legend(fontsize=8)
+
+    fig.suptitle(f"Kato (GT-free)  step {step}  recon_r2={metrics.get('recon_r2', float('nan')):.3f}  "
+                 f"d={dlat}  g={metrics.get('g', float('nan')):.3f}", fontsize=12, y=1.02)
     fig.tight_layout()
     os.makedirs(fig_dir, exist_ok=True)
     p = os.path.join(fig_dir, f"jax_step_{step:05d}.png")

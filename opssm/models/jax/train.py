@@ -8,6 +8,8 @@ Validation: d==1 uses the grid (kl vs exact filter, drift_l2, grid mean); d>1 us
 filter mean (no grid). Both score the Procrustes gauge-aligned lat_rel / drift_rel / g_rel (+ kl_aln, d==1)
 and c_cos / recon_r2. Figures via opssm.models.jax.viz_jax (d=1 posterior panels, d=2/3 phase-space).
 """
+import time
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -19,7 +21,8 @@ from opssm.models.jax.dynamics import DriftNet
 from opssm.models.jax.obs import zhat_from_obs, make_decode
 from opssm.models.jax.losses import pinn_zakai_loss, sample_collocation, kl_target_pred
 from opssm.models.jax import mstep as M
-from opssm.models.jax.init import subspace_id, warmstart_drift
+from opssm.models.jax.init import subspace_id, warmstart_drift, linear_dynamics
+from opssm.models.jax.obs import zhat_from_obs as _zhat
 from opssm.models.jax.systems import make_drift
 
 
@@ -162,18 +165,42 @@ def validate(op, drift_net, g_cur, C_cur, d_cur, refs, hp, key):
     return logs, m_op_full
 
 
-def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None):
-    """Run EM training in JAX (any d). refs: bridged arrays (jnp) + 'true_drift'. Returns state + history."""
+def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, timing=False):
+    """Run EM training in JAX (any d). refs: bridged arrays (jnp) + 'true_drift'. Returns (state, history).
+    timing=True blocks each phase (block_until_ready) + records per-phase wall-clock into state['timing']."""
+    t_train0 = time.perf_counter()
+    tm = {"estep": [], "mstep": [], "val": [], "fig": []}
+
+    def _block(x):
+        if timing:
+            jax.block_until_ready(x)
+        return x
+
     d = hp["latent_dim"]
     xs, mask = refs["x_train"], refs["mask_train"]
+    D_obs = hp["data_size"]
     s_coll = jnp.linspace(0.0, 1.0, hp["n_scoll"])
-    key, ko, kd, kw, kb = jax.random.split(key, 5)
+    key, ko, kd, kw, kb, kc = jax.random.split(key, 6)
 
-    op = OperatorFilter(hp["data_size"], hp["gru_hidden"], hp["ctx_dim"], hp["p"], latent_dim=d, key=ko)
-    C_cur, A_init = subspace_id(refs["full_obs"], d, hp["dt"])
-    d_cur = refs["full_obs"].reshape(-1, hp["data_size"]).mean(0)
+    op = OperatorFilter(D_obs, hp["gru_hidden"], hp["ctx_dim"], hp["p"], latent_dim=d, key=ko)
+    full_obs = refs["full_obs"]
+    ybar = full_obs.reshape(-1, D_obs).mean(0)
+    d_cur = ybar
+    # obs-model init: subspace-ID (C + dynamics A) | pca (top-d PCs) | random Stiefel (matches filter_module.setup)
+    method = hp.get("init_method") or ("pca" if hp.get("pca_init") else "random")
+    A_init = None
+    if method == "subspace":
+        C_cur, A_init = subspace_id(full_obs, d, hp["dt"])
+    elif method == "pca":
+        _, _, Vt = jnp.linalg.svd(full_obs.reshape(-1, D_obs) - ybar, full_matrices=False)
+        C_cur = Vt[:d].T
+    else:                                                          # random Stiefel
+        C_cur = jnp.linalg.qr(jax.random.normal(kc, (D_obs, d)))[0]
     drift_net = DriftNet(hp["drift_hidden"], latent_dim=d, key=kd)
-    drift_net, wmse = warmstart_drift(drift_net, A_init, kw)
+    wmse = float("nan")
+    if hp.get("init_dynamics", True) and method in ("pca", "subspace"):   # warm-start drift to the init's linear A
+        A = A_init if A_init is not None else linear_dynamics(_zhat(full_obs, C_cur, d_cur), hp["dt"])
+        drift_net, wmse = warmstart_drift(drift_net, A, kw)
     g_cur = hp["g_init"]
 
     sched = optax.exponential_decay(hp["lr"], transition_steps=1, decay_rate=hp["sched_gamma"])
@@ -182,9 +209,14 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None):
     dr_opt = optax.adam(hp["drift_lr"])
     dr_state = dr_opt.init(eqx.filter(drift_net.net, eqx.is_inexact_array))
 
-    drift_net, dr_state, C_cur, d_cur, g_cur, info = _run_mstep(
-        op, xs, mask, drift_net, dr_opt, dr_state, C_cur, d_cur, g_cur, hp, kb, bootstrap=True)
-    log_fn(f"[init] d={d} warmstart_mse={wmse:.4f} bootstrap cstab={info['cstab']:.4f} g={g_cur:.4f}")
+    cstab0 = float("nan")
+    if hp.get("bootstrap_mstep", True):                           # one init-time M-step from the init projection
+        drift_net, dr_state, C_cur, d_cur, g_cur, info = _run_mstep(
+            op, xs, mask, drift_net, dr_opt, dr_state, C_cur, d_cur, g_cur, hp, kb, bootstrap=True)
+        cstab0 = info["cstab"]
+    _block(eqx.filter(drift_net, eqx.is_inexact_array))
+    init_s = time.perf_counter() - t_train0                       # init + warmstart + bootstrap (+ their compiles)
+    log_fn(f"[init] d={d} method={method} warmstart_mse={wmse:.4f} bootstrap cstab={cstab0:.4f} g={g_cur:.4f}")
 
     _plot = None
     if fig_dir is not None:
@@ -193,9 +225,13 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None):
     def _validate_and_plot(step):
         nonlocal key
         key, vk = jax.random.split(key)
-        m, m_op = validate(op, drift_net, g_cur, jnp.asarray(C_cur), d_cur, refs, hp, vk)
+        tv = time.perf_counter()
+        m, m_op = validate(op, drift_net, g_cur, jnp.asarray(C_cur), d_cur, refs, hp, vk)   # returns floats -> synced
+        tm["val"].append(time.perf_counter() - tv)
         if _plot is not None:
+            tf = time.perf_counter()
             _plot(op, drift_net, g_cur, jnp.asarray(C_cur), d_cur, refs, hp, step, fig_dir, m, m_op)
+            tm["fig"].append(time.perf_counter() - tf)
         return m
 
     estep = make_estep(xs, mask, s_coll, optim, hp)
@@ -206,19 +242,66 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None):
 
     for step in range(1, n_steps + 1):
         key, sk = jax.random.split(key)
+        te = time.perf_counter()
         op, op_opt_state, aux = estep(op, op_opt_state, drift_net, jnp.asarray(g_cur),
                                       jnp.asarray(C_cur), d_cur, sk)
+        _block(aux)
+        tm["estep"].append(time.perf_counter() - te)
         if step > hp["warmup"] and step % hp["m_every"] == 0:
             key, mk = jax.random.split(key)
+            tms = time.perf_counter()
             drift_net, dr_state, C_cur, d_cur, g_cur, info = _run_mstep(
                 op, xs, mask, drift_net, dr_opt, dr_state, C_cur, d_cur, g_cur, hp, mk)
+            _block(eqx.filter(drift_net, eqx.is_inexact_array))
+            tm["mstep"].append(time.perf_counter() - tms)
         if step % val_every == 0 or step == n_steps:
             m = _validate_and_plot(step)
             res, jump, ic = (float(a) for a in aux)
             log_fn(f"[step {step}] res={res:.3f} jump={jump:.3f} ic={ic:.3f} | "
                    + " ".join(f"{k}={v:.4f}" for k, v in m.items()))
             history.append((step, m))
-    return dict(op=op, drift_net=drift_net, g_cur=g_cur, C_cur=C_cur, d_cur=d_cur), history
+    total_s = time.perf_counter() - t_train0
+    report = _timing_report(tm, init_s, total_s, n_steps)
+    if timing:
+        log_fn(_fmt_timing(report))
+    return dict(op=op, drift_net=drift_net, g_cur=g_cur, C_cur=C_cur, d_cur=d_cur, timing=report), history
+
+
+def _timing_report(tm, init_s, total_s, n_steps):
+    """Split per-phase wall-clock into first-call (compile-inclusive) vs steady, derive rates."""
+    def split(xs):
+        if not xs:
+            return 0.0, 0.0
+        first = xs[0]
+        steady = float(np.mean(xs[1:])) if len(xs) > 1 else xs[0]
+        return first, steady
+    e_first, e_steady = split(tm["estep"])
+    m_first, m_steady = split(tm["mstep"])
+    v_first, v_steady = split(tm["val"])
+    fig_ms = float(np.mean(tm["fig"])) * 1e3 if tm["fig"] else 0.0
+    compile_s = max(e_first - e_steady, 0) + max(m_first - m_steady, 0) + max(v_first - v_steady, 0)
+    return {
+        "total_s": total_s, "init_s": init_s, "compile_s": compile_s,
+        "n_estep": len(tm["estep"]), "n_mstep": len(tm["mstep"]), "n_val": len(tm["val"]),
+        "estep_first_ms": e_first * 1e3, "estep_ms": e_steady * 1e3,
+        "estep_per_s": (1.0 / e_steady) if e_steady else 0.0,
+        "mstep_first_ms": m_first * 1e3, "mstep_ms": m_steady * 1e3,
+        "mstep_per_s": (1.0 / m_steady) if m_steady else 0.0,
+        "val_first_ms": v_first * 1e3, "val_ms": v_steady * 1e3,
+        "val_per_s": (1.0 / v_steady) if v_steady else 0.0,
+        "fig_ms": fig_ms,
+        "steps_per_s_overall": n_steps / total_s if total_s else 0.0,
+    }
+
+
+def _fmt_timing(r):
+    return (f"[timing] total={r['total_s']:.1f}s  init/compile: init={r['init_s']:.1f}s "
+            f"xla_compile≈{r['compile_s']:.1f}s\n"
+            f"  overall {r['steps_per_s_overall']:.1f} steps/s (incl val/mstep)\n"
+            f"  E-step  {r['estep_ms']:.1f} ms  -> {r['estep_per_s']:.1f}/s   (first {r['estep_first_ms']:.0f} ms, compile)\n"
+            f"  M-step  {r['mstep_ms']:.1f} ms  -> {r['mstep_per_s']:.2f}/s  (first {r['mstep_first_ms']:.0f} ms, compile; n={r['n_mstep']})\n"
+            f"  val     {r['val_ms']:.1f} ms  -> {r['val_per_s']:.2f}/s  (first {r['val_first_ms']:.0f} ms, compile; n={r['n_val']})\n"
+            f"  figure  {r['fig_ms']:.0f} ms/fig")
 
 
 def load_refs(npz_path):
@@ -228,6 +311,9 @@ def load_refs(npz_path):
             "z_val_true", "C_true", "d_true", "ts"]
     refs = {k: jnp.asarray(D[k]) for k in keys if k in D.files}
     refs["a"] = float(D["a"]); refs["sigma"] = float(D["sigma"])
+    if "states_val" in D.files:                                   # Kato behavior labels (numpy, for figures)
+        refs["states_val"] = np.asarray(D["states_val"])
+        refs["state_names"] = list(D["state_names"]) if "state_names" in D.files else None
     system = str(D["system"]) if "system" in D.files else "doublewell"
     refs["system"] = system
     refs["true_drift"] = make_drift(system)[0]
