@@ -122,11 +122,12 @@ def gauge_aligned(m_op, z_true, drift_net, true_drift, g_cur, sigma, log_pi=None
 
 
 def validate(op, drift_net, g_cur, C_cur, d_cur, refs, hp, key):
-    """Validation metrics (any d). Returns (logs, m_op_full (T,B,d) aligned-frame-ready mean)."""
+    """Validation metrics (any d). GT-free-safe (Kato): gauge/c_cos auto-skip when z_true/C_true absent,
+    recon_r2 still logged. Returns (logs, m_op_full (T,B,d))."""
     d = hp["latent_dim"]
     xv, mv = refs["x_val"], refs["mask_val"]
-    z_true, C_true, sigma = refs["z_val_true"], refs["C_true"], refs["sigma"]
-    true_drift = refs["true_drift"]
+    has_zt = refs.get("z_val_true") is not None
+    has_ct = refs.get("C_true") is not None
     logs = {"g": float(g_cur)}
     log_pi = None
     if d == 1:
@@ -138,7 +139,7 @@ def validate(op, drift_net, g_cur, C_cur, d_cur, refs, hp, key):
         lo, hi = jnp.quantile(m_op, 0.01), jnp.quantile(m_op, 0.99)
         on = (zg >= lo) & (zg <= hi)
         fd = drift_net.net(zg[:, None])[:, 0]
-        ftrue_g = true_drift(zg[:, None])[:, 0]
+        ftrue_g = refs["true_drift"](zg[:, None])[:, 0]
         logs["drift_l2"] = float(jnp.sqrt((((fd - ftrue_g) ** 2) * on).sum() / jnp.maximum(on.sum(), 1)))
         m_op_full = m_op[..., None]                               # (T,B,1)
     else:
@@ -146,16 +147,18 @@ def validate(op, drift_net, g_cur, C_cur, d_cur, refs, hp, key):
         m_op_full, _ = M.posterior_mean_mala(op, xv, mv, center, hp["broad_std"], key,
                                              n_chains=hp["mala_chains"], n_steps=hp["mala_steps"],
                                              rng=hp["mala_rng"])   # (T,B,d)
-    Cn = C_true / jnp.linalg.norm(C_true, axis=0, keepdims=True)
-    logs["c_cos"] = float(jnp.minimum(jnp.linalg.svd(C_cur.T @ Cn, compute_uv=False), 1.0).mean())
+    if has_ct:
+        Cn = refs["C_true"] / jnp.linalg.norm(refs["C_true"], axis=0, keepdims=True)
+        logs["c_cos"] = float(jnp.minimum(jnp.linalg.svd(C_cur.T @ Cn, compute_uv=False), 1.0).mean())
     if hp["learn_obs"]:
         y_hat = m_op_full @ C_cur.T + d_cur
         xf = xv.reshape(-1, xv.shape[-1]); yf = y_hat.reshape(-1, xv.shape[-1])
         ss_res = ((xf - yf) ** 2).sum()
         ss_tot = jnp.maximum(((xf - xf.mean(0)) ** 2).sum(), 1e-8)
         logs["recon_r2"] = float(1.0 - ss_res / ss_tot)
-    logs.update(gauge_aligned(m_op_full, z_true, drift_net, true_drift, g_cur, sigma,
-                              log_pi, refs.get("filt_val"), refs.get("z_grid")))
+    if has_zt:                                                    # GT-only Procrustes metrics
+        logs.update(gauge_aligned(m_op_full, refs["z_val_true"], drift_net, refs["true_drift"],
+                                  g_cur, refs["sigma"], log_pi, refs.get("filt_val"), refs.get("z_grid")))
     return logs, m_op_full
 
 

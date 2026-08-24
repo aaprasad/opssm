@@ -12,6 +12,8 @@ import jax.numpy as jnp
 def plot_validation(op, drift_net, g_cur, C_cur, d_cur, refs, hp, step, fig_dir, metrics, m_op):
     """Dispatch the validation figure on latent_dim. m_op (T,B,d) = the (MALA/grid) filter mean."""
     d = hp["latent_dim"]
+    if refs.get("z_val_true") is None:                            # GT-free (Kato): no latent-recovery figure
+        return None
     if d == 1:
         return plot_em_highd_d1(op, drift_net, g_cur, C_cur, d_cur, refs, step, fig_dir, metrics)
     zt = np.asarray(refs["z_val_true"]); mo = np.asarray(m_op); ts = np.asarray(refs["ts"])
