@@ -1,11 +1,33 @@
-"""Minimal d=1 em_highd validation figure for the JAX backend (self-contained numpy/matplotlib, fed by the
-JAX operator's arrays -- decoupled from the torch-bound opssm.analysis.viz). Per validation trajectory:
-JAX gauge-aligned filtering posterior p(z|y_{0:t}) vs the EXACT filter (side-by-side heatmaps, true latent
-overlaid), the aligned latent mean vs truth, and the learned drift f(z) vs the true double-well a(z-z^3)."""
+"""Validation figures for the JAX backend (self-contained numpy/matplotlib, fed by the JAX operator's arrays
+-- decoupled from the torch-bound opssm.analysis.viz, but mirroring its layouts). d==1: gauge-aligned
+filtering posterior p(z|y_{0:t}) vs the EXACT filter + latent + drift (like vis_highd). d==2: phase-plane
+drift streamplots + latent recovery (like vis_latent2d). d==3: 3-D attractor + drift-direction quivers
+(like vis_latent3d). `plot_validation` dispatches on latent_dim."""
 import os
 
 import numpy as np
 import jax.numpy as jnp
+
+
+def plot_validation(op, drift_net, g_cur, C_cur, d_cur, refs, hp, step, fig_dir, metrics, m_op):
+    """Dispatch the validation figure on latent_dim. m_op (T,B,d) = the (MALA/grid) filter mean."""
+    d = hp["latent_dim"]
+    if d == 1:
+        return plot_em_highd_d1(op, drift_net, g_cur, C_cur, d_cur, refs, step, fig_dir, metrics)
+    zt = np.asarray(refs["z_val_true"]); mo = np.asarray(m_op); ts = np.asarray(refs["ts"])
+    if d == 2:
+        return plot_latent2d(drift_net, mo, zt, ts, refs["true_drift"], g_cur, step, fig_dir, metrics)
+    if d == 3:
+        return plot_latent3d(drift_net, mo, zt, ts, refs["true_drift"], g_cur, step, fig_dir, metrics)
+    return None
+
+
+def _affine_gauge_np(m_op, z_true):
+    d = z_true.shape[-1]
+    M = m_op.reshape(-1, d); Z = z_true.reshape(-1, d)
+    sol, *_ = np.linalg.lstsq(np.concatenate([M, np.ones_like(M[:, :1])], -1), Z, rcond=None)
+    A, b = sol[:d], sol[d]
+    return A, b, np.linalg.pinv(A)
 
 
 def _aligned_posterior(pi_op_traj, zg, s, b):
@@ -76,3 +98,98 @@ def plot_em_highd_d1(op, drift_net, g_cur, C_cur, d_cur, refs, step, fig_dir, me
     p2 = os.path.join(fig_dir, f"jax_step_{step:05d}_drift.png")
     fig2.savefig(p2, dpi=110); plt.close(fig2)
     return p1, p2
+
+
+def plot_latent2d(drift_net, m_op, z_true, ts, true_drift, g_cur, step, fig_dir, metrics, n_traj=4, ng=32):
+    """d=2 phase-plane: true drift streamplot + true traj / learned drift (aligned) + inferred traj /
+    latent recovery. Mirrors opssm.analysis.viz.vis_latent2d. m_op, z_true (T,B,2) numpy."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    A, b, A_inv = _affine_gauge_np(m_op, z_true)
+    Z = z_true.reshape(-1, 2)
+    z_al = m_op @ A + b
+    lo = np.quantile(Z, 0.01, 0); hi = np.quantile(Z, 0.99, 0)
+    pad = 0.1 * np.clip(hi - lo, 1e-3, None); lo, hi = lo - pad, hi + pad
+    xs = np.linspace(lo[0], hi[0], ng); ys = np.linspace(lo[1], hi[1], ng)
+    GX, GY = np.meshgrid(xs, ys)                                  # (ng,ng) indexing 'xy'
+    P = np.stack([GX.reshape(-1), GY.reshape(-1)], -1)          # (ng^2,2) true-frame grid
+    FT = np.asarray(true_drift(jnp.asarray(P)))
+    FL = np.asarray(drift_net.net(jnp.asarray((P - b) @ A_inv))) @ A   # learned drift -> true frame
+
+    def stream(ax, F, title):
+        u = F[:, 0].reshape(ng, ng); v = F[:, 1].reshape(ng, ng)
+        s = ax.streamplot(xs, ys, u, v, color=np.hypot(u, v), cmap="viridis",
+                          density=1.2, linewidth=1.0, arrowsize=0.8)
+        ax.set_xlabel("$z_1$"); ax.set_ylabel("$z_2$"); ax.set_title(title)
+        ax.set_xlim(xs[0], xs[-1]); ax.set_ylim(ys[0], ys[-1]); return s
+
+    nj = min(n_traj, z_true.shape[1])
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.4))
+    s0 = stream(axes[0], FT, "true drift f(z)")
+    for j in range(nj):
+        axes[0].plot(z_true[:, j, 0], z_true[:, j, 1], "k-", lw=0.8, alpha=0.5)
+    fig.colorbar(s0.lines, ax=axes[0], fraction=0.046)
+    s1 = stream(axes[1], FL, "learned drift (aligned)")
+    for j in range(nj):
+        axes[1].plot(z_al[:, j, 0], z_al[:, j, 1], "C3-", lw=0.8, alpha=0.6)
+    fig.colorbar(s1.lines, ax=axes[1], fraction=0.046)
+    ax = axes[2]
+    for j in range(nj):
+        ax.plot(z_al[:, j, 0], z_al[:, j, 1], "C3-", lw=1.0, alpha=0.8, label="inferred (aligned)" if j == 0 else None)
+        ax.plot(z_true[:, j, 0], z_true[:, j, 1], "k--", lw=1.0, alpha=0.6, label="true" if j == 0 else None)
+    ax.set_xlabel("$z_1$"); ax.set_ylabel("$z_2$"); ax.set_title("latent recovery"); ax.legend(fontsize=9)
+    m = metrics
+    fig.suptitle(f"VdP 2-D  step {step}  lat_rel={m.get('lat_rel',float('nan')):.3f} "
+                 f"drift_rel={m.get('drift_rel',float('nan')):.3f} g_rel={m.get('g_rel',float('nan')):.3f} "
+                 f"c_cos={m.get('c_cos',float('nan')):.3f} recon_r2={m.get('recon_r2',float('nan')):.3f} "
+                 f"g={float(g_cur):.3f}", fontsize=12, y=1.02)
+    fig.tight_layout()
+    os.makedirs(fig_dir, exist_ok=True)
+    p = os.path.join(fig_dir, f"jax_step_{step:05d}.png")
+    fig.savefig(p, dpi=110, bbox_inches="tight"); plt.close(fig)
+    return (p,)
+
+
+def plot_latent3d(drift_net, m_op, z_true, ts, true_drift, g_cur, step, fig_dir, metrics, n_traj=3, n_arrows=160):
+    """d=3 phase-space: 3-D attractor (true vs aligned) + 3 coordinate-projection drift-direction quivers.
+    Mirrors opssm.analysis.viz.vis_latent3d. m_op, z_true (T,B,3) numpy."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
+    A, b, A_inv = _affine_gauge_np(m_op, z_true)
+    Z = z_true.reshape(-1, 3)
+    z_al = m_op @ A + b
+    lo = np.quantile(Z, 0.01, 0); hi = np.quantile(Z, 0.99, 0)
+    pad = 0.1 * (hi - lo); lo, hi = lo - pad, hi + pad
+    sub = max(1, Z.shape[0] // n_arrows); P = Z[::sub]
+    FT = np.asarray(true_drift(jnp.asarray(P)))
+    FL = np.asarray(drift_net.net(jnp.asarray((P - b) @ A_inv))) @ A
+    ftn = FT / np.clip(np.linalg.norm(FT, axis=-1, keepdims=True), 1e-9, None)
+    fln = FL / np.clip(np.linalg.norm(FL, axis=-1, keepdims=True), 1e-9, None)
+    nj = min(n_traj, z_true.shape[1])
+    fig = plt.figure(figsize=(21, 5.2))
+    ax0 = fig.add_subplot(1, 4, 1, projection="3d")
+    for j in range(nj):
+        ax0.plot(z_al[:, j, 0], z_al[:, j, 1], z_al[:, j, 2], "C3-", lw=0.7, alpha=0.8, label="inferred (aligned)" if j == 0 else None)
+        ax0.plot(z_true[:, j, 0], z_true[:, j, 1], z_true[:, j, 2], "k--", lw=0.6, alpha=0.6, label="true" if j == 0 else None)
+    ax0.set_xlabel("$z_1$"); ax0.set_ylabel("$z_2$"); ax0.set_zlabel("$z_3$")
+    ax0.set_title("latent recovery (3-D)"); ax0.legend(fontsize=8)
+    ax0.set_xlim(lo[0], hi[0]); ax0.set_ylim(lo[1], hi[1]); ax0.set_zlim(lo[2], hi[2])
+    for ax, (i, k), name in zip([fig.add_subplot(1, 4, c) for c in (2, 3, 4)],
+                                [(0, 1), (0, 2), (1, 2)], ["z1-z2", "z1-z3", "z2-z3"]):
+        ax.quiver(P[:, i], P[:, k], ftn[:, i], ftn[:, k], color="0.5", alpha=0.7, angles="xy", scale=28, width=0.004, label="true")
+        ax.quiver(P[:, i], P[:, k], fln[:, i], fln[:, k], color="C3", alpha=0.6, angles="xy", scale=28, width=0.004, label="learned")
+        ax.set_xlabel(f"$z_{{{i+1}}}$"); ax.set_ylabel(f"$z_{{{k+1}}}$"); ax.set_title(f"drift dirs ({name})"); ax.legend(fontsize=8)
+        ax.set_xlim(lo[i], hi[i]); ax.set_ylim(lo[k], hi[k])
+    m = metrics
+    fig.suptitle(f"Lorenz 3-D  step {step}  lat_rel={m.get('lat_rel',float('nan')):.3f} "
+                 f"drift_rel={m.get('drift_rel',float('nan')):.3f} g_rel={m.get('g_rel',float('nan')):.3f} "
+                 f"c_cos={m.get('c_cos',float('nan')):.3f} recon_r2={m.get('recon_r2',float('nan')):.3f} "
+                 f"g={float(g_cur):.3f}", fontsize=12, y=1.02)
+    fig.tight_layout()
+    os.makedirs(fig_dir, exist_ok=True)
+    p = os.path.join(fig_dir, f"jax_step_{step:05d}.png")
+    fig.savefig(p, dpi=110, bbox_inches="tight"); plt.close(fig)
+    return (p,)

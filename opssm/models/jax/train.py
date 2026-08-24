@@ -1,12 +1,12 @@
-"""JAX EM training loop (em_highd, d=1) -- the functional replacement for filter_module's Lightning loop.
+"""JAX EM training loop -- functional replacement for filter_module's Lightning loop. Any latent dim d.
 
-Flow (mirrors ZakaiFilterModule): subspace-ID init (C, A) -> warm-start drift to A -> bootstrap M-step ->
+Flow (mirrors ZakaiFilterModule): subspace-ID init (C, A) -> warm-start drift -> bootstrap M-step ->
 per step { E-step (mesh-free Zakai PINN grad, exp-decay LR) ; M-step every m_every } -> validate. The
-mutable EM state (op/op_opt_state, drift_net/dr_state, g_cur, C_cur, d_cur) is threaded explicitly (JAX is
-functional); the E-step is one jitted call, the M-step is eager (amortized to ~0 at m_every=2000).
+mutable EM state (op/op_opt_state, drift_net/dr_state, g_cur, C_cur, d_cur) is threaded explicitly.
 
-Validation ports the d=1 metrics: kl vs the exact filter, on-data drift_l2, c_cos, and the Procrustes
-gauge-aligned kl_aln / lat_rel / drift_rel / g_rel (see filter_module._gauge_aligned).
+Validation: d==1 uses the grid (kl vs exact filter, drift_l2, grid mean); d>1 uses the mesh-free MALA
+filter mean (no grid). Both score the Procrustes gauge-aligned lat_rel / drift_rel / g_rel (+ kl_aln, d==1)
+and c_cos / recon_r2. Figures via opssm.models.jax.viz_jax (d=1 posterior panels, d=2/3 phase-space).
 """
 import numpy as np
 import jax
@@ -20,6 +20,7 @@ from opssm.models.jax.obs import zhat_from_obs, make_decode
 from opssm.models.jax.losses import pinn_zakai_loss, sample_collocation, kl_target_pred
 from opssm.models.jax import mstep as M
 from opssm.models.jax.init import subspace_id, warmstart_drift
+from opssm.models.jax.systems import make_drift
 
 
 def _log_prior(z):
@@ -33,8 +34,8 @@ def _interp1d(vals, grid, query):                                  # vals (...,N
     return vals[..., idx - 1] * (1 - w) + vals[..., idx] * w
 
 
-DEFAULTS = dict(  # em_highd resolved hparams (configs/model/operator.yaml + experiment/em_highd.yaml)
-    data_size=10, latent_dim=1, gru_hidden=64, ctx_dim=64, p=64, drift_hidden=64,
+DEFAULTS = dict(  # em_highd resolved hparams; the bridge overrides per-experiment (latent_dim, n_colloc, ...)
+    system="doublewell", data_size=10, latent_dim=1, gru_hidden=64, ctx_dim=64, p=64, drift_hidden=64,
     lr=2e-3, drift_lr=2e-3, sched_gamma=0.9998, n_scoll=4, n_tcoll=24, n_colloc=128,
     near_std=0.3, broad_std=1.6, warmup=0, m_every=2000, m_inner=400, reg_lambda=3e-4,
     g_init=1.0, w_res=0.4, res_mode="rel", learn_obs=True, learn_g=True, c_stable_tol=0.05,
@@ -86,67 +87,85 @@ def make_estep(xs, mask, s_coll, optim, hp):
     return estep
 
 
-def gauge_aligned_1d(log_pi, filt, m_op, z_true, drift_net, g_cur, sigma, a, z_grid):
-    """d=1 Procrustes gauge-aligned metrics (kl_aln, lat_rel, drift_rel, g_rel, s_fit). m_op (T,B),
-    z_true (T,B,1), log_pi/filt (T,B,Nz)."""
-    Mm = m_op.reshape(-1, 1)
-    Z = z_true.reshape(-1, 1)
-    Mh = jnp.concatenate([Mm, jnp.ones_like(Mm[:, :1])], -1)       # (N,2)
-    sol = jnp.linalg.lstsq(Mh, Z)[0]                              # (2,1): Z ~ [M,1]@sol
-    A, b = sol[:1], sol[1]                                        # (1,1),(1,)
+def gauge_aligned(m_op, z_true, drift_net, true_drift, g_cur, sigma, log_pi=None, filt=None, z_grid=None):
+    """Procrustes gauge-aligned metrics (any d): z_true ~ A m_op + b, score in the aligned frame.
+    lat_rel/drift_rel/g_rel/s_fit always; kl_aln only d==1 (grid oracle). m_op/z_true (T,B,d)."""
+    d = z_true.shape[-1]
+    Mm = m_op.reshape(-1, d)
+    Z = z_true.reshape(-1, d)
+    sol = jnp.linalg.lstsq(jnp.concatenate([Mm, jnp.ones_like(Mm[:, :1])], -1), Z)[0]   # (d+1,d)
+    A, b = sol[:d], sol[d]
     z_al = Mm @ A + b
-    f_al = drift_net.net(Mm) @ A                                 # (N,1) drift maps under A
-    f_true = a * (z_al - z_al ** 3)                             # double-well true drift
-    on = (jnp.abs(z_al[:, 0]) <= 1.5).astype(z_al.dtype)
-    s = A.reshape(-1)[0]
-    gscale = jnp.abs(s)
+    f_al = drift_net.net(Mm) @ A                                  # drift maps under the linear part
+    f_true = true_drift(z_al)
+    on = (jnp.abs(z_al[:, 0]) <= 1.5 if d == 1 else jnp.ones(z_al.shape[0], bool)).astype(z_al.dtype)
+    gscale = jnp.abs(jnp.linalg.det(A)) ** (1.0 / d)
     e_lat = ((z_al - Z) ** 2).sum(-1)
     e_drf = ((f_al - f_true) ** 2).sum(-1)
     z_scale = jnp.maximum(jnp.sqrt(((Z - Z.mean(0)) ** 2).sum(-1).mean()), 1e-8)
-    f_scale = jnp.maximum(jnp.sqrt((f_true[:, 0] ** 2 * on).sum() / jnp.maximum(on.sum(), 1)), 1e-8)
+    f_scale = jnp.maximum(jnp.sqrt(((f_true ** 2).sum(-1) * on).sum() / jnp.maximum(on.sum(), 1)), 1e-8)
     out = {
-        "s_fit": float(s),
+        "s_fit": float(A.reshape(-1)[0]) if d == 1 else float(gscale),
         "lat_rel": float(jnp.sqrt(e_lat.mean()) / z_scale),
+        "lat_rmse_aln": float(jnp.sqrt(e_lat.mean() / d)),
         "drift_rel": float(jnp.sqrt((e_drf * on).sum() / jnp.maximum(on.sum(), 1)) / f_scale),
         "g_aln": float(gscale * g_cur),
         "g_rel": float(gscale * g_cur / max(sigma, 1e-8)),
     }
-    b0, sv = float(b.reshape(-1)[0]), float(s)
-    pi_al = _interp1d(jnp.exp(log_pi), z_grid, (z_grid - b0) / sv)
-    pi_al = jnp.maximum(pi_al, 0.0) / abs(sv)
-    pi_al = pi_al / jnp.maximum(pi_al.sum(-1, keepdims=True), 1e-12)
-    out["kl_aln"] = float(kl_target_pred(filt, jnp.log(jnp.maximum(pi_al, 1e-20))))
+    if d == 1 and log_pi is not None and filt is not None and z_grid is not None:
+        s, b0 = float(A.reshape(-1)[0]), float(b.reshape(-1)[0])
+        pi_al = _interp1d(jnp.exp(log_pi), z_grid, (z_grid - b0) / s)
+        pi_al = jnp.maximum(pi_al, 0.0) / abs(s)
+        pi_al = pi_al / jnp.maximum(pi_al.sum(-1, keepdims=True), 1e-12)
+        out["kl_aln"] = float(kl_target_pred(filt, jnp.log(jnp.maximum(pi_al, 1e-20))))
     return out
 
 
-def validate(op, drift_net, g_cur, C_cur, d_cur, refs, hp):
-    """d=1 validation metrics vs the exact filter + gauge-aligned latent/drift/g."""
-    xv, mv, filt = refs["x_val"], refs["mask_val"], refs["filt_val"]
-    zg, z_true, C_true = refs["z_grid"], refs["z_val_true"], refs["C_true"]
-    a, sigma = refs["a"], refs["sigma"]
-    log_pi = op.log_posterior(xv, mv, zg)                         # (T,B,Nz)
-    logs = {"g": float(g_cur), "kl": float(kl_target_pred(filt, log_pi))}
-    m_op = (jnp.exp(log_pi) * zg).sum(-1)                         # (T,B) grid mean
-    lo, hi = jnp.quantile(m_op, 0.01), jnp.quantile(m_op, 0.99)
-    on = (zg >= lo) & (zg <= hi)
-    fd = drift_net.net(zg[:, None])[:, 0]
-    f_true_grid = a * (zg - zg ** 3)
-    logs["drift_l2"] = float(jnp.sqrt((((fd - f_true_grid) ** 2) * on).sum() / jnp.maximum(on.sum(), 1)))
+def validate(op, drift_net, g_cur, C_cur, d_cur, refs, hp, key):
+    """Validation metrics (any d). Returns (logs, m_op_full (T,B,d) aligned-frame-ready mean)."""
+    d = hp["latent_dim"]
+    xv, mv = refs["x_val"], refs["mask_val"]
+    z_true, C_true, sigma = refs["z_val_true"], refs["C_true"], refs["sigma"]
+    true_drift = refs["true_drift"]
+    logs = {"g": float(g_cur)}
+    log_pi = None
+    if d == 1:
+        zg = refs["z_grid"]
+        log_pi = op.log_posterior(xv, mv, zg)
+        if refs.get("filt_val") is not None:
+            logs["kl"] = float(kl_target_pred(refs["filt_val"], log_pi))
+        m_op = (jnp.exp(log_pi) * zg).sum(-1)                     # (T,B)
+        lo, hi = jnp.quantile(m_op, 0.01), jnp.quantile(m_op, 0.99)
+        on = (zg >= lo) & (zg <= hi)
+        fd = drift_net.net(zg[:, None])[:, 0]
+        ftrue_g = true_drift(zg[:, None])[:, 0]
+        logs["drift_l2"] = float(jnp.sqrt((((fd - ftrue_g) ** 2) * on).sum() / jnp.maximum(on.sum(), 1)))
+        m_op_full = m_op[..., None]                               # (T,B,1)
+    else:
+        center = zhat_from_obs(xv, C_cur, d_cur)
+        m_op_full, _ = M.posterior_mean_mala(op, xv, mv, center, hp["broad_std"], key,
+                                             n_chains=hp["mala_chains"], n_steps=hp["mala_steps"],
+                                             rng=hp["mala_rng"])   # (T,B,d)
     Cn = C_true / jnp.linalg.norm(C_true, axis=0, keepdims=True)
     logs["c_cos"] = float(jnp.minimum(jnp.linalg.svd(C_cur.T @ Cn, compute_uv=False), 1.0).mean())
-    logs.update(gauge_aligned_1d(log_pi, filt, m_op, z_true, drift_net, g_cur, sigma, a, zg))
-    return logs
+    if hp["learn_obs"]:
+        y_hat = m_op_full @ C_cur.T + d_cur
+        xf = xv.reshape(-1, xv.shape[-1]); yf = y_hat.reshape(-1, xv.shape[-1])
+        ss_res = ((xf - yf) ** 2).sum()
+        ss_tot = jnp.maximum(((xf - xf.mean(0)) ** 2).sum(), 1e-8)
+        logs["recon_r2"] = float(1.0 - ss_res / ss_tot)
+    logs.update(gauge_aligned(m_op_full, z_true, drift_net, true_drift, g_cur, sigma,
+                              log_pi, refs.get("filt_val"), refs.get("z_grid")))
+    return logs, m_op_full
 
 
 def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None):
-    """Run em_highd EM training in JAX. refs: bridged arrays (jnp). Returns final state + metric history.
-    fig_dir: if set, save a d=1 validation figure (posterior vs exact filter, latent, drift) each validation."""
+    """Run EM training in JAX (any d). refs: bridged arrays (jnp) + 'true_drift'. Returns state + history."""
     d = hp["latent_dim"]
     xs, mask = refs["x_train"], refs["mask_train"]
     s_coll = jnp.linspace(0.0, 1.0, hp["n_scoll"])
     key, ko, kd, kw, kb = jax.random.split(key, 5)
 
-    # --- init: operator, subspace-ID emission + dynamics, warm-start drift ---
     op = OperatorFilter(hp["data_size"], hp["gru_hidden"], hp["ctx_dim"], hp["p"], latent_dim=d, key=ko)
     C_cur, A_init = subspace_id(refs["full_obs"], d, hp["dt"])
     d_cur = refs["full_obs"].reshape(-1, hp["data_size"]).mean(0)
@@ -154,27 +173,31 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None):
     drift_net, wmse = warmstart_drift(drift_net, A_init, kw)
     g_cur = hp["g_init"]
 
-    # --- optimizers ---
     sched = optax.exponential_decay(hp["lr"], transition_steps=1, decay_rate=hp["sched_gamma"])
     optim = optax.adam(sched)
     op_opt_state = optim.init(eqx.filter(op, eqx.is_inexact_array))
     dr_opt = optax.adam(hp["drift_lr"])
     dr_state = dr_opt.init(eqx.filter(drift_net.net, eqx.is_inexact_array))
 
-    # --- bootstrap M-step (from the init projection, before any E-step) ---
     drift_net, dr_state, C_cur, d_cur, g_cur, info = _run_mstep(
         op, xs, mask, drift_net, dr_opt, dr_state, C_cur, d_cur, g_cur, hp, kb, bootstrap=True)
-    log_fn(f"[init] warmstart_mse={wmse:.4f} bootstrap cstab={info['cstab']:.4f} g={g_cur:.4f}")
+    log_fn(f"[init] d={d} warmstart_mse={wmse:.4f} bootstrap cstab={info['cstab']:.4f} g={g_cur:.4f}")
 
     _plot = None
     if fig_dir is not None:
-        from opssm.models.jax.viz_jax import plot_em_highd_d1 as _plot
+        from opssm.models.jax.viz_jax import plot_validation as _plot
+
+    def _validate_and_plot(step):
+        nonlocal key
+        key, vk = jax.random.split(key)
+        m, m_op = validate(op, drift_net, g_cur, jnp.asarray(C_cur), d_cur, refs, hp, vk)
+        if _plot is not None:
+            _plot(op, drift_net, g_cur, jnp.asarray(C_cur), d_cur, refs, hp, step, fig_dir, m, m_op)
+        return m
 
     estep = make_estep(xs, mask, s_coll, optim, hp)
     history = []
-    m0 = validate(op, drift_net, g_cur, jnp.asarray(C_cur), d_cur, refs, hp)
-    if _plot is not None:
-        _plot(op, drift_net, g_cur, jnp.asarray(C_cur), d_cur, refs, 0, fig_dir, m0)
+    m0 = _validate_and_plot(0)
     log_fn(f"[step 0] " + " ".join(f"{k}={v:.4f}" for k, v in m0.items()))
     history.append((0, m0))
 
@@ -187,9 +210,7 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None):
             drift_net, dr_state, C_cur, d_cur, g_cur, info = _run_mstep(
                 op, xs, mask, drift_net, dr_opt, dr_state, C_cur, d_cur, g_cur, hp, mk)
         if step % val_every == 0 or step == n_steps:
-            m = validate(op, drift_net, g_cur, jnp.asarray(C_cur), d_cur, refs, hp)
-            if _plot is not None:
-                _plot(op, drift_net, g_cur, jnp.asarray(C_cur), d_cur, refs, step, fig_dir, m)
+            m = _validate_and_plot(step)
             res, jump, ic = (float(a) for a in aux)
             log_fn(f"[step {step}] res={res:.3f} jump={jump:.3f} ic={ic:.3f} | "
                    + " ".join(f"{k}={v:.4f}" for k, v in m.items()))
@@ -198,10 +219,18 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None):
 
 
 def load_refs(npz_path):
-    """Load the bridged em_highd arrays as jnp (float32) + scalars."""
-    D = np.load(npz_path)
-    arr = lambda k: jnp.asarray(D[k])
-    refs = {k: arr(k) for k in ("x_train", "mask_train", "x_val", "mask_val", "filt_val",
-                                "z_grid", "full_obs", "z_val_true", "C_true", "d_true", "ts")}
+    """Load bridged arrays (jnp) + hparams. Returns (refs, hp). refs['true_drift'] baked from the system."""
+    D = np.load(npz_path, allow_pickle=True)
+    keys = ["x_train", "mask_train", "x_val", "mask_val", "filt_val", "z_grid", "full_obs",
+            "z_val_true", "C_true", "d_true", "ts"]
+    refs = {k: jnp.asarray(D[k]) for k in keys if k in D.files}
     refs["a"] = float(D["a"]); refs["sigma"] = float(D["sigma"])
-    return refs, dict(dt=float(D["dt"]), noise_std=float(D["noise_std_eff"]))
+    system = str(D["system"]) if "system" in D.files else "doublewell"
+    refs["system"] = system
+    refs["true_drift"] = make_drift(system)[0]
+    hp = dict(DEFAULTS)
+    if "hparams" in D.files:                                      # per-experiment resolved hparams
+        hp.update({k: (v.item() if hasattr(v, "item") else v) for k, v in D["hparams"].item().items()})
+    hp["system"] = system
+    hp["dt"] = float(D["dt"]); hp["noise_std"] = float(D["noise_std_eff"])
+    return refs, hp
