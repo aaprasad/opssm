@@ -138,8 +138,9 @@ def validate(op, drift_net, g_cur, C_cur, d_cur, refs, hp):
     return logs
 
 
-def train(refs, hp, n_steps, key, val_every=2000, log_fn=print):
-    """Run em_highd EM training in JAX. refs: bridged arrays (jnp). Returns final state + metric history."""
+def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None):
+    """Run em_highd EM training in JAX. refs: bridged arrays (jnp). Returns final state + metric history.
+    fig_dir: if set, save a d=1 validation figure (posterior vs exact filter, latent, drift) each validation."""
     d = hp["latent_dim"]
     xs, mask = refs["x_train"], refs["mask_train"]
     s_coll = jnp.linspace(0.0, 1.0, hp["n_scoll"])
@@ -165,9 +166,15 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print):
         op, xs, mask, drift_net, dr_opt, dr_state, C_cur, d_cur, g_cur, hp, kb, bootstrap=True)
     log_fn(f"[init] warmstart_mse={wmse:.4f} bootstrap cstab={info['cstab']:.4f} g={g_cur:.4f}")
 
+    _plot = None
+    if fig_dir is not None:
+        from opssm.models.jax.viz_jax import plot_em_highd_d1 as _plot
+
     estep = make_estep(xs, mask, s_coll, optim, hp)
     history = []
     m0 = validate(op, drift_net, g_cur, jnp.asarray(C_cur), d_cur, refs, hp)
+    if _plot is not None:
+        _plot(op, drift_net, g_cur, jnp.asarray(C_cur), d_cur, refs, 0, fig_dir, m0)
     log_fn(f"[step 0] " + " ".join(f"{k}={v:.4f}" for k, v in m0.items()))
     history.append((0, m0))
 
@@ -181,6 +188,8 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print):
                 op, xs, mask, drift_net, dr_opt, dr_state, C_cur, d_cur, g_cur, hp, mk)
         if step % val_every == 0 or step == n_steps:
             m = validate(op, drift_net, g_cur, jnp.asarray(C_cur), d_cur, refs, hp)
+            if _plot is not None:
+                _plot(op, drift_net, g_cur, jnp.asarray(C_cur), d_cur, refs, step, fig_dir, m)
             res, jump, ic = (float(a) for a in aux)
             log_fn(f"[step {step}] res={res:.3f} jump={jump:.3f} ic={ic:.3f} | "
                    + " ".join(f"{k}={v:.4f}" for k, v in m.items()))
@@ -193,6 +202,6 @@ def load_refs(npz_path):
     D = np.load(npz_path)
     arr = lambda k: jnp.asarray(D[k])
     refs = {k: arr(k) for k in ("x_train", "mask_train", "x_val", "mask_val", "filt_val",
-                                "z_grid", "full_obs", "z_val_true", "C_true", "d_true")}
+                                "z_grid", "full_obs", "z_val_true", "C_true", "d_true", "ts")}
     refs["a"] = float(D["a"]); refs["sigma"] = float(D["sigma"])
     return refs, dict(dt=float(D["dt"]), noise_std=float(D["noise_std_eff"]))
