@@ -338,9 +338,14 @@ def load_refs(npz_path):
     if "states_val" in D.files:                                   # Kato behavior labels (numpy, for figures)
         refs["states_val"] = np.asarray(D["states_val"])
         refs["state_names"] = list(D["state_names"]) if "state_names" in D.files else None
-    for k in ("y_full_std", "states_full"):                       # Kato whole-trace co-smoothing recon inputs
+    for k in ("y_full_std", "states_full", "y_full_raw", "obs_mean"):   # Kato whole-trace recon + figure inputs
         if k in D.files:
             refs[k] = np.asarray(D[k])
+    if "neuron_ids" in D.files:
+        refs["neuron_ids"] = list(D["neuron_ids"])
+    refs["obs_scale"] = float(D["obs_scale"]) if "obs_scale" in D.files else 1.0
+    if "name" in D.files:
+        refs["name"] = str(D["name"])
     system = str(D["system"]) if "system" in D.files else "doublewell"
     refs["system"] = system
     refs["true_drift"] = make_drift(system)[0]
