@@ -304,6 +304,30 @@ def _fmt_timing(r):
             f"  figure  {r['fig_ms']:.0f} ms/fig")
 
 
+def whole_trace_recon(op, C_cur, d_cur, refs, hp, key):
+    """Whole-trace co-smoothing recon (== opssm_adapter._filter_full / the Kato publication metric): window the
+    full standardized trace, MALA filter mean per window, average overlaps -> z_hat (T,d); recon vs the full
+    trace. Returns (r2, z_hat (T,d)). This is HIGHER than the held-out val-window recon."""
+    y = np.asarray(refs["y_full_std"])                           # (T,N) standardized full trace
+    T, N = y.shape
+    win, stride, d = int(hp["window"]), int(hp["stride"]), hp["latent_dim"]
+    starts = list(range(0, T - win + 1, stride)) or [0]
+    x = jnp.stack([jnp.asarray(y[s:s + win]) for s in starts], axis=1)   # (win,B,N)
+    mask = jnp.ones((x.shape[0], x.shape[1], 1), x.dtype)
+    center = _zhat(x, C_cur, d_cur)
+    zc, _ = M.posterior_mean_mala(op, x, mask, center, hp["broad_std"], key,
+                                  n_chains=hp["mala_chains"], n_steps=hp["mala_steps"], rng=hp["mala_rng"])
+    zc = np.asarray(zc)                                          # (win,B,d)
+    acc = np.zeros((T, d)); cnt = np.zeros((T, 1))
+    for b, s in enumerate(starts):                              # stitch overlapping windows (average)
+        L = min(win, T - s)
+        acc[s:s + L] += zc[:L, b]; cnt[s:s + L] += 1
+    z_hat = acc / np.maximum(cnt, 1)                            # (T,d)
+    y_hat = z_hat @ np.asarray(C_cur).T + np.asarray(d_cur)
+    r2 = 1.0 - ((y - y_hat) ** 2).sum() / max(((y - y.mean(0)) ** 2).sum(), 1e-8)
+    return float(r2), z_hat
+
+
 def load_refs(npz_path):
     """Load bridged arrays (jnp) + hparams. Returns (refs, hp). refs['true_drift'] baked from the system."""
     D = np.load(npz_path, allow_pickle=True)
@@ -314,6 +338,9 @@ def load_refs(npz_path):
     if "states_val" in D.files:                                   # Kato behavior labels (numpy, for figures)
         refs["states_val"] = np.asarray(D["states_val"])
         refs["state_names"] = list(D["state_names"]) if "state_names" in D.files else None
+    for k in ("y_full_std", "states_full"):                       # Kato whole-trace co-smoothing recon inputs
+        if k in D.files:
+            refs[k] = np.asarray(D[k])
     system = str(D["system"]) if "system" in D.files else "doublewell"
     refs["system"] = system
     refs["true_drift"] = make_drift(system)[0]
@@ -322,4 +349,7 @@ def load_refs(npz_path):
         hp.update({k: (v.item() if hasattr(v, "item") else v) for k, v in D["hparams"].item().items()})
     hp["system"] = system
     hp["dt"] = float(D["dt"]); hp["noise_std"] = float(D["noise_std_eff"])
+    for k in ("window", "stride"):                                # Kato windowing (for whole-trace recon)
+        if k in D.files:
+            hp[k] = int(D[k])
     return refs, hp
