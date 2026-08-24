@@ -59,15 +59,15 @@ class GRUEncoder(eqx.Module):
         if params is not None:
             self.W_ih, self.W_hh, self.b_ih, self.b_hh, self.Wc, self.bc = [jnp.asarray(p) for p in params]
             return
-        ks = jax.random.split(key, 3)
-        lg = 1.0 / jnp.sqrt(hidden)
+        ks = jax.random.split(key, 6)
+        lg = 1.0 / jnp.sqrt(hidden)                               # torch nn.GRU: ALL weights+biases ~ U(-1/sqrt(H))
         self.W_ih = jax.random.uniform(ks[0], (3 * hidden, in_dim), minval=-lg, maxval=lg)
         self.W_hh = jax.random.uniform(ks[1], (3 * hidden, hidden), minval=-lg, maxval=lg)
-        self.b_ih = jnp.zeros(3 * hidden)
-        self.b_hh = jnp.zeros(3 * hidden)
-        li = 1.0 / jnp.sqrt(hidden)
+        self.b_ih = jax.random.uniform(ks[3], (3 * hidden,), minval=-lg, maxval=lg)
+        self.b_hh = jax.random.uniform(ks[4], (3 * hidden,), minval=-lg, maxval=lg)
+        li = 1.0 / jnp.sqrt(hidden)                               # torch nn.Linear(hidden,ctx): W,b ~ U(-1/sqrt(H))
         self.Wc = jax.random.uniform(ks[2], (ctx_dim, hidden), minval=-li, maxval=li)
-        self.bc = jnp.zeros(ctx_dim)
+        self.bc = jax.random.uniform(ks[5], (ctx_dim,), minval=-li, maxval=li)
 
     def __call__(self, inp):                                      # (T,B,in) -> (T,B,ctx)
         B = inp.shape[1]
