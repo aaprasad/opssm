@@ -236,7 +236,6 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
 
     estep = make_estep(xs, mask, s_coll, optim, hp)
     history = []
-    n_msteps = 0                                                  # for the freeze_g_after_first DIAGNOSTIC
     m0 = _validate_and_plot(0)
     log_fn(f"[step 0] " + " ".join(f"{k}={v:.4f}" for k, v in m0.items()))
     history.append((0, m0))
@@ -251,12 +250,8 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
         if step > hp["warmup"] and step % hp["m_every"] == 0:
             key, mk = jax.random.split(key)
             tms = time.perf_counter()
-            g_before = g_cur
             drift_net, dr_state, C_cur, d_cur, g_cur, info = _run_mstep(
                 op, xs, mask, drift_net, dr_opt, dr_state, C_cur, d_cur, g_cur, hp, mk)
-            n_msteps += 1
-            if hp.get("freeze_g_after_first") and n_msteps > 1:   # DIAGNOSTIC: keep g at the 1st M-step value
-                g_cur = g_before
             _block(eqx.filter(drift_net, eqx.is_inexact_array))
             tm["mstep"].append(time.perf_counter() - tms)
         if step % val_every == 0 or step == n_steps:
