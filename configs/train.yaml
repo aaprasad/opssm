@@ -22,3 +22,8 @@ train_dir: ./dump/nzf
 # The two backends pin conflicting CUDA runtimes, so each lives in its own venv; this field just records intent
 # and lets each entrypoint fail fast if invoked under the wrong backend.
 backend: torch
+
+# JAX grid-search knobs (scripts/train_jax.py): checkpoint cadence + model-selection metric for best.eqx.
+ckpt_every: 1000
+monitor: recon_r2
+monitor_mode: max

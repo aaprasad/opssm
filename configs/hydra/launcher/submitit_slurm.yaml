@@ -1,0 +1,29 @@
+# @package hydra.launcher
+# Hydra submitit-launcher config for the JAX grid search. Select under multirun: `hydra/launcher=submitit_slurm`.
+# ONE job array across ALL partitions; each grid point is one array task = 1 GPU. Preemption resilience is
+# SLURM's `--requeue` + our resume: a preempted task is requeued as the SAME array task (stable run dir), and
+# scripts/train_jax.py resumes from the ckpt.* it wrote there. We do NOT catch signals -- submitit bypasses
+# SIGTERM and won't requeue non-checkpointable jobs, so the requeue is SLURM's and we just resume on rerun
+# (a preemption loses <= ckpt_every training steps).
+#
+# FILL the ??? / null placeholders for your site before launching (partition list is mandatory).
+_target_: hydra_plugins.hydra_submitit_launcher.submitit_launcher.SlurmLauncher
+submitit_folder: ${hydra.sweep.dir}/.submitit/%j     # submitit stdout/stderr + job pickles (per task)
+timeout_min: 1440                 # 24 h wall clock per task (rarely needed; tasks usually finish well under)
+nodes: 1
+tasks_per_node: 1                 # one array task ...
+gpus_per_node: 1                  # ... on one GPU
+cpus_per_task: 4                  # minimal
+mem_gb: 16                        # minimal
+partition: ???                    # FILL: comma-separated, e.g. "a100,h100,l40s" -- SLURM places each task wherever free
+account: null                     # FILL if your cluster requires one
+qos: null                         # FILL if your cluster requires one
+comment: null
+constraint: null                  # FILL to pin a GPU type/feature, e.g. "a100|h100"
+gres: null                        # FILL, e.g. "gpu:1", only if your site needs an explicit gres instead of gpus_per_node
+exclude: null
+array_parallelism: 92             # max array tasks running at once (~20 low-preempt + ~72 high-preempt GPUs)
+max_num_timeout: 10               # submitit's own resubmit cap on the 24h TIME LIMIT (our jobs finish well under it)
+additional_parameters:
+  requeue: true                   # THE mechanism: SLURM requeues a preempted task -> it reruns + resumes from ckpt.*
+setup: null                       # optional shell lines run on the node before the task (e.g. module load / env vars)

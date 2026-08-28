@@ -7,20 +7,21 @@ name = "opssm"
 version = "0.1.0"
 description = "Neural mesh-free Zakai filter (Neural Operators for Continuous State-Space Modeling)"
 requires-python = ">=3.10"
-# Backend-agnostic core: data loading, evaluation, and plotting. Installs WITHOUT a deep-learning framework
-# OR Hydra (the JAX backend consumes a pre-bridged .npz and needs no config framework). Pick exactly ONE
-# backend extra below -- they pin conflicting CUDA runtimes (torch cu130 vs jax cu12), so they must live in
-# separate venvs and never co-install.
+# Backend-agnostic core: data loading (incl. h5py for the Kato .mat), Hydra config, evaluation, and plotting.
+# Installs WITHOUT a deep-learning framework. Pick exactly ONE backend extra below -- they pin conflicting CUDA
+# runtimes (torch cu130 vs jax cu12), so they must live in separate venvs and never co-install.
 dependencies = [
     "numpy",
     "scipy",
     "scikit-learn",
     "matplotlib",
+    "h5py",
+    "hydra-core",
+    "omegaconf",
 ]
 
 [project.optional-dependencies]
-# Torch backend (the reference implementation): Lightning training loop + torch operator/filter_module, plus
-# Hydra (scripts/train.py and scripts/bridge.py compose the config here -- the JAX side reuses the result).
+# Torch backend (the reference implementation): Lightning training loop + torch operator/filter_module.
 #   pip install -e '.[torch]'
 # For a specific CUDA build (e.g. cu130) point pip at the pytorch index:
 #   pip install -e '.[torch]' --extra-index-url https://download.pytorch.org/whl/cu130
@@ -28,16 +29,16 @@ torch = [
     "torch",
     "torchsde",
     "lightning",
-    "hydra-core",
-    "omegaconf",
 ]
-# JAX backend (opssm/models/jax): equinox modules + optax optimizers.
+# JAX backend (opssm/models/jax): equinox modules + optax optimizers, plus the submitit launcher for the
+# preemptible SLURM grid search (scripts/train_jax.py -m hydra/launcher=submitit_slurm).
 #   pip install -e '.[jax]'
 # jax[cuda12] pulls the GPU wheels from PyPI; for CPU-only, install plain "jax" instead.
 jax = [
     "jax[cuda12]",
     "equinox",
     "optax",
+    "hydra-submitit-launcher",
 ]
 
 [tool.setuptools.packages.find]
