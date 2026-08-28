@@ -16,3 +16,9 @@ trainer:
 
 seed: 0
 train_dir: ./dump/nzf
+
+# Which backend runs this config. torch (default) -> scripts/train.py in the .[torch] venv (Lightning loop).
+# jax -> scripts/bridge.py (.[torch] venv, dumps <train_dir>/bridge.npz) then scripts/train_jax.py (.[jax] venv).
+# The two backends pin conflicting CUDA runtimes, so each lives in its own venv; this field just records intent
+# and lets each entrypoint fail fast if invoked under the wrong backend.
+backend: torch

@@ -14,6 +14,12 @@ from omegaconf import OmegaConf
 
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
 def main(cfg):
+    if cfg.get("backend", "torch") != "torch":                       # this entrypoint runs only the torch backend
+        raise SystemExit(
+            f"cfg.backend={cfg.backend!r}: scripts/train.py runs the torch backend only. For jax, bridge the\n"
+            f"data in the .[torch] venv then train in the .[jax] venv:\n"
+            f"  python scripts/bridge.py    experiment=<exp> train_dir=<dir> backend=jax  # .[torch] venv\n"
+            f"  python scripts/train_jax.py experiment=<exp> train_dir=<dir> backend=jax  # .[jax] venv")
     pl.seed_everything(cfg.seed)
     datamodule = instantiate(cfg.data)
     model = instantiate(cfg.model)
