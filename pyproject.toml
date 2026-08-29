@@ -39,6 +39,7 @@ jax = [
     "equinox",
     "optax",
     "hydra-submitit-launcher",
+    "hydra-optuna-sweeper",
 ]
 
 [tool.setuptools.packages.find]

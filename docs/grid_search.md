@@ -34,6 +34,26 @@ python scripts/train_jax.py -m \
 `multirun/<date>/<time>/<task>/`. Common knobs: `trainer.max_steps` (default 14000), `ckpt_every` (default 1000),
 `monitor`/`monitor_mode` (default `recon_r2`/`max`, selects `best.eqx`).
 
+## Random search (recommended for many knobs)
+
+A full grid over ~12 knobs is intractable (30k+ configs); random search covers a high-dimensional space far
+better per run. Add `hydra/sweeper=optuna_random` -- it samples the space in [`configs/hydra/sweeper/optuna_random.yaml`](../configs/hydra/sweeper/optuna_random.yaml)
+(ranges grounded in the 0.844 defaults) and maximizes the whole-trace `recon_r2` that `train_jax` returns:
+
+```bash
+python scripts/train_jax.py -m hydra/sweeper=optuna_random hydra/launcher=submitit_slurm backend=jax \
+    experiment=kato data.mat_path=/path/WT_NoStim.mat data.worm=0 model.data_size=109
+```
+
+- Edit `n_trials` (default 500) and the `params` ranges in the sweeper config; `n_jobs` (default 92) is the batch
+  size — set it to `array_parallelism` so each wave fills the array.
+- **Upgrade to Bayesian for free:** once you have a batch of random results, flip the sampler to
+  `_target_: optuna.samplers.TPESampler` (adaptive) -- same command otherwise.
+- **Objective caveat:** this maximizes *reconstruction*, which per the current read is already strong while the
+  *dynamics* are the weak point. If you want to select on dynamics, change what `train_jax` returns (e.g. behavior
+  decode, or a recon+decode blend) before a long run.
+- Optuna logs the best trial; `aggregate_sweep.py` (below) works on the sweep dir either way.
+
 ## Preemption & resume
 
 Resilience is SLURM `--requeue` + our resume -- deliberately **not** signal-catching:

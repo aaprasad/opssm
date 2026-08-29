@@ -78,6 +78,8 @@ def main(cfg):
     with open(os.path.join(run_dir, "result.json"), "w") as f:
         json.dump(result, f, indent=2, default=float)
     print(f"train_jax: done -> {os.path.join(run_dir, 'result.json')}", flush=True)
+    # objective for the hydra sweeper (optuna random/TPE search): maximize whole-trace recon
+    return float(result.get("whole_trace_recon_r2", (result.get("final") or {}).get("recon_r2", float("-inf"))))
 
 
 if __name__ == "__main__":
