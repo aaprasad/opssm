@@ -239,7 +239,9 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
     s_coll = jnp.linspace(0.0, 1.0, hp["n_scoll"])
     key, ko, kd, kw, kb, kc = jax.random.split(key, 6)
 
-    op = OperatorFilter(D_obs, hp["gru_hidden"], hp["ctx_dim"], hp["p"], latent_dim=d, key=ko)
+    op = OperatorFilter(D_obs, hp["gru_hidden"], hp["ctx_dim"], hp["p"], latent_dim=d, key=ko,
+                        branch_hidden=hp.get("branch_hidden", 128), trunk_hidden=hp.get("trunk_hidden", 64),
+                        trunk_layers=hp.get("trunk_layers", 3))
     full_obs = refs["full_obs"]
     ybar = full_obs.reshape(-1, D_obs).mean(0)
     d_cur = ybar
@@ -253,7 +255,7 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
         C_cur = Vt[:d].T
     else:                                                          # random Stiefel
         C_cur = jnp.linalg.qr(jax.random.normal(kc, (D_obs, d)))[0]
-    drift_net = DriftNet(hp["drift_hidden"], latent_dim=d, key=kd)
+    drift_net = DriftNet(hp["drift_hidden"], layers=hp.get("drift_layers", 3), latent_dim=d, key=kd)
     g_cur = hp["g_init"]
 
     sched = optax.exponential_decay(hp["lr"], transition_steps=1, decay_rate=hp["sched_gamma"])

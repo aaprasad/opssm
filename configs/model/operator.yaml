@@ -3,11 +3,15 @@ data_size: 1
 gru_hidden: 64
 ctx_dim: 64
 p: 64
+branch_hidden: 128        # branch MLP hidden width (context+time -> basis coeffs)
+trunk_hidden: 64          # trunk MLP hidden width (latent z -> state basis)
+trunk_layers: 3           # trunk MLP depth (# hidden layers)
 encoder: gru              # context encoder: gru | tcn | transformer | mamba | deer_gru | rno (registry key,
                           #   opssm/models/encoders.py). gru = default, byte-identical. ALL must be CAUSAL
                           #   (ctx_t <- y_{0:t}); the backward smoother twin flips it generically.
 encoder_kwargs: {}        # per-encoder overrides, e.g. {n_layers: 4, kernel: 2} / {n_heads: 4} / {n_modes: [1]}
 drift_hidden: 64
+drift_layers: 3           # drift MLP depth (# hidden layers)
 lr: 2e-3
 drift_lr: 2e-3
 sched_gamma: 0.9998
