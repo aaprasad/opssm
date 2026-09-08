@@ -7,9 +7,11 @@ torch-free (opssm.data.*.refs) -- no bridged .npz on disk. Per run it writes, in
   - metrics.csv      per-validation-step trajectory
   - result.json      final eval (whole-trace recon) + resolved hparams   (no figures are written)
 
-Single run:
+Single run (Kato):
     python scripts/train_jax.py experiment=kato data.mat_path=.../WT_NoStim.mat data.worm=0 \
         model.data_size=109 train_dir=dump/kato_nostim0 backend=jax
+Single run (synthetic -- data generated in memory, no npz needed; optionally +data.npz_path=... to load one):
+    python scripts/train_jax.py experiment=em_lorenz backend=jax train_dir=dump/lorenz0
 
 Grid search on SLURM (one job array across all partitions, preemptible/requeue -- tasks resume on requeue):
     python scripts/train_jax.py -m hydra/launcher=submitit_slurm backend=jax experiment=kato \
@@ -25,7 +27,11 @@ from omegaconf import OmegaConf
 
 
 def _build_data(cfg):
-    """Torch-free in-memory data build (dispatch by dataset). Returns the bridge-shaped dict of numpy arrays."""
+    """Torch-free in-memory data build (dispatch by dataset). Returns the bridge-shaped dict of numpy arrays.
+    Kato -> build_kato_data. Synthetic -> a pre-bridged npz (data.npz_path, if given AND present) else
+    generated in memory (opssm.data.synth_refs, numpy -- same generative model as the torch datamodule's
+    linear-sensor branches, just not saved). d==1 (em_highd) includes the exact grid oracle -> kl; d>=2
+    (vdp/lorenz) has no grid oracle (O(N^d)) -> no kl, as in the torch datamodule."""
     d = cfg.data
     if "mat_path" in d:                                              # Kato (real neural data)
         from opssm.data.kato.refs import build_kato_data
@@ -35,8 +41,12 @@ def _build_data(cfg):
                                subsample=int(d.get("subsample", 1)), latent_dim=int(d.latent_dim),
                                a=float(d.get("a", 1.0)), sigma=float(d.get("sigma", 0.1)),
                                system=str(d.get("system", "none")))
-    raise SystemExit(f"train_jax's in-memory loader currently supports Kato (data.mat_path) only; "
-                     f"system={cfg.data.get('system')!r}. For synthetic data, bridge to an npz + load_refs.")
+    npz_path = d.get("npz_path", None)                              # synthetic: pre-bridged npz if provided+present...
+    if npz_path and os.path.exists(str(npz_path)):
+        import numpy as np
+        return dict(np.load(str(npz_path), allow_pickle=True))
+    from opssm.data.synth_refs import build_synthetic_data          # ...else generate in memory (torch-free)
+    return build_synthetic_data(d, seed=int(d.get("seed", cfg.get("seed", 0))))
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
