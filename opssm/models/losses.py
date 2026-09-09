@@ -65,7 +65,7 @@ def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_pri
         predict (PINN):  d_tau ell = -(f' + f d_z ell) + 1/2 g^2 ((d_z ell)^2 + d2_z ell)
         update  (jump):  pi_{i+1}(.,0) = normalize( lik_{i+1} * pi_i(.,dt) )   [SNIS]
         anchor  (IC):    pi_0(.,0)     = normalize( lik_0 * prior )            [SNIS]
-    ell_i(z,s) = b(c_i,s).trunk(z); d_z ell = b.d_z tau, d_s ell = (d_s b).tau, all exact
+    ell_i(z,s) = b(c_i,s).state_basis(z); d_z ell = b.d_z tau, d_s ell = (d_s b).tau, all exact
     autodiff (jvp). pi(.,s) is SNIS weights W = softmax(ell - log_q). d_tau = d_s/dt.
     The recursion/SNIS terms use only the cheap basis tau (a forward, no autodiff) at ALL
     steps; the costly per-sample Jacobians (d_z, d2_z, d_s) for the FP residual are taken
@@ -75,7 +75,7 @@ def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_pri
     ctx = model.context(xs, mask)                                  # (T,B,C)
 
     # ---- cheap path (no autodiff): basis at all steps; coeffs at the interval ends s=0,1
-    tau = model.trunk(z_col.reshape(-1, d)).reshape(T, B, K, -1)   # (T,B,K,p)
+    tau = model.state_basis(z_col.reshape(-1, d)).reshape(T, B, K, -1)   # (T,B,K,p)
     b_ends = model.coeffs(ctx, torch.tensor([0.0, 1.0], device=z_col.device))   # (T,B,2,p)
     ell0 = torch.einsum("tbp,tbkp->tbk", b_ends[:, :, 0], tau) + model.bias   # post-update (s=0)
 
@@ -194,7 +194,7 @@ def pinn_adjoint_loss(model_b, xs, mask, z_col, log_q, s_coll, drift, sigma,
     alpha_t * msg_t / lik_t (see mstep.log_smoothed)."""
     T, B, K, d = z_col.shape
     ctx = model_b.context(xs, mask)                                # (T,B,C) anti-causal
-    tau = model_b.trunk(z_col.reshape(-1, d)).reshape(T, B, K, -1)  # (T,B,K,p)
+    tau = model_b.state_basis(z_col.reshape(-1, d)).reshape(T, B, K, -1)  # (T,B,K,p)
     b_ends = model_b.coeffs(ctx, torch.tensor([0.0, 1.0], device=z_col.device))   # (T,B,2,p)
     lmsg0 = torch.einsum("tbp,tbkp->tbk", b_ends[:, :, 0], tau) + model_b.bias     # (T,B,K) msg, s=0
 

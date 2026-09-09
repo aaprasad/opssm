@@ -186,16 +186,19 @@ def _save_ckpt(ckpt_dir, arrays, step, g_cur, key, history, name="ckpt", best_me
     eqx.tree_serialise_leaves(eqx_f + ".tmp", arrays)
     with open(pkl_f + ".tmp", "wb") as f:
         pickle.dump({"step": int(step), "g_cur": float(g_cur), "key": np.asarray(key),
-                     "history": history, "best_metric": best_metric}, f)
+                     "history": history, "best_metric": best_metric,
+                     "tail_std": arrays[0].tail_std}, f)
     os.replace(eqx_f + ".tmp", eqx_f)
     os.replace(pkl_f + ".tmp", pkl_f)
 
 
 def _load_ckpt(ckpt_dir, arrays_skeleton, name="ckpt"):
     eqx_f, pkl_f = _ckpt_files(ckpt_dir, name)
-    arrays = eqx.tree_deserialise_leaves(eqx_f, arrays_skeleton)
     with open(pkl_f, "rb") as f:
         meta = pickle.load(f)
+    if meta.get("tail_std", 0.0) != arrays_skeleton[0].tail_std:
+        raise ValueError("Checkpoint tail_std differs from this run; use a new output directory for a tail ablation")
+    arrays = eqx.tree_deserialise_leaves(eqx_f, arrays_skeleton)
     return arrays, meta
 
 
@@ -241,7 +244,7 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
 
     op = OperatorFilter(D_obs, hp["gru_hidden"], hp["ctx_dim"], hp["p"], latent_dim=d, key=ko,
                         branch_hidden=hp.get("branch_hidden", 128), trunk_hidden=hp.get("trunk_hidden", 64),
-                        trunk_layers=hp.get("trunk_layers", 3))
+                        trunk_layers=hp.get("trunk_layers", 3), tail_std=hp.get("tail_std", 0.0))
     full_obs = refs["full_obs"]
     ybar = full_obs.reshape(-1, D_obs).mean(0)
     d_cur = ybar

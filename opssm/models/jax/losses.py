@@ -61,7 +61,7 @@ def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_pri
     ctx = model.context(xs, mask)                               # (T,B,C)
 
     # ---- cheap path (no autodiff): basis at all steps; coeffs at the interval ends s=0,1
-    tau = model.trunk(z_col.reshape(-1, d)).reshape(T, B, K, -1)   # (T,B,K,p)
+    tau = model.state_basis(z_col.reshape(-1, d)).reshape(T, B, K, -1)   # (T,B,K,p)
     b_ends = model.coeffs(ctx, jnp.asarray([0.0, 1.0], dtype=z_col.dtype))   # (T,B,2,p)
     ell0 = jnp.einsum("tbp,tbkp->tbk", b_ends[:, :, 0], tau) + model.bias   # post-update (s=0)
 

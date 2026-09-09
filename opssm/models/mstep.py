@@ -72,7 +72,7 @@ def posterior_mean_fixed(model, x, mask, center, n_samples, near_std, broad_std)
     z, log_q = _fixed_nodes(center, mask, n_samples, near_std, broad_std)   # (T,B,K,d)
     ctx = model.context(x, mask)
     b0 = model.coeffs(ctx, torch.zeros(1, device=z.device))[:, :, 0]  # (T,B,p) at s=0
-    tau = model.trunk(z)                                           # (T,B,K,p)  (z already (...,d))
+    tau = model.state_basis(z)                                           # (T,B,K,p)  (z already (...,d))
     ell = torch.einsum("tbp,tbkp->tbk", b0, tau) + model.bias       # (T,B,K)
     w = torch.softmax(ell - log_q, dim=-1)                          # SNIS weights
     ess = 1.0 / (w.pow(2).sum(-1) * z.shape[2])                     # (T,B) fraction (K = z.shape[2])
@@ -175,8 +175,8 @@ def smoother_mean_fixed(model, model_b, x, mask, center, n_samples, near_std, br
     dev = z.device
     ctx_f = model.context(x, mask)
     ctx_b = model_b.context(x, mask)
-    tau_f = model.trunk(z)                                          # (T,B,K,p) forward basis on nodes
-    tau_b = model_b.trunk(z)                                        # (T,B,K,p) backward basis (own weights)
+    tau_f = model.state_basis(z)                                          # (T,B,K,p) forward basis on nodes
+    tau_b = model_b.state_basis(z)                                        # (T,B,K,p) backward basis (own weights)
     b1_f = model.coeffs(ctx_f, torch.ones(1, device=dev))[:, :, 0]  # (T,B,p) forward s=1 coeffs
     log_pred = torch.empty(z.shape[:3], device=dev)                # (T,B,K)
     log_pred[0] = -0.5 * z[0].pow(2).sum(-1)                       # predict_0 = prior N(0,I) on node_0
@@ -210,8 +210,8 @@ def smoother_pair_fixed(model, model_b, x, mask, center, drift_net, g_cur, dt,
     ctx_f = model.context(x, mask); ctx_b = model_b.context(x, mask)
     b0_f = model.coeffs(ctx_f, torch.zeros(1, device=dev))[:, :, 0]        # (T,B,p) forward s=0
     b0_b = model_b.coeffs(ctx_b, torch.zeros(1, device=dev))[:, :, 0]      # (T,B,p) backward s=0
-    l_alpha = torch.einsum("tbp,tbkp->tbk", b0_f[:-1], model.trunk(zt)) + model.bias
-    l_msg1 = torch.einsum("tbp,tbkp->tbk", b0_b[1:], model_b.trunk(zt1)) + model_b.bias
+    l_alpha = torch.einsum("tbp,tbkp->tbk", b0_f[:-1], model.state_basis(zt)) + model.bias
+    l_msg1 = torch.einsum("tbp,tbkp->tbk", b0_b[1:], model_b.state_basis(zt1)) + model_b.bias
     W = torch.softmax((l_alpha - log_q[:-1]) + l_msg1, dim=-1)             # (T-1,B,K)
     return zt, zt1, W
 
@@ -237,7 +237,7 @@ def filter_pair_fixed(model, x, mask, center, drift_net, g_cur, dt,
     zt, zt1 = z[:-1], z_next[:-1]                                          # pair (t, t+1) samples
     ctx_f = model.context(x, mask)
     b0_f = model.coeffs(ctx_f, torch.zeros(1, device=dev))[:, :, 0]        # (T,B,p) forward s=0
-    l_alpha = torch.einsum("tbp,tbkp->tbk", b0_f[:-1], model.trunk(zt)) + model.bias
+    l_alpha = torch.einsum("tbp,tbkp->tbk", b0_f[:-1], model.state_basis(zt)) + model.bias
     xnext = x[1:]                                                          # obs at t+1 (T-1,B,D)
     if decode is None:                                                    # direct obs h(z)=z (D=d)
         loglik = -0.5 * ((xnext.unsqueeze(2) - zt1) ** 2).sum(-1) / noise_std ** 2   # (T-1,B,K)
