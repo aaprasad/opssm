@@ -45,14 +45,19 @@ class OperatorFilter(nn.Module):
 
     def __init__(self, data_size=1, gru_hidden=64, ctx_dim=64, p=64,
                  branch_hidden=128, trunk_hidden=64, trunk_layers=3,
-                 encoder="gru", encoder_kwargs=None, reverse=False, latent_dim=1, tail_std=0.0):
+                 encoder="gru", encoder_kwargs=None, reverse=False, latent_dim=1, tail_std=0.0,
+                 trunk_activation='tanh'):
         super().__init__()
         self.latent_dim = latent_dim                                 # d: LATENT dim (separate from data_size = obs dim)
         if not math.isfinite(tail_std) or tail_std < 0:
-            raise ValueError("tail_std must be finite and nonnegative (0 selects the legacy density)")
+            raise ValueError("tail_std must be finite and nonnegative (0 disables the fixed tail)")
         if tail_std > 0 and trunk_layers < 1:
-            raise ValueError("Gaussian tails require at least one bounded tanh trunk layer")
+            raise ValueError("Gaussian tails require at least one trunk hidden layer")
         self.tail_std = float(tail_std)
+        activations = {'tanh': nn.Tanh, 'softplus': nn.Softplus}
+        if trunk_activation not in activations:
+            raise ValueError('trunk_activation must be tanh or softplus')
+        self.trunk_activation = trunk_activation
         # CAUSAL context encoder: packs [obs (zeroed where missing), observed-mask] -> (T,B,ctx_dim), so it
         # knows when to update vs predict-only through a gap. Pluggable (encoder=gru|tcn|transformer|...);
         # built FIRST so the default gru keeps the original init RNG order (byte-identical). `gru_hidden`
@@ -61,14 +66,16 @@ class OperatorFilter(nn.Module):
         self.encoder = make_encoder(encoder, data_size + 1, ctx_dim, **enc_kwargs)
         self.reverse = reverse                                       # True = anti-causal (backward twin)
         self.branch = mlp([ctx_dim + 1, branch_hidden, p])           # (context, time) -> coeffs
-        self.trunk = mlp([latent_dim] + [trunk_hidden] * trunk_layers + [p])  # query z (d) -> state basis
+        self.trunk = mlp([latent_dim] + [trunk_hidden] * trunk_layers + [p],
+                         act=activations[trunk_activation])  # query z (d) -> state basis
         self.bias = nn.Parameter(torch.zeros(()))
 
     def state_basis(self, z):
-        """Learned bounded basis, optionally augmented by -|z|²/(2 tail_std²).
+        """Learned basis, optionally augmented by -|z|²/(2 tail_std²).
 
         The extra feature has a fixed coefficient of one. Thus exp(ell) is integrable on R^d
-        for every context, while the neural residual can still represent multiple modes. Keeping
+        for every context (tanh is bounded; softplus grows at most linearly), while the neural
+        residual can still represent multiple modes. Keeping
         this outside the MLP preserves parameter names and shapes for existing checkpoints.
         All density consumers must use this basis, including losses, samplers and readouts.
         """

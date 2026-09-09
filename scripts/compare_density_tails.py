@@ -33,6 +33,7 @@ def main():
     parser.add_argument('--steps', type=int, default=1000)
     parser.add_argument('--seeds', type=int, nargs='+', default=[0, 1, 2])
     parser.add_argument('--tail-stds', type=float, nargs='+', default=[0., 2.])
+    parser.add_argument('--trunk-activation', choices=['tanh', 'softplus'], default='tanh')
     parser.add_argument('--learn-dynamics', action='store_true')
     parser.add_argument('--warmup', type=int, default=1000)
     parser.add_argument('--m-every', type=int, default=500)
@@ -119,6 +120,7 @@ def main():
         return out
 
     report = dict(settings=dict(steps=args.steps, seeds=args.seeds, tail_stds=args.tail_stds,
+                  trunk_activation=args.trunk_activation,
                   backend=jax.default_backend(), devices=devices,
                   data_seed=123, dt=dt, sigma=sigma, noise=noise, T=T, B=B, nval=nval,
                   w_res=.2, n_colloc=64, n_tcoll=12, n_scoll=3, width=32, lr=.002,
@@ -133,6 +135,7 @@ def main():
         for tail_std in args.tail_stds:
             model = OperatorFilter(gru_hidden=32, ctx_dim=32, p=32, branch_hidden=32,
                                    trunk_hidden=32, trunk_layers=2, tail_std=tail_std,
+                                   trunk_activation=args.trunk_activation,
                                    key=jax.random.PRNGKey(seed))
             state = opt.init(eqx.filter(model, eqx.is_inexact_array))
             drift_net = DriftNet(32, layers=2, key=jax.random.fold_in(jax.random.PRNGKey(seed), 17))

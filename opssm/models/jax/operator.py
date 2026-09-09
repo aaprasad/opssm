@@ -100,25 +100,28 @@ class OperatorFilter(eqx.Module):
 
     def __init__(self, data_size=1, gru_hidden=64, ctx_dim=64, p=64, branch_hidden=128,
                  trunk_hidden=64, trunk_layers=3, latent_dim=1, reverse=False, key=None, submodules=None,
-                 tail_std=0.0):
+                 tail_std=0.0, trunk_activation='tanh'):
         self.reverse = reverse
         self.latent_dim = latent_dim
         if not math.isfinite(tail_std) or tail_std < 0:
-            raise ValueError("tail_std must be finite and nonnegative (0 selects the legacy density)")
+            raise ValueError("tail_std must be finite and nonnegative (0 disables the fixed tail)")
         if tail_std > 0 and trunk_layers < 1:
-            raise ValueError("Gaussian tails require at least one bounded tanh trunk layer")
+            raise ValueError("Gaussian tails require at least one trunk hidden layer")
         self.tail_std = float(tail_std)
         if submodules is not None:                               # weight-transfer/parity path
             self.encoder, self.branch, self.trunk, self.bias = submodules
+            if self.trunk.activation != trunk_activation:
+                raise ValueError('Transferred trunk activation differs from trunk_activation')
             return
         k1, k2, k3 = jax.random.split(key, 3)
         self.encoder = GRUEncoder(data_size + 1, ctx_dim, gru_hidden, key=k1)
         self.branch = MLP([ctx_dim + 1, branch_hidden, p], k2)
-        self.trunk = MLP([latent_dim] + [trunk_hidden] * trunk_layers + [p], k3)
+        self.trunk = MLP([latent_dim] + [trunk_hidden] * trunk_layers + [p], k3,
+                         activation=trunk_activation)
         self.bias = jnp.zeros(())
 
     def state_basis(self, z):
-        """Bounded learned features plus an optional Gaussian tail with fixed coefficient one.
+        """Learned features plus an optional Gaussian tail with fixed coefficient one.
 
         Mirrors the Torch state_basis; derivatives and every density readout use this same basis.
         No additional parameter leaves, so existing weights can be reused for controlled ablations.

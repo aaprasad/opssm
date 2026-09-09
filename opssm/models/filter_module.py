@@ -67,7 +67,7 @@ class ZakaiFilterModule(pl.LightningModule):
                  encoder="gru", encoder_kwargs=None,
                  mean_method="mala", mala_chains=64, mala_steps=30, mala_rng="stochastic",
                  anim_posterior=False, plot_samples=False, latent_dim=1, loss="zakai", train_dir="./dump/nzf",
-                 tail_std=0.0):
+                 tail_std=0.0, trunk_activation='tanh'):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
@@ -76,11 +76,11 @@ class ZakaiFilterModule(pl.LightningModule):
                                     branch_hidden=h.branch_hidden, trunk_hidden=h.trunk_hidden,
                                     trunk_layers=h.trunk_layers,
                                     encoder=h.encoder, encoder_kwargs=h.encoder_kwargs, latent_dim=h.latent_dim,
-                                    tail_std=h.tail_std)
+                                    tail_std=h.tail_std, trunk_activation=h.trunk_activation)
         # backward adjoint-Zakai twin for the two-filter smoother (default off => byte-identical filter)
         self.model_b = OperatorBackward(h.data_size, h.gru_hidden, h.ctx_dim, h.p,
                                         branch_hidden=h.branch_hidden, trunk_hidden=h.trunk_hidden,
-                                        trunk_layers=h.trunk_layers,
+                                        trunk_layers=h.trunk_layers, trunk_activation=h.trunk_activation,
                                         encoder=h.encoder, encoder_kwargs=h.encoder_kwargs, latent_dim=h.latent_dim) \
             if h.learn_smoother else None
         self.drift_net = DriftNet(h.drift_hidden, layers=h.drift_layers, latent_dim=h.latent_dim)

@@ -125,6 +125,55 @@ The finite-grid and oracle limitations above also apply here. All six runs compl
 finite logged losses and final scalar metrics. Results, checkpoints, CSV and plots are saved under
 `dump/density_tails_em_gpu/` (ignored by Git).
 
+## Softplus activation comparison
+
+`model.trunk_activation=softplus model.tail_std=0.0` replaces every hidden tanh in the state-basis
+trunk with softplus, leaving the output layer linear. The branch, GRU and drift network retain their
+original activations. This option is supported by both backends; tanh remains the default. Parameter
+shapes and initialization draws are unchanged. Torch saves the choice in Lightning hyperparameters;
+JAX saves it in checkpoint metadata and rejects a resume with a different activation. Missing metadata
+in older JAX checkpoints means tanh.
+
+Softplus is smooth and unbounded, allowing log-density tails that decrease without a fixed Gaussian
+term. The learned coefficients still determine whether both tails decrease; the activation alone
+does not guarantee normalizability. A Gaussian term can also be combined with softplus, since the
+quadratic dominates its at-most-linear growth, but that combination was not tested in this ablation.
+
+```bash
+JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONPATH=. \
+  python scripts/compare_density_tails.py --learn-dynamics --steps 6000 --seeds 0 1 2 \
+  --tail-stds 0 --trunk-activation softplus --out dump/softplus_em_gpu
+JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false MPLBACKEND=Agg PYTHONPATH=. \
+  python scripts/plot_density_tails_em.py dump/softplus_em_gpu/results.json \
+  --compare-results dump/density_tails_em_gpu/results.json
+```
+
+Three softplus runs completed on the RTX 5090 with the same data, seeds, learning rates and EM schedule
+as the learned-dynamics comparison. The table reuses the matched tanh baseline above; neither column
+uses the Gaussian term. Means over the three initialization seeds:
+
+| Metric | Tanh | Softplus |
+|---|---:|---:|
+| Grid filtering KL | 0.04520 | 0.05002 |
+| Grid KL during the gap | 0.07989 | 0.09978 |
+| Latent RMSE against simulated paths | 0.16918 | 0.16893 |
+| Relative drift RMSE | 0.86578 | 0.85014 |
+| Learned diffusion g (true: 0.6) | 0.47326 | 0.48286 |
+| MALA mean RMSE against model's grid mean | 0.14641 | 0.00350 |
+
+Softplus improves MALA/grid agreement about 98%, also outperforming the Gaussian-tail variant on this
+diagnostic (0.02010). Latent RMSE is essentially unchanged. Drift error improves about 2%, and diffusion
+is slightly closer to truth but remains underestimated. Filtering KL worsens about 11%, and gap KL
+about 25%. This supports the activation swap as a way to improve sampling in this experiment, without
+establishing a substantial improvement in dynamics recovery. It remains a small, shared-data comparison
+with a known sensor; sampler/grid agreement does not prove global normalizability.
+
+All three runs completed ten M-steps with finite logged losses and final scalar metrics. Analytic
+softplus value/gradient/Laplacian checks, differentiable PINN losses and checkpoint compatibility pass
+in the backend tests. The JAX analytic tests request full-precision GPU matrix multiplication to meet
+their existing 1e-6 tolerances; the experiments use the same default precision as the earlier GPU runs.
+Raw results, weights and comparison plots are in `dump/softplus_em_gpu/` (ignored by Git).
+
 ## Verification
 
 In their respective backend environments:

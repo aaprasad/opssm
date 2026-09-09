@@ -1,6 +1,6 @@
 """JAX/equinox NN primitive -- mirror of opssm.models.nn (torch).
 
-Batch-native tanh MLP: Linear-Tanh-...-Linear with NO activation on the last layer, exactly like
+Batch-native MLP (tanh by default), with NO activation on the last layer, exactly like
 `opssm.models.nn.mlp`. Params are stored as weight/bias lists (a clean pytree for optax + trivial
 torch weight-transfer via the `weights=`/`biases=` constructor path used by the parity harness).
 Weight convention matches torch nn.Linear: W is (out, in), and forward is `x @ W.T + b`.
@@ -13,8 +13,12 @@ import equinox as eqx
 class MLP(eqx.Module):
     weights: list
     biases: list
+    activation: str = eqx.field(static=True)
 
-    def __init__(self, sizes=None, key=None, zero_last=False, weights=None, biases=None):
+    def __init__(self, sizes=None, key=None, zero_last=False, weights=None, biases=None, activation='tanh'):
+        if activation not in ('tanh', 'softplus'):
+            raise ValueError('activation must be tanh or softplus')
+        self.activation = activation
         if weights is not None:                                   # build from given arrays (weight-transfer/parity)
             self.weights = [jnp.asarray(w) for w in weights]
             self.biases = [jnp.asarray(b) for b in biases]
@@ -34,5 +38,5 @@ class MLP(eqx.Module):
         for i, (W, b) in enumerate(zip(self.weights, self.biases)):
             x = x @ W.T + b
             if i < len(self.weights) - 1:
-                x = jnp.tanh(x)
+                x = jnp.tanh(x) if self.activation == 'tanh' else jax.nn.softplus(x)
         return x

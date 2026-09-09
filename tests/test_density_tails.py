@@ -16,13 +16,38 @@ from opssm.models.mstep import (
 from opssm.models.dynamics import DriftNet
 
 
-def operator(d=1, tail_std=0.0, backward=False):
+def operator(d=1, tail_std=0.0, backward=False, trunk_activation='tanh'):
     cls = OperatorBackward if backward else OperatorFilter
     return cls(data_size=d, latent_dim=d, gru_hidden=8, ctx_dim=8, p=8,
-               branch_hidden=8, trunk_hidden=8, trunk_layers=1, tail_std=tail_std).double()
+               branch_hidden=8, trunk_hidden=8, trunk_layers=1, tail_std=tail_std,
+               trunk_activation=trunk_activation).double()
 
 
 class DensityTailsTest(unittest.TestCase):
+    def test_softplus_unbounded_basis_and_pde_derivatives(self):
+        model = operator(trunk_activation='softplus')
+        # Construct -softplus(z)-softplus(-z), whose value, score and curvature are known.
+        with torch.no_grad():
+            for p in model.trunk.parameters():
+                p.zero_()
+            model.trunk[0].weight[0, 0] = 1.
+            model.trunk[0].weight[1, 0] = -1.
+            model.trunk[2].weight[0, :2] = -1.
+        z = torch.tensor([[-100.], [-2.], [0.], [2.], [100.]])
+        tau, grad, lap = model.trunk_zderivs(z)
+        torch.testing.assert_close(tau[:, 0], -torch.logaddexp(z[:, 0], torch.zeros(5))
+                                   - torch.logaddexp(-z[:, 0], torch.zeros(5)))
+        torch.testing.assert_close(grad[:, 0, 0], -torch.tanh(z[:, 0]/2))
+        torch.testing.assert_close(lap[:, 0], -.5/torch.cosh(z[:, 0]/2).square())
+        nodes, logq = sample_collocation(self.x, self.mask, 16, .3, 1.6)
+        res, jump, ic, _ = pinn_zakai_loss(model, self.x, self.mask, nodes, logq,
+            torch.tensor([0., .5, 1.]), lambda z: (z-z**3, (1-3*z*z).sum(-1)),
+            .6, lambda z: -z.square().sum(-1)/2, .3, .1, res_mode='rel')
+        loss = res+jump+ic
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters()))
+
     def setUp(self):
         torch.manual_seed(4)
         self.old_dtype = torch.get_default_dtype()
