@@ -75,6 +75,56 @@ python scripts/train_jax.py backend=jax experiment=em_highd model.tail_std=2.0 \
 python scripts/train.py experiment=em_highd model.tail_std=2.0 train_dir=dump/torch_gaussian_tail
 ```
 
+## Learned-dynamics comparison
+
+The same harness can learn drift and scalar diffusion with the existing MALA/`det_mid` M-step while
+keeping the direct observation model fixed. This isolates dynamics learning from sensor identification.
+Ground-truth drift and diffusion are used for simulation and evaluation, not as training targets.
+
+```bash
+JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONPATH=. \
+  python scripts/compare_density_tails.py --learn-dynamics --steps 6000 --seeds 0 1 2 \
+  --tail-stds 0 2 --out dump/density_tails_em_gpu
+JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false MPLBACKEND=Agg PYTHONPATH=. \
+  python scripts/plot_density_tails_em.py dump/density_tails_em_gpu/results.json
+```
+
+Both variants start with zero drift and g=1.0, with no supervised warm start or bootstrap. After 1,000
+operator steps, the M-step runs every 500 steps with 200 drift-optimizer steps, learning rate 0.002,
+weight penalty 0.0003, and 64 MALA chains with 30 sweeps. Ten M-steps occur at steps 1,000 through 5,500;
+the final 500 operator steps let inference adjust to the final dynamics. All other data/architecture/loss
+settings match the controlled comparison above. M-step random keys are matched separately from E-step
+keys, so both variants receive identical random draws at corresponding updates.
+
+The report includes g, absolute diffusion error, drift RMSE and relative error evaluated at true held-out
+states with |z| <= 1.5, and latent RMSE against the actual simulated paths. The known direct sensor fixes
+the coordinates, so no affine alignment is used. Drift weights, operator weights, M-step histories and
+device information are saved with the results. Plotting writes PNG/PDF figures and a per-seed CSV table.
+
+Results on NVIDIA GeForce RTX 5090, 2026-09-09 (means over three initialization seeds):
+
+| Metric | Legacy | Gaussian tail, std=2 |
+|---|---:|---:|
+| Grid filtering KL | 0.04520 | 0.04409 |
+| Grid KL during the gap | 0.07989 | 0.08452 |
+| Latent RMSE against simulated paths | 0.16918 | 0.16872 |
+| Relative drift RMSE | 0.86578 | 0.83776 |
+| Learned diffusion g (true: 0.6) | 0.47326 | 0.47277 |
+| MALA mean RMSE against model's grid mean | 0.14641 | 0.02010 |
+
+The tail substantially improves sampler/grid agreement, but dynamics recovery improves only slightly:
+relative drift error drops about 3%, while diffusion remains about 21% below truth. Filtering KL improves
+about 2%, and gap KL worsens about 6%. Drift error improves in all three seeds; filtering KL improves in
+two of three. The learned drift curves still differ materially from the true double-well drift.
+
+These six runs establish that the tail works with learned dynamics, not that it solves parameter
+identification. They share one small dataset and a known sensor. The existing mean-based M-step still
+discards posterior uncertainty; testing an uncertainty-aware transition objective is a useful next
+experiment, although this comparison does not isolate the cause of the remaining parameter bias.
+The finite-grid and oracle limitations above also apply here. All six runs completed ten M-steps with
+finite logged losses and final scalar metrics. Results, checkpoints, CSV and plots are saved under
+`dump/density_tails_em_gpu/` (ignored by Git).
+
 ## Verification
 
 In their respective backend environments:
