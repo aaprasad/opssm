@@ -77,6 +77,10 @@ python scripts/train.py experiment=em_highd model.tail_std=2.0 train_dir=dump/to
 
 ## Learned-dynamics comparison
 
+This is a small custom ablation, not a reproduction of the established `em_highd` double-well
+benchmark (drift relative error 0.207). Its poor drift recovery limits conclusions about changes to
+that benchmark. See the benchmark audit below.
+
 The same harness can learn drift and scalar diffusion with the existing MALA/`det_mid` M-step while
 keeping the direct observation model fixed. This isolates dynamics learning from sensor identification.
 Ground-truth drift and diffusion are used for simulation and evaluation, not as training targets.
@@ -173,6 +177,42 @@ softplus value/gradient/Laplacian checks, differentiable PINN losses and checkpo
 in the backend tests. The JAX analytic tests request full-precision GPU matrix multiplication to meet
 their existing 1e-6 tolerances; the experiments use the same default precision as the earlier GPU runs.
 Raw results, weights and comparison plots are in `dump/softplus_em_gpu/` (ignored by Git).
+
+## Audit against the earlier 0.207 double-well result
+
+The earlier result is confirmed in `dump/dm_em_highd.log`: final step 14,000 reports `drift_rel=0.207`,
+`drift_rmse_aln=0.0908`, `g=0.611`, and `g_aln=0.549`. Its saved configuration is
+`outputs/2026-08-12/10-27-35/.hydra/config.yaml`; the corresponding implementation is in commit
+`fbe1f92`. The activation experiments changed much more than the activation relative to that run:
+
+| Setting | Earlier benchmark | Recent activation ablation |
+|---|---|---|
+| Backend | Torch | JAX |
+| Training / validation trajectories | 224 / 32 | 16 / 8 |
+| Time points per trajectory | 100 | 40 |
+| Sensor | Learned 10-D linear sensor, standardized | Fixed direct 1-D sensor |
+| Missing observations | None | Five-point gap |
+| Trunk / drift width and depth | 64, three hidden layers | 32, two hidden layers |
+| Operator training steps | 14,000, exponentially decaying LR | 6,000, constant LR |
+| FP residual weight | 0.4 | 0.2 |
+| M-step interval / inner steps | 2,000 / 400 | 500 / 200 |
+| Reported drift metric | Affine-aligned, evaluated at inferred means | Unaligned, evaluated at true states |
+
+The old run predates subspace initialization and bootstrap M-steps; those newer defaults must not be
+silently used when reproducing it. It used a random sensor initialization, zero initial drift, and a
+2,000-step warmup. Thus supervised or subspace initialization does not explain its better result.
+
+Rescoring all nine recent checkpoints with the earlier affine-aligned metric using grid posterior means
+gives mean relative drift errors **1.011 (tanh), 0.985 (tanh + Gaussian), and 1.015 (softplus)**.
+The metric change therefore does not explain away the poor recovery. The rescore uses the recent
+dataset and 401-point grid, not the old data/grid; it checks the metric definition, not benchmark parity.
+Per-seed rescoring is saved in `dump/softplus_em_gpu/metric_audit.json`.
+
+The activation comparisons remain matched to each other within the small experiment. They do not
+establish performance relative to the earlier 0.207 result, nor that the existing M-step inherently
+cannot recover double-well dynamics. Reproducing the original setup and then changing only the trunk
+activation is the appropriate benchmark comparison; the effects of data size, sensor, capacity and
+optimization have not been separated here.
 
 ## Verification
 
