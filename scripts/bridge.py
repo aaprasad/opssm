@@ -21,7 +21,8 @@ import torch
 import lightning.pytorch as pl
 from hydra.utils import instantiate
 
-HP_KEYS = ["data_size", "latent_dim", "gru_hidden", "ctx_dim", "p", "drift_hidden", "lr", "drift_lr",
+HP_KEYS = ["data_size", "latent_dim", "gru_hidden", "ctx_dim", "p", "branch_hidden", "trunk_hidden",
+           "trunk_layers", "drift_hidden", "drift_layers", "lr", "drift_lr",
            "sched_gamma", "n_scoll", "n_tcoll", "n_colloc", "near_std", "broad_std", "warmup", "m_every",
            "m_inner", "reg_lambda", "g_init", "w_res", "res_mode", "learn_obs", "learn_g", "c_stable_tol",
            "n_mean", "mean_method", "mala_chains", "mala_steps", "mala_rng", "drift_target",

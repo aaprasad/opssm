@@ -8,7 +8,10 @@ Validation: d==1 uses the grid (kl vs exact filter, drift_l2, grid mean); d>1 us
 filter mean (no grid). Both score the Procrustes gauge-aligned lat_rel / drift_rel / g_rel (+ kl_aln, d==1)
 and c_cos / recon_r2. Figures via opssm.models.jax.viz_jax (d=1 posterior panels, d=2/3 phase-space).
 """
+import os
+import csv
 import time
+import pickle
 
 import numpy as np
 import jax
@@ -165,9 +168,63 @@ def validate(op, drift_net, g_cur, C_cur, d_cur, refs, hp, key):
     return logs, m_op_full
 
 
-def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, timing=False):
+def _ckpt_files(ckpt_dir, name="ckpt"):
+    return os.path.join(ckpt_dir, f"{name}.eqx"), os.path.join(ckpt_dir, f"{name}.pkl")
+
+
+def _has_ckpt(ckpt_dir, name="ckpt"):
+    eqx_f, pkl_f = _ckpt_files(ckpt_dir, name)
+    return os.path.exists(eqx_f) and os.path.exists(pkl_f)
+
+
+def _save_ckpt(ckpt_dir, arrays, step, g_cur, key, history, name="ckpt", best_metric=None):
+    """Atomic checkpoint: array leaves (op/opt-states/drift/C/d) via equinox, scalars/step/key/history via
+    pickle. Write to .tmp then os.replace, so a preempt-kill mid-write can never corrupt the live checkpoint.
+    name='ckpt' is the rolling resume point (overwritten); name='best' is the best monitored metric so far."""
+    os.makedirs(ckpt_dir, exist_ok=True)
+    eqx_f, pkl_f = _ckpt_files(ckpt_dir, name)
+    eqx.tree_serialise_leaves(eqx_f + ".tmp", arrays)
+    with open(pkl_f + ".tmp", "wb") as f:
+        pickle.dump({"step": int(step), "g_cur": float(g_cur), "key": np.asarray(key),
+                     "history": history, "best_metric": best_metric}, f)
+    os.replace(eqx_f + ".tmp", eqx_f)
+    os.replace(pkl_f + ".tmp", pkl_f)
+
+
+def _load_ckpt(ckpt_dir, arrays_skeleton, name="ckpt"):
+    eqx_f, pkl_f = _ckpt_files(ckpt_dir, name)
+    arrays = eqx.tree_deserialise_leaves(eqx_f, arrays_skeleton)
+    with open(pkl_f, "rb") as f:
+        meta = pickle.load(f)
+    return arrays, meta
+
+
+def _write_metrics(ckpt_dir, history):
+    """Rewrite metrics.csv from the (resume-safe, checkpointed) history -- one row per validation step."""
+    if not history:
+        return
+    keys = []
+    for _, m in history:
+        for k in m:
+            if k not in keys:
+                keys.append(k)
+    tmp = os.path.join(ckpt_dir, "metrics.csv.tmp")
+    with open(tmp, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["step"] + keys)
+        for step, m in history:
+            w.writerow([step] + [m.get(k, "") for k in keys])
+    os.replace(tmp, os.path.join(ckpt_dir, "metrics.csv"))
+
+
+def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, timing=False,
+          ckpt_dir=None, ckpt_every=1000, resume=True, monitor="recon_r2", monitor_mode="max"):
     """Run EM training in JAX (any d). refs: bridged arrays (jnp) + 'true_drift'. Returns (state, history).
-    timing=True blocks each phase (block_until_ready) + records per-phase wall-clock into state['timing']."""
+    timing=True blocks each phase (block_until_ready) + records per-phase wall-clock into state['timing'].
+    ckpt_dir: if set, checkpoint the EM state every ckpt_every steps and, when resume, restart from
+    <ckpt_dir>/ckpt.* if present (skips the warmstart+bootstrap init). Preemption-safe via SLURM --requeue +
+    resume: we do NOT catch signals -- submitit bypasses SIGTERM and won't requeue non-checkpointable jobs, so
+    the requeue is SLURM's and we simply resume from the last periodic checkpoint on rerun."""
     t_train0 = time.perf_counter()
     tm = {"estep": [], "mstep": [], "val": [], "fig": []}
 
@@ -182,7 +239,9 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
     s_coll = jnp.linspace(0.0, 1.0, hp["n_scoll"])
     key, ko, kd, kw, kb, kc = jax.random.split(key, 6)
 
-    op = OperatorFilter(D_obs, hp["gru_hidden"], hp["ctx_dim"], hp["p"], latent_dim=d, key=ko)
+    op = OperatorFilter(D_obs, hp["gru_hidden"], hp["ctx_dim"], hp["p"], latent_dim=d, key=ko,
+                        branch_hidden=hp.get("branch_hidden", 128), trunk_hidden=hp.get("trunk_hidden", 64),
+                        trunk_layers=hp.get("trunk_layers", 3))
     full_obs = refs["full_obs"]
     ybar = full_obs.reshape(-1, D_obs).mean(0)
     d_cur = ybar
@@ -196,11 +255,7 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
         C_cur = Vt[:d].T
     else:                                                          # random Stiefel
         C_cur = jnp.linalg.qr(jax.random.normal(kc, (D_obs, d)))[0]
-    drift_net = DriftNet(hp["drift_hidden"], latent_dim=d, key=kd)
-    wmse = float("nan")
-    if hp.get("init_dynamics", True) and method in ("pca", "subspace"):   # warm-start drift to the init's linear A
-        A = A_init if A_init is not None else linear_dynamics(_zhat(full_obs, C_cur, d_cur), hp["dt"])
-        drift_net, wmse = warmstart_drift(drift_net, A, kw)
+    drift_net = DriftNet(hp["drift_hidden"], layers=hp.get("drift_layers", 3), latent_dim=d, key=kd)
     g_cur = hp["g_init"]
 
     sched = optax.exponential_decay(hp["lr"], transition_steps=1, decay_rate=hp["sched_gamma"])
@@ -208,15 +263,29 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
     op_opt_state = optim.init(eqx.filter(op, eqx.is_inexact_array))
     dr_opt = optax.adam(hp["drift_lr"])
     dr_state = dr_opt.init(eqx.filter(drift_net.net, eqx.is_inexact_array))
+    estep = make_estep(xs, mask, s_coll, optim, hp)
 
-    cstab0 = float("nan")
-    if hp.get("bootstrap_mstep", True):                           # one init-time M-step from the init projection
-        drift_net, dr_state, C_cur, d_cur, g_cur, info = _run_mstep(
-            op, xs, mask, drift_net, dr_opt, dr_state, C_cur, d_cur, g_cur, hp, kb, bootstrap=True)
-        cstab0 = info["cstab"]
-    _block(eqx.filter(drift_net, eqx.is_inexact_array))
-    init_s = time.perf_counter() - t_train0                       # init + warmstart + bootstrap (+ their compiles)
-    log_fn(f"[init] d={d} method={method} warmstart_mse={wmse:.4f} bootstrap cstab={cstab0:.4f} g={g_cur:.4f}")
+    history, best_metric = [], None
+    arrays = (op, op_opt_state, drift_net, dr_state, C_cur, d_cur)   # skeleton for (de)serialisation
+    if ckpt_dir is not None and resume and _has_ckpt(ckpt_dir):    # RESUME: restore state, skip warmstart+bootstrap
+        (op, op_opt_state, drift_net, dr_state, C_cur, d_cur), meta = _load_ckpt(ckpt_dir, arrays)
+        g_cur, key, start_step, history = meta["g_cur"], jnp.asarray(meta["key"]), meta["step"], meta["history"]
+        best_metric = meta.get("best_metric")
+        log_fn(f"[resume] {_ckpt_files(ckpt_dir)[0]} at step {start_step} (g={g_cur:.4f})")
+    else:                                                          # FRESH: warm-start drift + bootstrap M-step
+        wmse = float("nan")
+        if hp.get("init_dynamics", True) and method in ("pca", "subspace"):   # warm-start drift to init's linear A
+            A = A_init if A_init is not None else linear_dynamics(_zhat(full_obs, C_cur, d_cur), hp["dt"])
+            drift_net, wmse = warmstart_drift(drift_net, A, kw)
+        cstab0 = float("nan")
+        if hp.get("bootstrap_mstep", True):                       # one init-time M-step from the init projection
+            drift_net, dr_state, C_cur, d_cur, g_cur, info = _run_mstep(
+                op, xs, mask, drift_net, dr_opt, dr_state, C_cur, d_cur, g_cur, hp, kb, bootstrap=True)
+            cstab0 = info["cstab"]
+        _block(eqx.filter(drift_net, eqx.is_inexact_array))
+        log_fn(f"[init] d={d} method={method} warmstart_mse={wmse:.4f} bootstrap cstab={cstab0:.4f} g={g_cur:.4f}")
+        start_step = 0
+    init_s = time.perf_counter() - t_train0                       # init/resume time (+ any compiles)
 
     _plot = None
     if fig_dir is not None:
@@ -234,13 +303,14 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
             tm["fig"].append(time.perf_counter() - tf)
         return m
 
-    estep = make_estep(xs, mask, s_coll, optim, hp)
-    history = []
-    m0 = _validate_and_plot(0)
-    log_fn(f"[step 0] " + " ".join(f"{k}={v:.4f}" for k, v in m0.items()))
-    history.append((0, m0))
+    if start_step == 0:                                           # fresh run: record the step-0 baseline
+        m0 = _validate_and_plot(0)
+        log_fn(f"[step 0] " + " ".join(f"{k}={v:.4f}" for k, v in m0.items()))
+        history.append((0, m0))
+        if ckpt_dir is not None:
+            _write_metrics(ckpt_dir, history)
 
-    for step in range(1, n_steps + 1):
+    for step in range(start_step + 1, n_steps + 1):
         key, sk = jax.random.split(key)
         te = time.perf_counter()
         op, op_opt_state, aux = estep(op, op_opt_state, drift_net, jnp.asarray(g_cur),
@@ -260,6 +330,19 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
             log_fn(f"[step {step}] res={res:.3f} jump={jump:.3f} ic={ic:.3f} | "
                    + " ".join(f"{k}={v:.4f}" for k, v in m.items()))
             history.append((step, m))
+            if ckpt_dir is not None:
+                _write_metrics(ckpt_dir, history)                 # metrics.csv trajectory (resume-safe)
+                mv = m.get(monitor)                               # save the BEST checkpoint on monitor improvement
+                if mv is not None and (best_metric is None
+                                       or (mv > best_metric if monitor_mode == "max" else mv < best_metric)):
+                    best_metric = mv
+                    _save_ckpt(ckpt_dir, (op, op_opt_state, drift_net, dr_state, C_cur, d_cur), step, g_cur,
+                               key, history, name="best", best_metric=best_metric)
+        # rolling resume checkpoint AFTER validation (history+key consistent at the boundary). No signal handler:
+        # SLURM --requeue reruns the same array task -> same run dir -> resume from here (loses <= ckpt_every steps).
+        if ckpt_dir is not None and (step % ckpt_every == 0 or step == n_steps):
+            _save_ckpt(ckpt_dir, (op, op_opt_state, drift_net, dr_state, C_cur, d_cur), step, g_cur, key,
+                       history, best_metric=best_metric)
     total_s = time.perf_counter() - t_train0
     report = _timing_report(tm, init_s, total_s, n_steps)
     if timing:
@@ -328,33 +411,43 @@ def whole_trace_recon(op, C_cur, d_cur, refs, hp, key):
     return float(r2), z_hat
 
 
-def load_refs(npz_path):
-    """Load bridged arrays (jnp) + hparams. Returns (refs, hp). refs['true_drift'] baked from the system."""
-    D = np.load(npz_path, allow_pickle=True)
+def _refs_from_mapping(D):
+    """Assemble (refs jnp, hp) from a mapping key->array -- a bridged npz (has .files) OR an in-memory dict.
+    Shared by load_refs (npz) and the torch-free in-memory loaders (opssm.data.*.refs). refs['true_drift']
+    is baked from the system name."""
+    files = set(D.files) if hasattr(D, "files") else set(D)
     keys = ["x_train", "mask_train", "x_val", "mask_val", "filt_val", "z_grid", "full_obs",
             "z_val_true", "C_true", "d_true", "ts"]
-    refs = {k: jnp.asarray(D[k]) for k in keys if k in D.files}
-    refs["a"] = float(D["a"]); refs["sigma"] = float(D["sigma"])
-    if "states_val" in D.files:                                   # Kato behavior labels (numpy, for figures)
+    refs = {k: jnp.asarray(D[k]) for k in keys if k in files}
+    refs["a"] = float(D["a"]) if "a" in files else 1.0
+    refs["sigma"] = float(D["sigma"]) if "sigma" in files else 0.1
+    if "states_val" in files:                                     # Kato behavior labels (numpy, for figures)
         refs["states_val"] = np.asarray(D["states_val"])
-        refs["state_names"] = list(D["state_names"]) if "state_names" in D.files else None
+        refs["state_names"] = list(D["state_names"]) if "state_names" in files else None
     for k in ("y_full_std", "states_full", "y_full_raw", "obs_mean"):   # Kato whole-trace recon + figure inputs
-        if k in D.files:
+        if k in files:
             refs[k] = np.asarray(D[k])
-    if "neuron_ids" in D.files:
+    if "neuron_ids" in files:
         refs["neuron_ids"] = list(D["neuron_ids"])
-    refs["obs_scale"] = float(D["obs_scale"]) if "obs_scale" in D.files else 1.0
-    if "name" in D.files:
+    refs["obs_scale"] = float(D["obs_scale"]) if "obs_scale" in files else 1.0
+    if "name" in files:
         refs["name"] = str(D["name"])
-    system = str(D["system"]) if "system" in D.files else "doublewell"
+    system = str(D["system"]) if "system" in files else "doublewell"
     refs["system"] = system
     refs["true_drift"] = make_drift(system)[0]
     hp = dict(DEFAULTS)
-    if "hparams" in D.files:                                      # per-experiment resolved hparams
-        hp.update({k: (v.item() if hasattr(v, "item") else v) for k, v in D["hparams"].item().items()})
+    if "hparams" in files:                                        # per-experiment resolved hparams
+        hpin = D["hparams"]
+        hpin = hpin.item() if hasattr(hpin, "item") else dict(hpin)
+        hp.update({k: (v.item() if hasattr(v, "item") else v) for k, v in hpin.items()})
     hp["system"] = system
     hp["dt"] = float(D["dt"]); hp["noise_std"] = float(D["noise_std_eff"])
     for k in ("window", "stride"):                                # Kato windowing (for whole-trace recon)
-        if k in D.files:
+        if k in files:
             hp[k] = int(D[k])
     return refs, hp
+
+
+def load_refs(npz_path):
+    """Load bridged arrays (jnp) + hparams from an npz. Returns (refs, hp)."""
+    return _refs_from_mapping(np.load(npz_path, allow_pickle=True))

@@ -1,0 +1,37 @@
+# @package hydra.sweeper
+# Random search over the JAX-backend hyperparameters (Optuna RandomSampler). Select under multirun:
+#   python scripts/train_jax.py -m hydra/sweeper=optuna_random hydra/launcher=submitit_slurm backend=jax \
+#       experiment=kato data.mat_path=.../WT_NoStim.mat data.worm=0 model.data_size=109
+# Objective = whole-trace recon_r2 returned by train_jax (maximized). Flip `sampler` to TPESampler for
+# Bayesian search once you have a batch of random results to seed it. Ranges are grounded in the defaults
+# that reach 0.844; widen/narrow as you learn. n_jobs matches the launcher's array_parallelism (one wave).
+_target_: hydra_plugins.hydra_optuna_sweeper.optuna_sweeper.OptunaSweeper
+sampler:
+  _target_: optuna.samplers.RandomSampler
+  seed: 0
+direction: maximize
+study_name: opssm_kato_random
+storage: null
+n_trials: 500
+n_jobs: 92
+search_space: null          # using the `params` DSL below instead of a structured search_space
+custom_search_space: null
+params:
+  model.w_res: interval(0.05, 0.7)
+  model.reg_lambda: tag(log, interval(1.0e-5, 3.0e-3))
+  model.m_every: choice(1000, 2000, 4000)
+  model.m_inner: choice(200, 400, 800)
+  model.drift_hidden: choice(32, 64, 128)
+  model.drift_layers: choice(2, 3, 4)
+  model.gru_hidden: choice(64, 128)
+  model.ctx_dim: choice(64, 128)
+  model.p: choice(64, 128, 256)
+  model.branch_hidden: choice(64, 128, 256)
+  model.trunk_hidden: choice(32, 64, 128)
+  model.trunk_layers: choice(2, 3, 4)
+  model.n_colloc: choice(64, 128, 256)
+  model.near_std: interval(0.15, 0.5)
+  model.broad_std: interval(1.0, 2.2)
+  model.init_method: choice(subspace, pca, random)
+  model.mala_chains: choice(32, 64, 128)
+  model.mala_steps: choice(20, 30, 50)

@@ -55,7 +55,8 @@ def _interp1d(vals, grid, query):
 
 
 class ZakaiFilterModule(pl.LightningModule):
-    def __init__(self, data_size=1, gru_hidden=64, ctx_dim=64, p=64, drift_hidden=64,
+    def __init__(self, data_size=1, gru_hidden=64, ctx_dim=64, p=64,
+                 branch_hidden=128, trunk_hidden=64, trunk_layers=3, drift_hidden=64, drift_layers=3,
                  lr=2e-3, drift_lr=2e-3, sched_gamma=0.9998,
                  n_scoll=4, n_tcoll=24, n_colloc=128, chunk_size=16, near_std=0.3, broad_std=1.6,
                  warmup=0, m_every=2000, m_inner=400, reg_lambda=3e-4, reg_lambda_g=3e-3,
@@ -71,15 +72,21 @@ class ZakaiFilterModule(pl.LightningModule):
         self.automatic_optimization = False
         h = self.hparams
         self.model = OperatorFilter(h.data_size, h.gru_hidden, h.ctx_dim, h.p,
+                                    branch_hidden=h.branch_hidden, trunk_hidden=h.trunk_hidden,
+                                    trunk_layers=h.trunk_layers,
                                     encoder=h.encoder, encoder_kwargs=h.encoder_kwargs, latent_dim=h.latent_dim)
         # backward adjoint-Zakai twin for the two-filter smoother (default off => byte-identical filter)
         self.model_b = OperatorBackward(h.data_size, h.gru_hidden, h.ctx_dim, h.p,
+                                        branch_hidden=h.branch_hidden, trunk_hidden=h.trunk_hidden,
+                                        trunk_layers=h.trunk_layers,
                                         encoder=h.encoder, encoder_kwargs=h.encoder_kwargs, latent_dim=h.latent_dim) \
             if h.learn_smoother else None
-        self.drift_net = DriftNet(h.drift_hidden, latent_dim=h.latent_dim); self.drift_net.requires_grad_(False)
+        self.drift_net = DriftNet(h.drift_hidden, layers=h.drift_layers, latent_dim=h.latent_dim)
+        self.drift_net.requires_grad_(False)
         self.diff_net = None
         if h.learn_g and h.g_net:
-            self.diff_net = DiffusionNet(h.drift_hidden, g_init=h.g_init, latent_dim=h.latent_dim)
+            self.diff_net = DiffusionNet(h.drift_hidden, layers=h.drift_layers, g_init=h.g_init,
+                                         latent_dim=h.latent_dim)
             self.diff_net.requires_grad_(False)
         # mutable EM state (initialized in setup once the data is known)
         self.g_cur = h.g_init
