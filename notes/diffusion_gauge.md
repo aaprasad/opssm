@@ -53,6 +53,30 @@ The det-based scalar is exact because it is GAUGE-COVARIANT: the Procrustes gaug
 `gscale = |det A|^(1/d) = |det M|^(-1/d)` and `det(Sigma_model)^(1/2d) = sigma |det M|^(1/d)` -- the two
 `det M` factors cancel identically, leaving `sigma`.
 
+## Confirmed in a TRAINED model (em_vdp, d=2)
+
+The gauge argument makes a falsifiable prediction: the learned `Sigma`'s anisotropy should equal the
+singular-value ratio of `C_true`, computable BEFORE any run. For `em_vdp`'s frozen dataset that sensor has
+singular values 1.96 / 1.69, so the prediction was **1.16**.
+
+A 14k-step `em_vdp` run with `diffusion_cov=true` converged to **g_aniso = 1.1442**.
+
+This is a genuine advance prediction, not a post-hoc fit, and it discriminates against the alternative
+explanation (that the anisotropy is absorbed DRIFT ERROR): there is no reason drift-error absorption would
+land on the sensor's singular-value ratio. Same run, paired against the baseline on identical data:
+
+| arm | drift_rel | lat_rel | g_rel | recon_r2 | g_aniso |
+|---|---|---|---|---|---|
+| base (scalar g) | 0.2269 | 0.0938 | 1.0117 | 0.9421 | - |
+| learned R only | 0.2351 | 0.0944 | 1.0139 | 0.9419 | - |
+| both | 0.2114 | 0.0921 | 1.0044 | 0.9423 | 1.1442 |
+
+CAVEATS: one seed; `drift_rel` is read off a degrading curve (0.1965 @2k -> 0.1526 @6k -> 0.2114 @14k), so
+the final value is noisy; and the covariance-ONLY arm had not yet run, so the attribution to the covariance
+(rather than to the interaction) is inferred from learned-R-alone being slightly worse, not measured.
+VdP is also a WEAK test by construction -- at anisotropy 1.16 the predicted scalar-g over-read is only 1.006.
+Lorenz (anisotropy 4.43, predicted over-read 1.327) is the discriminating case.
+
 ## Refinement of [[g-is-drift-limited]] (does NOT contradict it)
 
 `g_est^2 = g_true^2 + drift_rmse^2 dt` still holds in the MODEL frame; what that note calls `g_true^2` is
