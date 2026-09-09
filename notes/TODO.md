@@ -48,6 +48,25 @@ physics-`g` beat increment-`g`") vs the regression M-step. If it wins at d=1 (it
 d=3 (Lorenz) where the rotational-gauge question decides residual-only vs hybrid. Subsumes the deferred drift
 work (higher-order increment / finer dt below stay as complementary levers for the rotational part).
 
+## Port the E-step batch CHUNKING to the JAX backend (memory parity with torch)
+
+The torch E-step splits the batch and accumulates gradients per chunk (`losses.accumulate_pinn_grads`,
+`chunk_size=16`), so peak memory tracks the chunk, not the batch. The JAX `estep` (`models/jax/train.py`,
+`make_estep`) is ONE whole-batch `eqx.filter_jit` call with no equivalent. Consequence measured 2026-09-09
+on a 32 GB RTX 5090: **`experiment=em_lorenz` cannot run at its default config on the JAX backend at all** --
+the BASELINE arm (`diffusion_cov=false`, i.e. nothing exotic) dies with
+`RESOURCE_EXHAUSTED: ... allocate 22.00GiB` in `jit_estep`. `n_colloc=384 n_tcoll=24` OOMs;
+`n_colloc=256 n_tcoll=12` and below fit.
+
+So the two backends do NOT have the same reachable configuration space, and the published Lorenz settings
+are torch-only. That also silently biases any JAX grid search away from large `n_colloc` at d=3.
+
+Fix: chunk the JAX E-step over the batch axis and sum the gradients (a `lax.scan`/`fori_loop` over chunks
+accumulating into a grad pytree, or `jax.checkpoint` on the residual path). The residual is per-point and the
+recursion is per-trajectory -- both independent across the batch -- so the chunked result is EXACT, exactly as
+in torch. Cheap correctness check: chunked vs unchunked gradients must match to float tolerance on a small
+config.
+
 ## Fix the `nll` gradient detach (dormant; do before enabling Stage-3 NLL training)
 
 In `pinn_zakai_loss` the data-NLL is `logc = logsumexp(logW_pred + loglik)` with `logW_pred =
