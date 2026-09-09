@@ -79,10 +79,11 @@ def _linear_sensor(z, obs_dim, noise_std, c_scale, rng):
     return y.astype(np.float32), C.astype(np.float32), d_off.astype(np.float32)
 
 
-def _standardize(y, n_val, d_lat, noise_std):
+def _standardize(y, mask, n_val, d_lat, noise_std):
     """Per-dim MEAN + a single GLOBAL SIGNAL scalar (geo-mean of top-d_lat singular values / sqrt(N)) from
-    the TRAINING split (mask all-ones here). Mirrors DoubleWellDataModule._standardize_obs (s_scale removed)."""
-    yt = y[:, n_val:].reshape(-1, y.shape[-1])                    # training observed entries
+    the TRAINING split's OBSERVED entries. Mirrors DoubleWellDataModule._standardize_obs (s_scale removed)."""
+    obs = mask[:, n_val:, 0] > 0                                  # (T, B_train) observed training entries
+    yt = y[:, n_val:][obs]                                        # (N_obs, D)
     mean = yt.mean(0)
     sv = np.linalg.svd(yt - mean, compute_uv=False)
     scale = max(float(np.exp(np.log(sv[:d_lat]).mean()) / math.sqrt(yt.shape[0])), 1e-6)
@@ -95,11 +96,12 @@ def _softmax(x, axis):
     return e / (e.sum(axis, keepdims=True) + 1e-12)
 
 
-def _grid_filter_highd(y, z, a, sigma, noise_std, dt, n_sub, C, d):
+def _grid_filter_highd(y, z, a, sigma, noise_std, dt, n_sub, C, d, mask=None):
     """Exact 1-D grid filter p(z_t | y_{0:t}) -> filtered mass (T,B,Nz). numpy port of
     opssm.data.doublewell.oracle.grid_filter_highd (FORWARD pass only -- the d=1 kl uses the filter).
     Column-stochastic Euler-Maruyama transition (true drift) ^ n_sub, high-D Gaussian sensor likelihood
-    N(y; C z + d, noise^2 I). Runs on RAW y/C/d (obs-scale-invariant over z). C is (D,), z (Nz,)."""
+    N(y; C z + d, noise^2 I). mask (T,B): False/0 = no observation -> predict-only (skip the update), so the
+    d=1 kl target reflects the SAME missing pattern. Runs on RAW y/C/d (obs-scale-invariant). C (D,), z (Nz,)."""
     dt_sub = dt / n_sub
     f = a * (z - z ** 3)                                          # true drift on the grid
     mean = z + f * dt_sub
@@ -114,14 +116,38 @@ def _grid_filter_highd(y, z, a, sigma, noise_std, dt, n_sub, C, d):
     for i in range(Tn):
         ll = -inv2var * ((y[i][:, None, :] - hz[None, :, :]) ** 2).sum(-1)   # (B,Nz)
         w = np.exp(ll - ll.max(1, keepdims=True)) * pi           # update (stabilized)
+        if mask is not None:                                     # predict-only where unobserved
+            w = np.where(mask[i].reshape(-1, 1) > 0, w, pi)
         w = w / (w.sum(1, keepdims=True) + 1e-12)
         filt[i] = w
         pi = w @ K.T                                            # predict
     return filt
 
 
+def _window(arr, window_len, stride):
+    """(T,B,...) -> (window_len, n_win, ...): chop each trajectory into fixed-length windows on the batch
+    axis. n_win = B * (1 + (T-window_len)//stride). Bounds the E-step sequence length (memory) and gives a
+    fixed operator input shape regardless of trajectory length / obs_dt. window_len>=T is a no-op (one window)."""
+    T = arr.shape[0]
+    if window_len is None or window_len >= T:
+        return arr
+    starts = range(0, T - window_len + 1, stride)
+    return np.concatenate([arr[s:s + window_len] for s in starts], axis=1)
+
+
 def build_synthetic_data(dcfg, seed=0):
-    """dcfg: cfg.data mapping. Returns the bridge-shaped dict of numpy arrays for _refs_from_mapping."""
+    """dcfg: cfg.data mapping -> the bridge-shaped dict of numpy arrays for _refs_from_mapping.
+
+    Data-sweep knobs (all default to the current behavior, so nothing changes unless set):
+      obs_dt    -- observation spacing; num_steps = (t1-t0)/obs_dt so TOTAL PHYSICAL TIME is held fixed.
+      sim_dt    -- fine EM substep; n_sub = round(obs_dt/sim_dt) (set it for an obs_dt sweep so integration
+                   accuracy stays constant; keep it small+fixed, it's a convergence knob not a sweep axis).
+      mask_frac -- per-(t,b) missing-at-random dropout (calcium-style dropped frames); filter predicts at gaps.
+      window_len/stride -- chop each trajectory into fixed-length windows on the BATCH axis (fixed operator
+                   input length across obs_dt). NOTE: this reshapes T->B, it is ~memory-neutral for the
+                   whole-batch E-step (peak memory tracks the resulting #windows and n_colloc, not T); to
+                   bound memory when refining obs_dt / lengthening obs, cap #windows via batch_size.
+    sigma / noise_std / obs_dim / batch_size are already the diffusion / obs-noise / obs-dim / #samples axes."""
     def g(k, dv=None):
         return dcfg[k] if k in dcfg else dv
 
@@ -132,32 +158,59 @@ def build_synthetic_data(dcfg, seed=0):
             "synthetic in-memory gen supports the LINEAR-SENSOR path only (system != doublewell, or "
             "highd=true). Direct-obs 1-D (doublewell, highd=false) needs the npz bridge (dump/jax_port/bridge.py).")
     d_lat = _DIM[system]
-    num_steps, batch, n_val = int(g("num_steps")), int(g("batch_size")), int(g("n_val"))
+    batch, n_val = int(g("batch_size")), int(g("n_val"))
     t0, t1 = float(g("t0", 0.0)), float(g("t1"))
-    dt = (t1 - t0) / num_steps
+    total_time = t1 - t0
+    obs_dt = g("obs_dt", None)
+    if obs_dt is not None:                                        # explicit obs spacing -> derive num_steps (fixed span)
+        dt = float(obs_dt)
+        num_steps = max(2, round(total_time / dt))
+    else:
+        num_steps = int(g("num_steps"))
+        dt = total_time / num_steps
+    sim_dt = g("sim_dt", None)                                    # fixed fine substep -> n_sub scales with obs_dt
+    n_sub = max(1, round(dt / float(sim_dt))) if sim_dt is not None else int(g("n_sub", 1))
     sigma, noise_std, a = float(g("sigma")), float(g("noise_std")), float(g("a", 1.0))
 
-    z_true = _simulate(system, a, batch, num_steps, dt, sigma, int(g("n_sub", 1)),
+    z_true = _simulate(system, a, batch, num_steps, dt, sigma, n_sub,
                        float(g("init_std", 1.0)), int(g("burn_in", 0)), g("x0_uniform", None),
                        np.random.default_rng(int(seed)))
     y, C, d_off = _linear_sensor(z_true, int(g("obs_dim")), noise_std, float(g("c_scale", 1.0)),
                                  np.random.default_rng(int(seed) + 1))
-    y_std, _, obs_scale, nse = _standardize(y, n_val, d_lat, noise_std)
+
+    mask_frac = float(g("mask_frac", 0.0))                        # per-(t,b) missing-at-random dropout
+    if mask_frac > 0.0:
+        mask = (np.random.default_rng(int(seed) + 2).random((num_steps, batch, 1)) >= mask_frac).astype(np.float32)
+    else:
+        mask = np.ones((num_steps, batch, 1), np.float32)
+
+    y_std, _, obs_scale, nse = _standardize(y, mask, n_val, d_lat, noise_std)
+
+    filt = None
+    if d_lat == 1:                                                # d=1: exact grid oracle (mask-aware) on RAW val obs
+        zmax, Nz = float(g("zmax", 3.0)), int(g("Nz", 200))
+        z_grid = np.linspace(-zmax, zmax, Nz, dtype=np.float32)
+        filt = _grid_filter_highd(y[:, :n_val], z_grid, a, sigma, noise_std, dt, n_sub,
+                                  C[:, 0], d_off, mask=mask[:, :n_val, 0])          # (T,n_val,Nz)
+
+    wl = g("window_len", None)                                    # split by trajectory, then window (aligned)
+    wl = int(wl) if wl is not None else None
+    st = int(g("stride", wl)) if wl is not None else None
+    win = lambda arr: _window(arr, wl, st)
+    x_tr, m_tr = win(y_std[:, n_val:]), win(mask[:, n_val:])
+    x_va, m_va = win(y_std[:, :n_val]), win(mask[:, :n_val])
+    z_va = win(z_true[:, :n_val])
+    T_out = x_tr.shape[0]
 
     D = dict(
         system=system,
-        x_train=y_std[:, n_val:], mask_train=np.ones((num_steps, batch - n_val, 1), np.float32),
-        x_val=y_std[:, :n_val], mask_val=np.ones((num_steps, n_val, 1), np.float32),
-        full_obs=y_std[:, n_val:],
-        z_val_true=z_true[:, :n_val], C_true=C, d_true=d_off,
-        ts=np.linspace(t0, t1, num_steps, dtype=np.float32),
+        x_train=x_tr, mask_train=m_tr, x_val=x_va, mask_val=m_va, full_obs=x_tr,
+        z_val_true=z_va, C_true=C, d_true=d_off,
+        ts=np.arange(T_out, dtype=np.float32) * dt,
         dt=np.float32(dt), noise_std_eff=np.float32(nse), a=np.float32(a), sigma=np.float32(sigma),
         obs_scale=np.float32(obs_scale), obs_dim=np.int64(int(g("obs_dim"))),
     )
-    if d_lat == 1:                                                # d=1: exact grid oracle IS tractable (O(N))
-        zmax, Nz = float(g("zmax", 3.0)), int(g("Nz", 200))
-        z_grid = np.linspace(-zmax, zmax, Nz, dtype=np.float32)
+    if d_lat == 1:
         D["z_grid"] = z_grid                                       # grid-mean readout + drift_l2
-        D["filt_val"] = _grid_filter_highd(y[:, :n_val], z_grid, a, sigma, noise_std, dt,   # RAW val obs
-                                           int(g("n_sub", 1)), C[:, 0], d_off)   # -> exact-filter kl target
+        D["filt_val"] = win(filt)                                  # exact-filter kl target (windowed to match x_val)
     return D

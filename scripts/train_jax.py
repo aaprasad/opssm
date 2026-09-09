@@ -49,6 +49,22 @@ def _build_data(cfg):
     return build_synthetic_data(d, seed=int(d.get("seed", cfg.get("seed", 0))))
 
 
+def _is_env_failure(e):
+    """True for trial-specific ENVIRONMENTAL failures we log+skip (GPU/CUDA OOM, missing files, host OOM);
+    False for CODE bugs (TypeError/KeyError/AttributeError/...), which should abort the whole sweep loudly so
+    you fix them rather than silently logging failures across every trial."""
+    if isinstance(e, (OSError, MemoryError)):                        # missing files / host OOM (FileNotFoundError etc.)
+        return True
+    try:
+        from jax.errors import JaxRuntimeError                       # XLA/CUDA runtime (RESOURCE_EXHAUSTED, device err)
+        if isinstance(e, JaxRuntimeError):
+            return True
+    except Exception:
+        pass
+    return any(t in str(e) for t in                                  # OOM/CUDA that surfaced as another type
+               ("RESOURCE_EXHAUSTED", "out of memory", "CUDA", "CUBLAS", "CUDNN", "cuDNN", "cudaMalloc"))
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
 def main(cfg):
     if cfg.get("backend", "torch") != "jax":                        # this entrypoint runs only the jax backend
@@ -58,38 +74,64 @@ def main(cfg):
     from opssm.models.jax.train import train, _refs_from_mapping, whole_trace_recon
 
     run_dir = HydraConfig.get().runtime.output_dir                  # per-run (per array-task) output dir
-    D = _build_data(cfg)
-    hparams = OmegaConf.to_container(cfg.model, resolve=True)        # swept model hp from the config...
-    hparams.pop("_target_", None)
-    hparams["data_size"] = int(D["obs_dim"])                        # ...but data_size is the ACTUAL obs count
-    D["hparams"] = hparams
-    refs, hp = _refs_from_mapping(D)
+    # worst objective returned on failure so ONE bad trial (OOM, NaN, ...) logs + is skipped instead of
+    # aborting the whole sweep (the submitit launcher re-raises a failed job into the orchestrator). Default
+    # is very negative for the MAXIMIZE objective (recon_r2); set fail_objective=1e30 for a minimize sweep.
+    fail_obj = float(cfg.get("fail_objective", -1e30))
+    try:
+        D = _build_data(cfg)
+        hparams = OmegaConf.to_container(cfg.model, resolve=True)    # swept model hp from the config...
+        hparams.pop("_target_", None)
+        hparams["data_size"] = int(D["obs_dim"])                    # ...but data_size is the ACTUAL obs count
+        D["hparams"] = hparams
+        refs, hp = _refs_from_mapping(D)
 
-    n_steps = int(cfg.trainer.max_steps)
-    val_every = int(cfg.trainer.val_check_interval)
-    seed = int(cfg.get("seed", 0))
-    ckpt_every = int(cfg.get("ckpt_every", 1000))
-    monitor = str(cfg.get("monitor", "recon_r2"))
-    print(f"train_jax: run_dir={run_dir} system={hp['system']} d={hp['latent_dim']} data_size={hp['data_size']} "
-          f"init={hp.get('init_method')} bootstrap={hp.get('bootstrap_mstep')} n_steps={n_steps} seed={seed} "
-          f"noise_std_eff={float(hp['noise_std']):.4f} ckpt_every={ckpt_every} monitor={monitor}", flush=True)
+        n_steps = int(cfg.trainer.max_steps)
+        val_every = int(cfg.trainer.val_check_interval)
+        seed = int(cfg.get("seed", 0))
+        ckpt_every = int(cfg.get("ckpt_every", 1000))
+        monitor = str(cfg.get("monitor", "recon_r2"))
+        print(f"train_jax: run_dir={run_dir} system={hp['system']} d={hp['latent_dim']} data_size={hp['data_size']} "
+              f"init={hp.get('init_method')} bootstrap={hp.get('bootstrap_mstep')} n_steps={n_steps} seed={seed} "
+              f"noise_std_eff={float(hp['noise_std']):.4f} ckpt_every={ckpt_every} monitor={monitor}", flush=True)
 
-    state, hist = train(refs, hp, n_steps=n_steps, key=jax.random.PRNGKey(seed), val_every=val_every,
-                        fig_dir=None, ckpt_dir=run_dir, ckpt_every=ckpt_every,
-                        monitor=monitor, monitor_mode=str(cfg.get("monitor_mode", "max")))
+        state, hist = train(refs, hp, n_steps=n_steps, key=jax.random.PRNGKey(seed), val_every=val_every,
+                            fig_dir=None, ckpt_dir=run_dir, ckpt_every=ckpt_every,
+                            monitor=monitor, monitor_mode=str(cfg.get("monitor_mode", "max")))
 
-    result = {"status": "done", "seed": seed, "n_steps": n_steps, "run_dir": run_dir,
-              "hparams": hparams, "final": dict(hist[-1][1]) if hist else {}}
-    if "y_full_raw" in refs:                                         # Kato: whole-trace co-smoothing recon (the pub metric)
-        r2w, _ = whole_trace_recon(state["op"], state["C_cur"], state["d_cur"], refs, hp, jax.random.PRNGKey(7))
-        result["whole_trace_recon_r2"] = float(r2w)
-        result["g_final"] = float(state["g_cur"])
-        print(f"train_jax: WHOLE-TRACE recon_r2 = {r2w:.4f}  g={float(state['g_cur']):.4f}", flush=True)
-    with open(os.path.join(run_dir, "result.json"), "w") as f:
-        json.dump(result, f, indent=2, default=float)
-    print(f"train_jax: done -> {os.path.join(run_dir, 'result.json')}", flush=True)
-    # objective for the hydra sweeper (optuna random/TPE search): maximize whole-trace recon
-    return float(result.get("whole_trace_recon_r2", (result.get("final") or {}).get("recon_r2", float("-inf"))))
+        result = {"status": "done", "seed": seed, "n_steps": n_steps, "run_dir": run_dir,
+                  "hparams": hparams, "final": dict(hist[-1][1]) if hist else {}}
+        dcfg = OmegaConf.to_container(cfg.data, resolve=True); dcfg.pop("_target_", None)   # data-sweep axes...
+        result["data"] = dcfg
+        result["data_eff"] = {"system": hp["system"], "latent_dim": int(hp["latent_dim"]),   # ...+ EFFECTIVE descriptors
+                              "dt": float(hp["dt"]), "noise_std_eff": float(hp["noise_std"]),  # (SNR is random per draw)
+                              "obs_scale": float(refs.get("obs_scale", 1.0))}
+        if "y_full_raw" in refs:                                     # Kato: whole-trace co-smoothing recon (the pub metric)
+            r2w, _ = whole_trace_recon(state["op"], state["C_cur"], state["d_cur"], refs, hp, jax.random.PRNGKey(7))
+            result["whole_trace_recon_r2"] = float(r2w)
+            result["g_final"] = float(state["g_cur"])
+            print(f"train_jax: WHOLE-TRACE recon_r2 = {r2w:.4f}  g={float(state['g_cur']):.4f}", flush=True)
+        with open(os.path.join(run_dir, "result.json"), "w") as f:
+            json.dump(result, f, indent=2, default=float)
+        print(f"train_jax: done -> {os.path.join(run_dir, 'result.json')}", flush=True)
+        # objective for the hydra sweeper (optuna random/TPE search): maximize whole-trace recon
+        return float(result.get("whole_trace_recon_r2", (result.get("final") or {}).get("recon_r2", fail_obj)))
+    except Exception as e:
+        if not _is_env_failure(e):                                   # CODE bug -> abort the whole sweep (fix it)
+            raise
+        import traceback
+        traceback.print_exc()
+        try:                                                        # env failure (CUDA/OOM/missing file): log + skip
+            hp_c = OmegaConf.to_container(cfg.model, resolve=True); hp_c.pop("_target_", None)
+            dc = OmegaConf.to_container(cfg.data, resolve=True); dc.pop("_target_", None)
+            with open(os.path.join(run_dir, "result.json"), "w") as f:
+                json.dump({"status": "failed", "error_type": type(e).__name__, "error": repr(e)[:2000],
+                           "seed": int(cfg.get("seed", 0)), "run_dir": run_dir, "hparams": hp_c, "data": dc},
+                          f, indent=2, default=str)
+        except Exception:
+            pass
+        print(f"train_jax: SKIPPED ({type(e).__name__}) -> {run_dir}: {e!r}", flush=True)
+        return fail_obj
 
 
 if __name__ == "__main__":
