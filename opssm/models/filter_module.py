@@ -66,7 +66,8 @@ class ZakaiFilterModule(pl.LightningModule):
                  res_mode="rel", w_res=0.2, learn_smoother=False, joint_g=False, drift_target="forward",
                  encoder="gru", encoder_kwargs=None,
                  mean_method="mala", mala_chains=64, mala_steps=30, mala_rng="stochastic",
-                 anim_posterior=False, plot_samples=False, latent_dim=1, loss="zakai", train_dir="./dump/nzf"):
+                 anim_posterior=False, plot_samples=False, latent_dim=1, loss="zakai", train_dir="./dump/nzf",
+                 trunk_activation='softplus'):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
@@ -74,11 +75,12 @@ class ZakaiFilterModule(pl.LightningModule):
         self.model = OperatorFilter(h.data_size, h.gru_hidden, h.ctx_dim, h.p,
                                     branch_hidden=h.branch_hidden, trunk_hidden=h.trunk_hidden,
                                     trunk_layers=h.trunk_layers,
-                                    encoder=h.encoder, encoder_kwargs=h.encoder_kwargs, latent_dim=h.latent_dim)
+                                    encoder=h.encoder, encoder_kwargs=h.encoder_kwargs, latent_dim=h.latent_dim,
+                                    trunk_activation=h.trunk_activation)
         # backward adjoint-Zakai twin for the two-filter smoother (default off => byte-identical filter)
         self.model_b = OperatorBackward(h.data_size, h.gru_hidden, h.ctx_dim, h.p,
                                         branch_hidden=h.branch_hidden, trunk_hidden=h.trunk_hidden,
-                                        trunk_layers=h.trunk_layers,
+                                        trunk_layers=h.trunk_layers, trunk_activation=h.trunk_activation,
                                         encoder=h.encoder, encoder_kwargs=h.encoder_kwargs, latent_dim=h.latent_dim) \
             if h.learn_smoother else None
         self.drift_net = DriftNet(h.drift_hidden, layers=h.drift_layers, latent_dim=h.latent_dim)
@@ -92,6 +94,13 @@ class ZakaiFilterModule(pl.LightningModule):
         self.g_cur = h.g_init
         self.C_cur = self.d_cur = None
         self.dr_opt = self.dg_opt = None
+
+    def on_load_checkpoint(self, checkpoint):
+        saved = checkpoint.get('hyper_parameters', {})
+        if saved.get('tail_std', 0.0) != 0.0:
+            raise ValueError('This checkpoint uses removed Gaussian tails; use the experiment revision to load it')
+        if saved.get('trunk_activation', 'tanh') != self.hparams.trunk_activation:
+            raise ValueError('Checkpoint trunk_activation differs from this model; construct it with the saved activation')
 
     # -- static config pulled from the datamodule + EM-state init --------------------------------
     def setup(self, stage=None):
@@ -319,7 +328,7 @@ class ZakaiFilterModule(pl.LightningModule):
                "drift_rel": (e_drf.mean().sqrt() / f_scale).item(),            #   relative (÷ true drift magnitude)
                "g_aln": gscale * float(self.g_cur),                    # isotropic g gauge-scaled by |A|^(1/d) -> true frame
                "g_rel": gscale * float(self.g_cur) / max(float(self.sigma), 1e-8)}   # g_aln / true sigma (1.0 = perfect)
-        if d == 1:                                                       # KL: grid-bound (1-D oracle only)
+        if d == 1 and log_pi is not None and filt is not None:            # mean-only smoother metrics have no density
             s = float(A.reshape(-1)[0]); b0 = float(b.reshape(-1)[0]); zg = self.z_grid
             pi_al = _interp1d(log_pi.exp(), zg, (zg - b0) / s).clamp_min(0) / abs(s)   # z_op=(z_true-b)/s -> true frame
             pi_al = pi_al / pi_al.sum(-1, keepdim=True).clamp_min(1e-12)

@@ -25,6 +25,10 @@ python scripts/train.py experiment=em_highd     # Stage 4: learn f, g, and the S
 Override anything from the CLI, e.g. `... experiment=em_highd model.pca_init=false trainer.max_steps=8000`.
 Figures + metrics are written under `train_dir` (default `./dump/nzf`).
 
+The state-dependent trunk defaults to softplus in both backends. Use `model.trunk_activation=tanh`
+for legacy baselines and checkpoints. See the [activation comparison](docs/em_highd_activation.md)
+for JAX commands, checkpoint compatibility, and double-well results.
+
 ## Package layout
 ```
 opssm/

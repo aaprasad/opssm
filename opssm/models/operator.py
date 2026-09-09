@@ -30,6 +30,8 @@ class OperatorFilter(nn.Module):
 
         ell_i(z, s) = bias + sum_p b_p(c_i, s) * trunk_p(z)
 
+    Softplus trunk activations allow unbounded log-densities. Tanh remains available for legacy runs.
+
     The state basis trunk(z) (p functions of z) is fixed; the per-step coefficients
     b(c_i, s) FLOW with s (a Galerkin-in-z, evolve-in-time DeepONet -- the branch takes
     the time, so each observation step gets its own coefficient trajectory). s=0 is the
@@ -40,9 +42,14 @@ class OperatorFilter(nn.Module):
 
     def __init__(self, data_size=1, gru_hidden=64, ctx_dim=64, p=64,
                  branch_hidden=128, trunk_hidden=64, trunk_layers=3,
-                 encoder="gru", encoder_kwargs=None, reverse=False, latent_dim=1):
+                 encoder="gru", encoder_kwargs=None, reverse=False, latent_dim=1,
+                 trunk_activation='softplus'):
         super().__init__()
         self.latent_dim = latent_dim                                 # d: LATENT dim (separate from data_size = obs dim)
+        activations = {'tanh': nn.Tanh, 'softplus': nn.Softplus}
+        if trunk_activation not in activations:
+            raise ValueError('trunk_activation must be tanh or softplus')
+        self.trunk_activation = trunk_activation
         # CAUSAL context encoder: packs [obs (zeroed where missing), observed-mask] -> (T,B,ctx_dim), so it
         # knows when to update vs predict-only through a gap. Pluggable (encoder=gru|tcn|transformer|...);
         # built FIRST so the default gru keeps the original init RNG order (byte-identical). `gru_hidden`
@@ -51,7 +58,8 @@ class OperatorFilter(nn.Module):
         self.encoder = make_encoder(encoder, data_size + 1, ctx_dim, **enc_kwargs)
         self.reverse = reverse                                       # True = anti-causal (backward twin)
         self.branch = mlp([ctx_dim + 1, branch_hidden, p])           # (context, time) -> coeffs
-        self.trunk = mlp([latent_dim] + [trunk_hidden] * trunk_layers + [p])  # query z (d) -> state basis
+        self.trunk = mlp([latent_dim] + [trunk_hidden] * trunk_layers + [p],
+                         act=activations[trunk_activation])  # query z (d) -> state basis
         self.bias = nn.Parameter(torch.zeros(()))
 
     def context(self, xs, mask):

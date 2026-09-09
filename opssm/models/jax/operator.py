@@ -96,16 +96,20 @@ class OperatorFilter(eqx.Module):
     latent_dim: int = eqx.field(static=True)
 
     def __init__(self, data_size=1, gru_hidden=64, ctx_dim=64, p=64, branch_hidden=128,
-                 trunk_hidden=64, trunk_layers=3, latent_dim=1, reverse=False, key=None, submodules=None):
+                 trunk_hidden=64, trunk_layers=3, latent_dim=1, reverse=False, key=None, submodules=None,
+                 trunk_activation='softplus'):
         self.reverse = reverse
         self.latent_dim = latent_dim
         if submodules is not None:                               # weight-transfer/parity path
             self.encoder, self.branch, self.trunk, self.bias = submodules
+            if self.trunk.activation != trunk_activation:
+                raise ValueError('Transferred trunk activation differs from trunk_activation')
             return
         k1, k2, k3 = jax.random.split(key, 3)
         self.encoder = GRUEncoder(data_size + 1, ctx_dim, gru_hidden, key=k1)
         self.branch = MLP([ctx_dim + 1, branch_hidden, p], k2)
-        self.trunk = MLP([latent_dim] + [trunk_hidden] * trunk_layers + [p], k3)
+        self.trunk = MLP([latent_dim] + [trunk_hidden] * trunk_layers + [p], k3,
+                         activation=trunk_activation)
         self.bias = jnp.zeros(())
 
     def context(self, xs, mask):                                 # (T,B,M),(T,B,1) -> (T,B,C)
