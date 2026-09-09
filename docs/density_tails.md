@@ -131,6 +131,10 @@ finite logged losses and final scalar metrics. Results, checkpoints, CSV and plo
 
 ## Softplus activation comparison
 
+For the subsequent comparison using `train_jax.py experiment=em_highd`, including a tanh baseline
+with drift error 0.218, see [the standard EM experiment](em_highd_activation.md). The smaller
+experiment below is retained for its original inference diagnostics.
+
 `model.trunk_activation=softplus model.tail_std=0.0` replaces every hidden tanh in the state-basis
 trunk with softplus, leaving the output layer linear. The branch, GRU and drift network retain their
 original activations. This option is supported by both backends; tanh remains the default. Parameter
