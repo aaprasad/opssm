@@ -46,7 +46,8 @@ DEFAULTS = dict(  # em_highd resolved hparams; the bridge overrides per-experime
     near_std=0.3, broad_std=1.6, warmup=0, m_every=2000, m_inner=400, reg_lambda=3e-4,
     g_init=1.0, w_res=0.4, res_mode="rel", learn_obs=True, learn_g=True, c_stable_tol=0.05,
     n_mean=256, mean_method="mala", mala_chains=64, mala_steps=30, mala_rng="stochastic",
-    drift_target="det_mid",
+    drift_target="det_mid", diffusion_cov=True, g_floor=0.05,
+    learn_obs_noise=True, obs_noise_mode="diag", obs_noise_est="perp", obs_noise_damp=0.5,
 )
 
 
@@ -54,18 +55,30 @@ def _mala_cfg(hp):
     return dict(n_chains=hp["mala_chains"], n_steps=hp["mala_steps"], rng=hp["mala_rng"])
 
 
-def _run_mstep(op, xs, mask, drift_net, dr_opt, dr_state, C, d, g, hp, key, bootstrap=False):
+def _run_mstep(op, xs, mask, drift_net, dr_opt, dr_state, C, d, g, hp, key, bootstrap=False,
+               L=None, noise_var=None):
     info, drift_net, dr_state = M.mstep(
         op, xs, mask, hp["dt"], drift_net, dr_opt, dr_state, key,
         learn_g=hp["learn_g"], reg_lambda=hp["reg_lambda"], m_inner=hp["m_inner"],
         learn_obs=hp["learn_obs"], c_stable_tol=hp["c_stable_tol"], C_cur=C, d_cur=d,
         n_mean=hp["n_mean"], near_std=hp["near_std"], broad_std=hp["broad_std"],
         mean_method=hp["mean_method"], mala=_mala_cfg(hp), drift_target=hp["drift_target"],
-        bootstrap=bootstrap)
+        bootstrap=bootstrap,
+        diffusion_cov=hp.get("diffusion_cov", False), g_floor=hp.get("g_floor", 0.05),
+        learn_obs_noise=hp.get("learn_obs_noise", False),
+        obs_noise_mode=hp.get("obs_noise_mode", "diag"),
+        obs_noise_est=hp.get("obs_noise_est", "perp"), noise_var_in=noise_var,
+        obs_noise_damp=hp.get("obs_noise_damp", 0.5))
     g = info["g_cur"] if info["g_cur"] is not None else g
+    if info.get("L_cur") is not None:
+        L = info["L_cur"]
+    elif info["g_cur"] is not None and L is not None:                 # keep L in sync on the scalar path
+        L = float(g) * jnp.eye(L.shape[0], dtype=L.dtype)
+    if info.get("noise_var") is not None:
+        noise_var = info["noise_var"]
     if hp["learn_obs"]:
         C, d = info["C_cur"], info["d_cur"]
-    return drift_net, dr_state, C, d, g, info
+    return drift_net, dr_state, C, d, g, info, L, noise_var
 
 
 def make_estep(xs, mask, s_coll, optim, hp):
@@ -73,7 +86,7 @@ def make_estep(xs, mask, s_coll, optim, hp):
     T = xs.shape[0]
 
     @eqx.filter_jit
-    def estep(op, opt_state, drift_net, g, C, d, key):
+    def estep(op, opt_state, drift_net, g, C, d, noise_var, key):
         kc, kt = jax.random.split(key)
         center = zhat_from_obs(xs, C, d)
         decode = make_decode(C, d)
@@ -82,7 +95,7 @@ def make_estep(xs, mask, s_coll, optim, hp):
 
         def loss_fn(op):
             res, jump, ic, nll = pinn_zakai_loss(op, xs, mask, z_col, log_q, s_coll, drift_net.drift, g,
-                                                 _log_prior, hp["noise_std"], hp["dt"], ti=ti,
+                                                 _log_prior, noise_var, hp["dt"], ti=ti,
                                                  res_mode=hp["res_mode"], decode=decode)
             return hp["w_res"] * res + jump + ic, (res, jump, ic)
 
@@ -265,6 +278,11 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
         C_cur = jnp.linalg.qr(jax.random.normal(kc, (D_obs, d)))[0]
     drift_net = DriftNet(hp["drift_hidden"], layers=hp.get("drift_layers", 3), latent_dim=d, key=kd)
     g_cur = hp["g_init"]
+    # matrix diffusion Sigma = L L^T, seeded isotropic at g_init (so a fresh run starts exactly where the
+    # scalar path starts, and d==1 stays numerically identical to it)
+    L_cur = float(g_cur) * jnp.eye(d)
+    # observation-noise VARIANCE, per obs dim. Starts at the configured noise_std^2; the M-step re-fits it.
+    noise_var = jnp.full((D_obs,), float(hp["noise_std"]) ** 2)
 
     sched = optax.exponential_decay(hp["lr"], transition_steps=1, decay_rate=hp["sched_gamma"])
     optim = optax.adam(sched)
@@ -273,10 +291,10 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
     dr_state = dr_opt.init(eqx.filter(drift_net.net, eqx.is_inexact_array))
     estep = make_estep(xs, mask, s_coll, optim, hp)
 
-    history, best_metric = [], None
-    arrays = (op, op_opt_state, drift_net, dr_state, C_cur, d_cur)   # skeleton for (de)serialisation
+    history, best_metric, mstep_diag = [], None, {}
+    arrays = (op, op_opt_state, drift_net, dr_state, C_cur, d_cur, L_cur, noise_var)  # (de)serialise skeleton
     if ckpt_dir is not None and resume and _has_ckpt(ckpt_dir):    # RESUME: restore state, skip warmstart+bootstrap
-        (op, op_opt_state, drift_net, dr_state, C_cur, d_cur), meta = _load_ckpt(ckpt_dir, arrays)
+        (op, op_opt_state, drift_net, dr_state, C_cur, d_cur, L_cur, noise_var), meta = _load_ckpt(ckpt_dir, arrays)
         g_cur, key, start_step, history = meta["g_cur"], jnp.asarray(meta["key"]), meta["step"], meta["history"]
         best_metric = meta.get("best_metric")
         log_fn(f"[resume] {_ckpt_files(ckpt_dir)[0]} at step {start_step} (g={g_cur:.4f})")
@@ -287,8 +305,9 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
             drift_net, wmse = warmstart_drift(drift_net, A, kw)
         cstab0 = float("nan")
         if hp.get("bootstrap_mstep", True):                       # one init-time M-step from the init projection
-            drift_net, dr_state, C_cur, d_cur, g_cur, info = _run_mstep(
-                op, xs, mask, drift_net, dr_opt, dr_state, C_cur, d_cur, g_cur, hp, kb, bootstrap=True)
+            drift_net, dr_state, C_cur, d_cur, g_cur, info, L_cur, noise_var = _run_mstep(
+                op, xs, mask, drift_net, dr_opt, dr_state, C_cur, d_cur, g_cur, hp, kb, bootstrap=True,
+                L=L_cur, noise_var=noise_var)
             cstab0 = info["cstab"]
         _block(eqx.filter(drift_net, eqx.is_inexact_array))
         log_fn(f"[init] d={d} method={method} warmstart_mse={wmse:.4f} bootstrap cstab={cstab0:.4f} g={g_cur:.4f}")
@@ -304,6 +323,16 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
         key, vk = jax.random.split(key)
         tv = time.perf_counter()
         m, m_op = validate(op, drift_net, g_cur, jnp.asarray(C_cur), d_cur, refs, hp, vk)   # returns floats -> synced
+        if hp.get("diffusion_cov", False) and d > 1:               # anisotropy of the learned Sigma
+            gi, an = mstep_diag.get("g_iso"), mstep_diag.get("aniso")
+            if gi is not None and gi == gi:
+                m["g_iso"], m["g_aniso"] = float(gi), float(an)
+        if hp.get("learn_obs_noise", False):                       # learned obs noise vs its feedback-immune ref
+            m["obs_noise"] = float(jnp.sqrt(jnp.mean(noise_var)))
+            for tag, k in (("obs_noise_perp", "R_perp"), ("obs_noise_post", "R_post")):
+                v = mstep_diag.get(k)                              # log BOTH estimators (NaN-safe)
+                if v is not None and v == v:
+                    m[tag] = float(v) ** 0.5
         tm["val"].append(time.perf_counter() - tv)
         if _plot is not None:
             tf = time.perf_counter()
@@ -321,15 +350,18 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
     for step in range(start_step + 1, n_steps + 1):
         key, sk = jax.random.split(key)
         te = time.perf_counter()
-        op, op_opt_state, aux = estep(op, op_opt_state, drift_net, jnp.asarray(g_cur),
-                                      jnp.asarray(C_cur), d_cur, sk)
+        diff = L_cur if hp.get("diffusion_cov", False) else jnp.asarray(g_cur)   # Sigma=L L^T, or scalar g
+        op, op_opt_state, aux = estep(op, op_opt_state, drift_net, diff,
+                                      jnp.asarray(C_cur), d_cur, noise_var, sk)
         _block(aux)
         tm["estep"].append(time.perf_counter() - te)
         if step > hp["warmup"] and step % hp["m_every"] == 0:
             key, mk = jax.random.split(key)
             tms = time.perf_counter()
-            drift_net, dr_state, C_cur, d_cur, g_cur, info = _run_mstep(
-                op, xs, mask, drift_net, dr_opt, dr_state, C_cur, d_cur, g_cur, hp, mk)
+            drift_net, dr_state, C_cur, d_cur, g_cur, info, L_cur, noise_var = _run_mstep(
+                op, xs, mask, drift_net, dr_opt, dr_state, C_cur, d_cur, g_cur, hp, mk,
+                L=L_cur, noise_var=noise_var)
+            mstep_diag = {k: info.get(k) for k in ("R_perp", "R_post", "g_iso", "aniso")}
             _block(eqx.filter(drift_net, eqx.is_inexact_array))
             tm["mstep"].append(time.perf_counter() - tms)
         if step % val_every == 0 or step == n_steps:
@@ -344,13 +376,14 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
                 if mv is not None and (best_metric is None
                                        or (mv > best_metric if monitor_mode == "max" else mv < best_metric)):
                     best_metric = mv
-                    _save_ckpt(ckpt_dir, (op, op_opt_state, drift_net, dr_state, C_cur, d_cur), step, g_cur,
-                               key, history, name="best", best_metric=best_metric)
+                    _save_ckpt(ckpt_dir, (op, op_opt_state, drift_net, dr_state, C_cur, d_cur, L_cur,
+                                          noise_var), step, g_cur, key, history, name="best",
+                               best_metric=best_metric)
         # rolling resume checkpoint AFTER validation (history+key consistent at the boundary). No signal handler:
         # SLURM --requeue reruns the same array task -> same run dir -> resume from here (loses <= ckpt_every steps).
         if ckpt_dir is not None and (step % ckpt_every == 0 or step == n_steps):
-            _save_ckpt(ckpt_dir, (op, op_opt_state, drift_net, dr_state, C_cur, d_cur), step, g_cur, key,
-                       history, best_metric=best_metric)
+            _save_ckpt(ckpt_dir, (op, op_opt_state, drift_net, dr_state, C_cur, d_cur, L_cur, noise_var),
+                       step, g_cur, key, history, best_metric=best_metric)
     total_s = time.perf_counter() - t_train0
     report = _timing_report(tm, init_s, total_s, n_steps)
     if timing:

@@ -108,6 +108,41 @@ class OperatorFilter(nn.Module):
                 grad.movedim(0, -2).reshape(*shp, d, -1),          # (d,N,p) -> (N,d,p)
                 lap_ax.sum(0).reshape(*shp, -1))                   # sum axes -> Laplacian (N,p)
 
+    def trunk_zderivs_dirs(self, z, dirs):
+        """State basis with its full GRADIENT and the DIRECTIONAL second derivatives summed over `dirs`.
+
+        z (...,d), dirs (m,d) [ROW k = the k-th direction v_k] ->
+            tau (...,p), grad_tau (...,d,p) [d_i tau], sec_tau (...,p) [sum_k v_k^T H(tau) v_k].
+
+        The anisotropic-diffusion generalization of `trunk_zderivs`. For a diffusion matrix
+        Sigma = L L^T, taking `dirs = L.T` (rows = COLUMNS of L) gives exactly
+
+            sec_tau = sum_k (L[:,k])^T H L[:,k] = tr(L^T H L) = tr(Sigma H),
+
+        the weighted Hessian trace the Fokker-Planck operator needs -- at the SAME cost as the
+        isotropic Laplacian (d directions), not the d(d+1)/2 of a full Hessian. With L = g I this
+        reduces to g^2 * (Laplacian), so the isotropic path is recovered exactly.
+
+        The gradient is taken separately along the UNIT axes (a single forward jvp each, ~half the
+        cost of the nested one) because the drift term f . grad ell needs the gradient in the
+        canonical frame, not the L frame -- recovering it by a triangular solve with L^-T would
+        amplify error whenever L is ill-conditioned."""
+        d = z.shape[-1]
+        zin = z.reshape(-1, d)                                       # (N,d)
+        eye = torch.eye(d, device=z.device, dtype=z.dtype)          # unit tangents
+        tau, grads = vmap(lambda e: jvp(self.trunk, (zin,), (e.expand_as(zin),)))(eye)  # (d,N,p)
+
+        def sec_along(v):                                           # v (d,) -> v^T H tau v  (N,p)
+            vv = v.expand_as(zin)                                   # (N,d) tangent
+            (_, _), (_, dvv) = jvp(lambda x: jvp(self.trunk, (x,), (vv,)), (zin,), (vv,))
+            return dvv
+
+        sec = vmap(sec_along)(dirs)                                 # (m,N,p)
+        shp = z.shape[:-1]
+        return (tau[0].reshape(*shp, -1),
+                grads.movedim(0, -2).reshape(*shp, d, -1),          # (N,d,p)
+                sec.sum(0).reshape(*shp, -1))                       # sum_k -> tr(Sigma H)  (N,p)
+
     def trunk_grad(self, z):
         """State basis trunk(z) with its GRADIENT only (no Laplacian) -> tau (...,p), grad_tau (...,d,p)
         [d_i tau]. Single forward jvp per unit tangent, VMAPPED over the d tangents (= forward-mode

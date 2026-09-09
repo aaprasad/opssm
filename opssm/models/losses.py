@@ -25,6 +25,42 @@ def kl_target_pred(target, log_pred, eps=1e-12):
     return (t * (t.log() - log_pred)).sum(dim=-1).mean()
 
 
+def as_chol(sigma, d, device=None, dtype=None):
+    """Coerce a diffusion spec to a lower-triangular Cholesky factor L with Sigma = L L^T, or None.
+
+    Accepts a scalar g (-> g I, the isotropic legacy path), a (d,d) tensor (already L), or a callable
+    (the state-dependent 1-D g_net, which has no matrix form -> None). Returns None whenever the caller
+    should stay on the isotropic/g_net code path."""
+    if callable(sigma):
+        return None
+    if torch.is_tensor(sigma) and sigma.dim() == 2:
+        return sigma
+    return None
+
+
+def gauss_loglik(xs, z_col, decode, noise_var):
+    """log N(y; h(z), R) up to a constant, R diagonal. xs (T,B,D), z_col (T,B,K,d) ->
+    (T,B,K). `noise_var` is the observation-noise VARIANCE: a scalar (isotropic R = r I) or a
+    (D,) per-observation-dimension vector (diagonal R). The per-dim form is what makes a LEARNED
+    observation noise meaningful on real data, where neurons/sensors have different noise levels."""
+    resid = xs.unsqueeze(2) - (z_col if decode is None else decode(z_col))     # (T,B,K,D)
+    return -0.5 * (resid.pow(2) / noise_var).sum(-1)
+
+
+def fp_diffusion_term(b_s, grad_ell, sec_tau, L):
+    """The FP diffusion term in LOG space for a constant matrix diffusion Sigma = L L^T:
+
+        grad ell^T Sigma grad ell + tr(Sigma H(ell))  =  |L^T grad ell|^2 + sum_p b_p tr(Sigma H(tau_p))
+
+    grad_ell (Ts,B,Ns,K,d), sec_tau (Ts,B,K,p) [from trunk_zderivs_dirs with dirs = L.T],
+    b_s (Ts,B,Ns,p) -> (Ts,B,Ns,K). The quadratic form needs NO extra autodiff (it is a contraction
+    of the gradient already computed); only the weighted Hessian trace does, and that costs the same
+    d directions as the isotropic Laplacian."""
+    Lg = torch.einsum("tbskd,de->tbske", grad_ell, L)         # (L^T grad ell)_e = sum_d L_{d,e} grad_d
+    quad = Lg.pow(2).sum(-1)                                  # grad^T Sigma grad   (Ts,B,Ns,K)
+    return quad + torch.einsum("tbsp,tbkp->tbsk", b_s, sec_tau)
+
+
 def sample_collocation(xs, mask, n_colloc, near_std, broad_std, center=None):
     """MESH-FREE collocation: draw state points from a data-following proposal q (no grid,
     no zmax). Half are near the observation (the peaked observed posterior), half broad
@@ -57,7 +93,7 @@ def sample_collocation(xs, mask, n_colloc, near_std, broad_std, center=None):
 
 
 def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_prior,
-                    noise_std, dt, n_tcoll=None, res_post=0.0, res_mode="l2", decode=None):
+                    noise_var, dt, n_tcoll=None, res_post=0.0, res_mode="l2", decode=None):
     """MESH-FREE continuous-time Zakai PINN -- no grid, no time-stepping, no Euler.
     Collocation points z_col (T,B,K) are SAMPLED from the proposal (log_q its log-density);
     the normalizer Z and evidence c are self-normalized importance-sampling (SNIS) estimates
@@ -79,10 +115,7 @@ def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_pri
     b_ends = model.coeffs(ctx, torch.tensor([0.0, 1.0], device=z_col.device))   # (T,B,2,p)
     ell0 = torch.einsum("tbp,tbkp->tbk", b_ends[:, :, 0], tau) + model.bias   # post-update (s=0)
 
-    if decode is None:                                                # direct obs h(z) = z (D = d)
-        loglik = -0.5 * ((xs.unsqueeze(2) - z_col) ** 2).sum(-1) / noise_std ** 2   # (T,B,K)
-    else:                                                             # high-D obs: lik = N(y; h(z), sigma^2 I)
-        loglik = -0.5 * ((xs.unsqueeze(2) - decode(z_col)) ** 2).sum(-1) / noise_std ** 2   # (T,B,K)
+    loglik = gauss_loglik(xs, z_col, decode, noise_var)               # (T,B,K); R scalar or (D,) diagonal
     m = mask[..., 0]                                                   # (T,B)
     logZ0 = torch.logsumexp(ell0 - log_q, dim=-1, keepdim=True) - math.log(K)
     logpi0 = ell0 - logZ0                                              # normalized log-density
@@ -103,15 +136,25 @@ def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_pri
     ti = (torch.randperm(T, device=z_col.device)[:n_tcoll] if n_tcoll and n_tcoll < T
           else torch.arange(T, device=z_col.device))
     b_s, ds_b = model.coeffs_dtime(ctx[ti], s_coll)                   # (Ts,B,Ns,p)
-    tau_s, grad_tau, lap_tau = model.trunk_zderivs(z_col[ti])         # (Ts,B,K,p),(...,K,d,p),(...,K,p)
+    L = as_chol(sigma, z_col.shape[-1])                               # (d,d) Cholesky factor, or None (iso/g_net)
+    if L is not None:            # anisotropic Sigma = L L^T: directional 2nd derivs along L's COLUMNS
+        tau_s, grad_tau, sec_tau = model.trunk_zderivs_dirs(z_col[ti], L.t())   # sec = tr(Sigma H)
+        lap_tau = None
+    else:
+        tau_s, grad_tau, lap_tau = model.trunk_zderivs(z_col[ti])     # (Ts,B,K,p),(...,K,d,p),(...,K,p)
     grad_ell = torch.einsum("tbsp,tbkdp->tbskd", b_s, grad_tau)       # (Ts,B,Ns,K,d)  grad ell
     grad_ell_sq = grad_ell.pow(2).sum(-1)                             # (Ts,B,Ns,K)    |grad ell|^2
-    lap_ell = torch.einsum("tbsp,tbkp->tbsk", b_s, lap_tau)           # (Ts,B,Ns,K)    Laplacian ell
+    lap_ell = (None if lap_tau is None else
+               torch.einsum("tbsp,tbkp->tbsk", b_s, lap_tau))         # (Ts,B,Ns,K)    Laplacian ell
     ds_ell = torch.einsum("tbsp,tbkp->tbsk", ds_b, tau_s)
     f, div_f = drift(z_col[ti])                                       # f (Ts,B,K,d), div f (Ts,B,K)
     f_dot = torch.einsum("tbskd,tbkd->tbsk", grad_ell, f)            # f . grad ell  (Ts,B,Ns,K)
     divf = div_f.unsqueeze(2)                                        # (Ts,B,1,K)
-    if callable(sigma):                                             # state-dependent g^2(z) -- 1-D only (g_net)
+    if L is not None:                                               # MATRIX diffusion Sigma = L L^T (anisotropic)
+        # d-D FP in log-space: -(div f + f . grad ell) + 1/2 (grad ell^T Sigma grad ell + tr(Sigma H)).
+        # Reduces EXACTLY to the isotropic branch below when L = g I.
+        rhs = -(divf + f_dot) + 0.5 * fp_diffusion_term(b_s, grad_ell, sec_tau, L)
+    elif callable(sigma):                                           # state-dependent g^2(z) -- 1-D only (g_net)
         g2, dg2, d2g2 = sigma(z_col[ti])                            # (Ts,B,K) each (DiffusionNet.diffusion is 1-D)
         g2 = g2.unsqueeze(2); dg2 = dg2.unsqueeze(2); d2g2 = d2g2.unsqueeze(2)
         dz_ell = grad_ell[..., 0]                                   # d==1 gradient component
@@ -144,7 +187,7 @@ def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_pri
     return res_loss, jump_loss, ic_loss, nll
 
 
-def accumulate_pinn_grads(model, xs, mask, s_coll, drift, sigma, log_prior, noise_std, dt,
+def accumulate_pinn_grads(model, xs, mask, s_coll, drift, sigma, log_prior, noise_var, dt,
                           n_colloc, near_std, broad_std, n_tcoll, chunk_size,
                           w_nll=0.0, num_steps=1, res_post=0.0, res_mode="l2", w_res=1.0,
                           decode=None, center=None):
@@ -167,7 +210,7 @@ def accumulate_pinn_grads(model, xs, mask, s_coll, drift, sigma, log_prior, nois
                                           center=ctr)
         res, jump, ic, nll = pinn_zakai_loss(
             model, xs[:, sl], mask[:, sl], z_col, log_q, s_coll, drift, sigma, log_prior,
-            noise_std, dt, n_tcoll=n_tcoll, res_post=res_post, res_mode=res_mode, decode=decode)
+            noise_var, dt, n_tcoll=n_tcoll, res_post=res_post, res_mode=res_mode, decode=decode)
         # w_res down-weights the FP RESIDUAL relative to the jump/ic recursion: the residual SPREADS
         # and the likelihood update (jump) SHARPENS, so w_res<1 sharpens the balance toward the exact
         # filter (w_res=0 collapses to a spike -- keep it > 0 to still enforce the FP dynamics).
@@ -178,7 +221,7 @@ def accumulate_pinn_grads(model, xs, mask, s_coll, drift, sigma, log_prior, nois
 
 
 def pinn_adjoint_loss(model_b, xs, mask, z_col, log_q, s_coll, drift, sigma,
-                      noise_std, dt, n_tcoll=None, res_mode="rel", decode=None):
+                      noise_var, dt, n_tcoll=None, res_mode="rel", decode=None):
     """BACKWARD adjoint-Zakai PINN for the smoother's log post-update backward MESSAGE
     lmsg = log msg_t(z), msg_t(z) = p(y_{t:T} | z_t). Time-reversed mirror of pinn_zakai_loss:
         adjoint residual (s=0 at obs t, s=1 backward toward obs t-1 -- the backward Kolmogorov
@@ -198,10 +241,7 @@ def pinn_adjoint_loss(model_b, xs, mask, z_col, log_q, s_coll, drift, sigma,
     b_ends = model_b.coeffs(ctx, torch.tensor([0.0, 1.0], device=z_col.device))   # (T,B,2,p)
     lmsg0 = torch.einsum("tbp,tbkp->tbk", b_ends[:, :, 0], tau) + model_b.bias     # (T,B,K) msg, s=0
 
-    if decode is None:                                             # direct obs h(z) = z (D = d)
-        loglik = -0.5 * ((xs.unsqueeze(2) - z_col) ** 2).sum(-1) / noise_std ** 2   # (T,B,K)
-    else:                                                          # high-D: lik = N(y; C z + d, sigma^2 I)
-        loglik = -0.5 * ((xs.unsqueeze(2) - decode(z_col)) ** 2).sum(-1) / noise_std ** 2
+    loglik = gauss_loglik(xs, z_col, decode, noise_var)            # (T,B,K); R scalar or (D,) diagonal
     m = mask[..., 0]                                               # (T,B)
     logZ0 = torch.logsumexp(lmsg0 - log_q, dim=-1, keepdim=True) - math.log(K)
     lmsgpi0 = lmsg0 - logZ0                                        # normalized (mirror of logpi0)
@@ -220,14 +260,22 @@ def pinn_adjoint_loss(model_b, xs, mask, z_col, log_q, s_coll, drift, sigma,
     ti = (torch.randperm(T, device=z_col.device)[:n_tcoll] if n_tcoll and n_tcoll < T
           else torch.arange(T, device=z_col.device))
     b_s, ds_b = model_b.coeffs_dtime(ctx[ti], s_coll)             # (Ts,B,Ns,p)
-    tau_s, grad_tau, lap_tau = model_b.trunk_zderivs(z_col[ti])   # (Ts,B,K,p),(...,K,d,p),(...,K,p)
+    Lb = as_chol(sigma, z_col.shape[-1])                          # matrix diffusion (or None -> iso/g_net)
+    if Lb is not None:
+        tau_s, grad_tau, sec_tau = model_b.trunk_zderivs_dirs(z_col[ti], Lb.t())
+        lap_tau = None
+    else:
+        tau_s, grad_tau, lap_tau = model_b.trunk_zderivs(z_col[ti])   # (Ts,B,K,p),(...,K,d,p),(...,K,p)
     grad_lm = torch.einsum("tbsp,tbkdp->tbskd", b_s, grad_tau)   # (Ts,B,Ns,K,d)
     grad_lm_sq = grad_lm.pow(2).sum(-1)                          # (Ts,B,Ns,K)
-    lap_lm = torch.einsum("tbsp,tbkp->tbsk", b_s, lap_tau)       # (Ts,B,Ns,K)
+    lap_lm = (None if lap_tau is None else
+              torch.einsum("tbsp,tbkp->tbsk", b_s, lap_tau))      # (Ts,B,Ns,K)
     ds_lm = torch.einsum("tbsp,tbkp->tbsk", ds_b, tau_s)
     f, _ = drift(z_col[ti])                                       # backward GENERATOR uses f (not div f)
     f_dot = torch.einsum("tbskd,tbkd->tbsk", grad_lm, f)         # f . grad lmsg  (Ts,B,Ns,K)
-    if callable(sigma):                                          # state-dependent g^2(z) -- 1-D only (g_net)
+    if Lb is not None:                                           # MATRIX diffusion (adjoint GENERATOR)
+        rhs = f_dot + 0.5 * fp_diffusion_term(b_s, grad_lm, sec_tau, Lb)
+    elif callable(sigma):                                        # state-dependent g^2(z) -- 1-D only (g_net)
         g2 = sigma(z_col[ti])[0].unsqueeze(2)
         rhs = f_dot + 0.5 * g2 * (grad_lm_sq + lap_lm)           # NO d2g2/dg2 (generator, not FP adjoint)
     else:                                                        # constant scalar g (isotropic)
@@ -243,7 +291,7 @@ def pinn_adjoint_loss(model_b, xs, mask, z_col, log_q, s_coll, drift, sigma,
     return res_b, jump_b, tc_b
 
 
-def accumulate_adjoint_grads(model_b, xs, mask, s_coll, drift, sigma, noise_std, dt,
+def accumulate_adjoint_grads(model_b, xs, mask, s_coll, drift, sigma, noise_var, dt,
                              n_colloc, near_std, broad_std, n_tcoll, chunk_size,
                              res_mode="rel", w_res=1.0, decode=None, center=None):
     """Memory-capped chunked forward+backward of the backward adjoint-Zakai loss (sibling of
@@ -259,7 +307,7 @@ def accumulate_adjoint_grads(model_b, xs, mask, s_coll, drift, sigma, noise_std,
                                           center=ctr)
         res_b, jump_b, tc_b = pinn_adjoint_loss(
             model_b, xs[:, sl], mask[:, sl], z_col, log_q, s_coll, drift, sigma,
-            noise_std, dt, n_tcoll=n_tcoll, res_mode=res_mode, decode=decode)
+            noise_var, dt, n_tcoll=n_tcoll, res_mode=res_mode, decode=decode)
         (bw * (w_res * res_b + jump_b + tc_b)).backward()
         for i, v in enumerate((res_b, jump_b, tc_b)):
             agg[i] += bw * v.item()

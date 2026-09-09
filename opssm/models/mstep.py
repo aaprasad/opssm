@@ -62,13 +62,14 @@ def _fixed_nodes(center, mask, n_samples, near_std, broad_std):
 
 
 @torch.no_grad()
-def posterior_mean_fixed(model, x, mask, center, n_samples, near_std, broad_std):
+def posterior_mean_fixed(model, x, mask, center, n_samples, near_std, broad_std, return_samples=False):
     """DETERMINISTIC mesh-free FILTER MEAN via FIXED-NODE importance sampling: the proposal nodes are
     drawn ONCE (fixed seed) and reused every M-step. So z_hat = sum_k w_k z_k is a smooth deterministic
     function of the operator -- the grid's deterministic mean, but with data-following nodes instead of a
     uniform grid. No fresh per-M-step randomness => no readout noise (the SNIS blowup was the fresh
     per-step sampling noise; fixing the nodes removes it while keeping the MEAN, unlike the mode).
-    Returns (z_hat (T,B), ess_frac)."""
+    Returns (z_hat (T,B,d), ess_frac), or (z_hat, ess_frac, nodes, weights) with return_samples=True
+    (the weighted nodes ARE the posterior sample set the observation-noise M-step integrates over)."""
     z, log_q = _fixed_nodes(center, mask, n_samples, near_std, broad_std)   # (T,B,K,d)
     ctx = model.context(x, mask)
     b0 = model.coeffs(ctx, torch.zeros(1, device=z.device))[:, :, 0]  # (T,B,p) at s=0
@@ -76,7 +77,10 @@ def posterior_mean_fixed(model, x, mask, center, n_samples, near_std, broad_std)
     ell = torch.einsum("tbp,tbkp->tbk", b0, tau) + model.bias       # (T,B,K)
     w = torch.softmax(ell - log_q, dim=-1)                          # SNIS weights
     ess = 1.0 / (w.pow(2).sum(-1) * z.shape[2])                     # (T,B) fraction (K = z.shape[2])
-    return (w.unsqueeze(-1) * z).sum(2), float(ess.mean())          # (T,B,d), scalar
+    z_hat = (w.unsqueeze(-1) * z).sum(2)                            # (T,B,d)
+    if return_samples:
+        return z_hat, float(ess.mean()), z, w
+    return z_hat, float(ess.mean())
 
 
 @torch.no_grad()
@@ -156,10 +160,15 @@ def filter_mean(model, x, mask, center, *, method, n_mean, near_std, broad_std, 
     gradient MCMC (posterior_mean_mala, knobs in the `mala` dict, diag={'accept':..}). One seam for both the
     M-step readout and the d>1 validation mean."""
     if method == "mala":
-        z_hat, acc = posterior_mean_mala(model, x, mask, center, broad_std=broad_std, **(mala or {}))
-        return z_hat, {"accept": acc}
-    z_hat, ess = posterior_mean_fixed(model, x, mask, center, n_mean, near_std, broad_std)
-    return z_hat, {"ess": ess}
+        mk = dict(mala or {})
+        z_s, z_hat, acc = _mala_chains(model, x, mask, center, mk.pop("n_chains", 64),
+                                       mk.pop("n_steps", 30), broad_std, **mk)
+        K = z_s.shape[2]                                    # chain states are EQUALLY weighted draws from pi_t
+        w = torch.full(z_s.shape[:3], 1.0 / K, device=z_s.device, dtype=z_s.dtype)
+        return z_hat, {"accept": acc, "z_samp": z_s, "w_samp": w}
+    z_hat, ess, z_s, w = posterior_mean_fixed(model, x, mask, center, n_mean, near_std, broad_std,
+                                              return_samples=True)
+    return z_hat, {"ess": ess, "z_samp": z_s, "w_samp": w}
 
 
 @torch.no_grad()
@@ -377,6 +386,97 @@ def fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,
 
 
 @torch.no_grad()
+def fit_diffusion_cov(drift_net, zc, zc_next, dz, dt, g_floor=0.05):
+    """FULL diffusion covariance Sigma = L L^T from the trapezoidal mean-increment residual.
+
+    The increment residual Delta = z_{t+1} - z_t - 1/2(f(z_t)+f(z_{t+1})) dt is, under the generative
+    model, N(0, Sigma dt). So the closed-form M-step is the second moment
+
+        Sigma = E[Delta Delta^T] / dt = E[r r^T] * dt,     r = Delta/dt = dz - f_trap   (N,d)
+
+    which is the MATRIX version of the existing scalar g^2 = E[|r|^2] dt / d (that is exactly
+    trace(Sigma)/d). Returns the lower-triangular Cholesky factor L, so the E-step gets Sigma = L L^T
+    with guaranteed positive-definiteness.
+
+    Why anisotropy matters: the Stiefel M-step gives C ORTHONORMAL columns, so the latent carries all
+    the amplitude anisotropy of the data while an isotropic g forces one noise scale on every latent
+    direction. On a variance-imbalanced latent (e.g. Kato, ~58% of the variance in one component) the
+    small directions are then modelled as almost pure process noise. A full Sigma lets each direction
+    carry its own diffusion. A `g_floor^2 I` ridge keeps the factorization well-conditioned when a
+    direction is nearly deterministic."""
+    f_trap = 0.5 * (drift_net.net(zc) + drift_net.net(zc_next))      # (N,d)
+    r = dz - f_trap                                                  # (N,d) = Delta/dt
+    d = r.shape[-1]
+    Sig = (r.t() @ r) / max(r.shape[0], 1) * dt                      # E[r r^T] dt = E[Delta Delta^T]/dt
+    Sig = 0.5 * (Sig + Sig.t()) + (g_floor ** 2) * torch.eye(d, device=r.device, dtype=r.dtype)
+    return torch.linalg.cholesky(Sig)                                # (d,d) lower-triangular
+
+
+def chol_summary(L):
+    """Scalar/diagnostic summaries of Sigma = L L^T -> (g_det, g_iso, aniso).
+
+    g_det = det(Sigma)^{1/2d} is the GAUGE-COVARIANT scalar: under the latent gauge z -> A z the
+    diffusion maps Sigma -> A Sigma A^T, so g_det -> |det A|^{1/d} g_det, i.e. exactly the scaling the
+    existing `g_aln = gscale * g` metric already applies. It equals g when Sigma = g^2 I, so the
+    reported number stays comparable with every isotropic run. g_iso = sqrt(trace(Sigma)/d) is the
+    isotropic-equivalent magnitude, and aniso = sqrt(lambda_max/lambda_min) says how far from
+    isotropic the learned diffusion actually is (1.0 = isotropic)."""
+    d = L.shape[0]
+    Sig = L @ L.t()
+    ev = torch.linalg.eigvalsh(Sig).clamp_min(1e-24)
+    g_det = float(ev.log().mean().mul(0.5).exp())                    # det(Sigma)^{1/2d}, stable in log space
+    g_iso = float((ev.mean()).sqrt())
+    return g_det, g_iso, float((ev.max() / ev.min()).sqrt())
+
+
+@torch.no_grad()
+def fit_obs_noise(x, mask, z_samp, w_samp, C_cur, d_cur, mode="diag", est="perp", floor=1e-3):
+    """Observation-noise M-step. Returns (R (D,) variances, diag dict with both estimators).
+
+    R is the one generative parameter the M-step never fitted, yet it sets the sharpness of the
+    likelihood in the jump, hence the posterior width, hence (through the increment residual) both g and
+    the drift. On real data it is a guessed hyperparameter.
+
+    TWO estimators, because they fail differently:
+
+    `est='posterior'` -- the textbook EM step, R = E_q[(y - Cz - d)^2] over the MALA posterior SAMPLES
+      (not at the mean: the mean-only version omits Var_q[Cz], under-reads R, sharpens the likelihood and
+      runs to zero). Correct IF q is the true posterior. But this operator's posterior is known to be
+      1.5-2x too WIDE (notes/overdispersion.md), and that width enters E_q directly, so this estimator
+      inherits the over-dispersion bias and reads high.
+
+    `est='perp'` (DEFAULT) -- project the residual onto the D-d observation directions ORTHOGONAL to
+      span(C), where no latent can contribute:  perp = (I - C C^T)(y - d) = (I - C C^T) eps.
+      E[perp perp^T] = P R P with P = I - C C^T a projector, so per dimension
+          R_i = E[perp_i^2] / P_ii,        P_ii = 1 - ||C_[i,:]||^2,
+      exact for isotropic R and accurate to O(d/D) for a diagonal one (P is near-identity when d << D).
+      It never touches q, so it is immune BOTH to the over-dispersion bias and to the widening feedback
+      (a wider posterior inflates R, which flattens the likelihood, which widens the posterior further).
+
+    Requires a learned sensor; with direct observations there is no orthogonal complement and this falls
+    back to the posterior estimator. `mode='scalar'` pools across observation dimensions."""
+    h = z_samp if C_cur is None else torch.einsum("od,tbkd->tbko", C_cur, z_samp) + d_cur
+    obs = mask[..., 0] > 0
+    R_post = ((w_samp.unsqueeze(-1) * (x.unsqueeze(2) - h).pow(2)).sum(2))[obs].mean(0)   # (D,)
+    R_perp = None
+    if C_cur is not None and C_cur.shape[0] > C_cur.shape[1]:
+        yc = (x - d_cur)[obs]                                        # (N,D)
+        perp = yc - yc @ C_cur @ C_cur.t()                           # (I - C C^T)(y-d), C orthonormal cols
+        Pii = (1.0 - C_cur.pow(2).sum(-1)).clamp_min(1e-3)           # (D,) diag of the projector
+        R_perp = perp.pow(2).mean(0) / Pii
+    R = R_post if (est == "posterior" or R_perp is None) else R_perp
+    if est not in ("posterior", "perp"):
+        raise ValueError(f"obs_noise_est must be 'posterior' or 'perp', got {est!r}")
+    if mode == "scalar":
+        R = R.mean().expand_as(R).clone()
+    elif mode != "diag":
+        raise ValueError(f"obs_noise_mode must be 'diag' or 'scalar', got {mode!r}")
+    diag = {"R_post": float(R_post.mean()),
+            "R_perp": float("nan") if R_perp is None else float(R_perp.mean())}
+    return R.clamp_min(floor ** 2), diag
+
+
+@torch.no_grad()
 def fit_obs_map_stiefel(z_hat, y, C_cur):
     """High-D Stiefel observation map (orthogonal Procrustes): C = unit direction of the cross-covariance
     of y and the inferred latent; d is the intercept. Obs are standardized upstream so the decode has no
@@ -398,7 +498,10 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
           learn_g, g_net, reg_lambda, reg_lambda_g, m_inner,
           learn_obs=False, c_stable_tol=0.05, C_cur=None, d_cur=None,
           meshfree_mean=False, n_mean=256, near_std=0.3, broad_std=1.6, mean_method="fixed", mala=None,
-          joint_g=False, noise_std=None, g_cur_in=None, drift_target="forward", bootstrap=False):
+          joint_g=False, noise_std=None, g_cur_in=None, drift_target="forward", bootstrap=False,
+          diffusion_cov=False, g_floor=0.05,
+          learn_obs_noise=False, obs_noise_mode="diag", obs_noise_est="perp", noise_var_in=None,
+          obs_noise_damp=0.5):
     """One EM M-step. Order: posterior-mean increments -> (high-D) Stiefel obs-map + cstab ->
     drift GATED on `cstab < c_stable_tol` -> diffusion. In 1-D (learn_obs=False) cstab==0, so the
     gate is always open and this reduces to the plain f,g M-step. `meshfree_mean` replaces the grid
@@ -410,6 +513,7 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
     is the wrong, over-smoothed drift target), so ONE posterior (the forward filter) feeds both moments.
     Returns updated {g_cur, C_cur, d_cur, cstab}."""
     ess = accept = None
+    z_samp = w_samp = None                                            # posterior samples (obs-noise M-step)
     center = zhat_from_obs(x, C_cur, d_cur) if learn_obs else x       # (T,B,d) (obs standardized upstream)
     if bootstrap:                                                    # no-warmup seed: fit from the deterministic
         z_hat = center                                              #   init projection, skip the untrained operator
@@ -417,6 +521,7 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
         z_hat, diag = filter_mean(model, x, mask, center, method=mean_method, n_mean=n_mean,
                                   near_std=near_std, broad_std=broad_std, mala=mala)
         ess, accept = diag.get("ess"), diag.get("accept")
+        z_samp, w_samp = diag.get("z_samp"), diag.get("w_samp")
     else:
         z_hat = posterior_mean(model, x, mask, z_grid)                # (T, B) -- 1-D grid only
     pair = None                                                       # filter lag-one joint for g (drift stays on the mean)
@@ -449,8 +554,27 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
             with torch.no_grad():                                   #   z_t + (dt/2) f(z_t) -- noise-free, |shift| BOUNDED by
                 zc_fit = zc + 0.5 * dt * drift_net.net(zc)          #   (dt/2)|f| (not the quadratic (dt/2)|grad f . f|)
         fit_drift(drift_net, dr_opt, zc_fit, dz_fit, reg_lambda, m_inner)
-    g_cur = None
+    g_cur = L_cur = None
+    g_iso = aniso = float("nan")
     if learn_g:
-        g_cur = fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,
-                              g_net, reg_lambda_g, m_inner, pair=pair)
-    return dict(g_cur=g_cur, C_cur=C_cur, d_cur=d_cur, cstab=cstab, ess=ess, accept=accept)
+        if diffusion_cov and not g_net:                               # FULL matrix diffusion Sigma = L L^T
+            L_cur = fit_diffusion_cov(drift_net, zc, zc_next, dz, dt, g_floor=g_floor)
+            g_cur, g_iso, aniso = chol_summary(L_cur)                 # gauge-covariant scalar + diagnostics
+        else:                                                         # legacy scalar g (or state-dependent g_net)
+            g_cur = fit_diffusion(diff_net, dg_opt, drift_net, zc, zc_next, dz, z_reg, hr, dt,
+                                  g_net, reg_lambda_g, m_inner, pair=pair)
+    # ---- observation noise R (skipped at bootstrap: no operator posterior yet, so no spread term) ----
+    noise_var, R_perp, R_post = noise_var_in, float("nan"), float("nan")
+    if learn_obs_noise and not bootstrap and z_samp is not None:
+        R_new, rdiag = fit_obs_noise(x, mask, z_samp, w_samp, C_cur if learn_obs else None,
+                                     d_cur if learn_obs else None, mode=obs_noise_mode, est=obs_noise_est)
+        R_perp = rdiag["R_perp"]
+        R_post = rdiag["R_post"]
+        # DAMPED update. R feeds straight back into the likelihood sharpness, so a single bad M-step
+        # (e.g. an under-trained operator, whose over-wide posterior inflates E_q[(y-h)^2]) would
+        # flatten the likelihood and slow the operator down. An EMA bounds how far one step can move it
+        # while still converging over the handful of M-steps a run performs.
+        noise_var = (R_new if noise_var_in is None else
+                     obs_noise_damp * noise_var_in + (1.0 - obs_noise_damp) * R_new)
+    return dict(g_cur=g_cur, L_cur=L_cur, C_cur=C_cur, d_cur=d_cur, cstab=cstab, ess=ess, accept=accept,
+                noise_var=noise_var, R_perp=R_perp, R_post=R_post, g_iso=g_iso, aniso=aniso)

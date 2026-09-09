@@ -105,5 +105,32 @@ drift_target: det_mid     # drift M-step increment target. DEFAULT det_mid (robu
                           #   |f| -- that zeros it at fixed points) -> ito's precision where the correction is small
                           #   + det_mid stability where it's large. Recovers the dw 0.207->0.157 gap, but adds a clip
                           #   hyperparameter, so not worth it unless the last bit of drift accuracy matters.
+diffusion_cov: true      # diffusion as a FULL covariance Sigma = L L^T (L lower-triangular, fit in closed
+                         #   form from the increment second moment) instead of an isotropic scalar g. The FP
+                         #   term becomes grad ell^T Sigma grad ell + tr(Sigma H), computed at the SAME cost as
+                         #   the Laplacian by taking the directional 2nd derivatives along L's COLUMNS. Exactly
+                         #   equivalent to the scalar path when L = g I, so d==1 is unchanged; it only bites at
+                         #   latent d>1, where the Stiefel C forces all amplitude anisotropy into the latent
+                         #   while one scalar g would impose a single noise scale on every direction.
+                         #   Reported `g` stays comparable: it is det(Sigma)^(1/2d), which equals g when isotropic.
+g_floor: 0.05            # ridge added to Sigma before the Cholesky (and the old scalar-g clamp): keeps the
+                         #   factorization well-conditioned when a latent direction is nearly deterministic.
+learn_obs_noise: true    # fit the observation noise R in the M-step instead of trusting the configured
+                         #   noise_std. R sets the likelihood sharpness in the jump, hence the posterior width,
+                         #   hence g and the drift -- and on real data (Kato) it is a guessed hyperparameter that
+                         #   swings whole-trace recon 0.84 <-> 0.77. Estimated as E_q[(y-Cz-d)^2] over the MALA
+                         #   posterior SAMPLES (not at the mean): the mean-only estimator drops Var_q[Cz] and
+                         #   runs to zero, while the sample estimator is anchored from below by the D-d
+                         #   observation directions orthogonal to span(C), which no z can explain.
+obs_noise_damp: 0.5      # EMA on the R update (new = damp*old + (1-damp)*fit). R feeds back into the
+                         #   likelihood sharpness, so this bounds how far one M-step can move it.
+obs_noise_est: perp      # WHICH estimator. perp (default) = residual on the D-d observation directions
+                         #   ORTHOGONAL to span(C), where no latent can contribute: immune both to the
+                         #   operator's known posterior over-dispersion and to the R->wider-posterior->larger-R
+                         #   feedback. posterior = textbook EM over MALA samples, correct if q were exact but
+                         #   it inherits the over-dispersion bias and reads high. Both are always logged
+                         #   (obs_noise_perp / obs_noise_post) so the gap is visible.
+obs_noise_mode: diag     # diag = one variance per observation dim (what real sensors/neurons need);
+                         #   scalar = pooled isotropic R.
 loss: zakai
 train_dir: ${train_dir}

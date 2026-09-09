@@ -33,6 +33,30 @@ def trunk_zderivs(trunk, z):
             lap_ax.sum(0).reshape(*shp, -1))
 
 
+def trunk_zderivs_dirs(trunk, z, dirs):
+    """trunk(z) with the full GRADIENT and the directional 2nd derivatives SUMMED over `dirs`.
+
+    z (...,d), dirs (m,d) [row k = direction v_k] -> tau (...,p), grad (...,d,p), sec (...,p) with
+    sec = sum_k v_k^T H(tau) v_k. With dirs = L.T (rows = columns of L) this is tr(Sigma H) for
+    Sigma = L L^T -- the anisotropic-diffusion generalization of the Laplacian, at the same d-direction
+    cost. Mirror of torch OperatorFilter.trunk_zderivs_dirs."""
+    d = z.shape[-1]
+    zin = z.reshape(-1, d)
+    eye = jnp.eye(d, dtype=z.dtype)
+    tau, grads = jax.vmap(lambda e: jax.jvp(trunk, (zin,), (jnp.broadcast_to(e, zin.shape),)))(eye)
+
+    def sec_along(v):
+        vv = jnp.broadcast_to(v, zin.shape)
+        (_, _), (_, dvv) = jax.jvp(lambda x: jax.jvp(trunk, (x,), (vv,)), (zin,), (vv,))
+        return dvv
+
+    sec = jax.vmap(sec_along)(dirs)
+    shp = z.shape[:-1]
+    return (tau[0].reshape(*shp, -1),
+            jnp.moveaxis(grads, 0, -2).reshape(*shp, d, -1),
+            sec.sum(0).reshape(*shp, -1))
+
+
 def trunk_grad(trunk, z):
     """trunk(z) with GRADIENT only -> tau (...,p), grad (...,d,p) (forward-mode Jacobian; MALA readout)."""
     d = z.shape[-1]
@@ -148,3 +172,6 @@ class OperatorFilter(eqx.Module):
 
     def trunk_grad(self, z):
         return trunk_grad(self.trunk, z)
+
+    def trunk_zderivs_dirs(self, z, dirs):
+        return trunk_zderivs_dirs(self.trunk, z, dirs)

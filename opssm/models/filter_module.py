@@ -67,7 +67,9 @@ class ZakaiFilterModule(pl.LightningModule):
                  encoder="gru", encoder_kwargs=None,
                  mean_method="mala", mala_chains=64, mala_steps=30, mala_rng="stochastic",
                  anim_posterior=False, plot_samples=False, latent_dim=1, loss="zakai", train_dir="./dump/nzf",
-                 trunk_activation='softplus'):
+                 trunk_activation='softplus',
+                 diffusion_cov=True, g_floor=0.05, learn_obs_noise=True, obs_noise_mode="diag",
+                 obs_noise_est="perp", obs_noise_damp=0.5):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
@@ -92,6 +94,8 @@ class ZakaiFilterModule(pl.LightningModule):
             self.diff_net.requires_grad_(False)
         # mutable EM state (initialized in setup once the data is known)
         self.g_cur = h.g_init
+        self.L_cur = None                                            # (d,d) Cholesky of Sigma (diffusion_cov)
+        self.noise_var = None                                        # observation-noise variances (scalar or (D,))
         self.C_cur = self.d_cur = None
         self.dr_opt = self.dg_opt = None
 
@@ -124,6 +128,13 @@ class ZakaiFilterModule(pl.LightningModule):
             self.z_reg = self.hr = self.f_true_grid = self.supp = None
         if not h.learn_g:
             self.g_cur = self.sigma
+        # diffusion as a Cholesky factor: Sigma = L L^T. Seeded isotropic at g_init, so a fresh run starts
+        # exactly where the scalar path starts, and d==1 is numerically identical to it throughout.
+        self.L_cur = float(self.g_cur) * torch.eye(d, device=dev)
+        # observation-noise VARIANCE. Starts at the configured noise_std^2 (the old fixed hyperparameter);
+        # the M-step then re-estimates it if learn_obs_noise. Per-dim (D,) so a diagonal R can be learned.
+        D_obs = int(getattr(dm.hparams, "obs_dim", h.data_size) or h.data_size)
+        self.noise_var = torch.full((D_obs,), float(self.noise_std) ** 2, device=dev)
         # high-D observation map init. Obs are standardized to ~unit scale at the dataloader level, so the
         # decode is h(z) = C z + d with NO scale factor (s_scale removed) -- C is a D x d Stiefel matrix and
         # d the (now ~zero) intercept.
@@ -208,16 +219,21 @@ class ZakaiFilterModule(pl.LightningModule):
         zero_warm = step <= h.warmup and not h.init_dynamics          # keep a warm-started drift during warmup
         drift = (lambda z: (torch.zeros_like(z), torch.zeros(z.shape[:-1], device=z.device, dtype=z.dtype))) \
             if zero_warm else self.drift_net.drift
-        diffusion = self.diff_net.diffusion if (h.g_net and step > h.warmup) else self.g_cur
+        if h.g_net and step > h.warmup:                           # state-dependent g^2(z) (1-D only)
+            diffusion = self.diff_net.diffusion
+        elif h.diffusion_cov:                                     # matrix diffusion Sigma = L L^T
+            diffusion = self.L_cur
+        else:
+            diffusion = self.g_cur                                # legacy isotropic scalar
         decode, center = self._decode_center(x)
         opt.zero_grad()
         res, jump, ic, _ = accumulate_pinn_grads(                 # does its own chunked backward
-            self.model, x, mask, self.s_coll, drift, diffusion, _log_prior, self.noise_std,
+            self.model, x, mask, self.s_coll, drift, diffusion, _log_prior, self.noise_var,
             self.dt, h.n_colloc, h.near_std, h.broad_std, h.n_tcoll, h.chunk_size,
             res_mode=h.res_mode, w_res=h.w_res, decode=decode, center=center)
         if h.learn_smoother:                                      # backward E-step: accumulate into the
             res_b, jump_b, tc_b = accumulate_adjoint_grads(       # SAME optimizer (disjoint model_b params,
-                self.model_b, x, mask, self.s_coll, drift, diffusion, self.noise_std, self.dt,  # same frozen dyn)
+                self.model_b, x, mask, self.s_coll, drift, diffusion, self.noise_var, self.dt,  # same frozen dyn)
                 h.n_colloc, h.near_std, h.broad_std, h.n_tcoll, h.chunk_size,
                 res_mode=h.res_mode, w_res=h.w_res, decode=decode, center=center)
         opt.step()
@@ -241,9 +257,20 @@ class ZakaiFilterModule(pl.LightningModule):
                     near_std=h.near_std, broad_std=h.broad_std,
                     mean_method=h.mean_method, mala=self._mala_cfg(),
                     joint_g=h.joint_g, noise_std=self.noise_std, g_cur_in=self.g_cur,
-                    drift_target=h.drift_target, bootstrap=bootstrap)
+                    drift_target=h.drift_target, bootstrap=bootstrap,
+                    diffusion_cov=h.diffusion_cov, g_floor=h.g_floor,
+                    learn_obs_noise=h.learn_obs_noise, obs_noise_mode=h.obs_noise_mode,
+                    obs_noise_est=h.obs_noise_est, noise_var_in=self.noise_var,
+                    obs_noise_damp=h.obs_noise_damp)
         if out["g_cur"] is not None:
             self.g_cur = out["g_cur"]
+        if out.get("L_cur") is not None:
+            self.L_cur = out["L_cur"]
+        elif out["g_cur"] is not None:                                # keep L in sync on the scalar path
+            self.L_cur = float(self.g_cur) * torch.eye(self.model.latent_dim, device=self.device)
+        if out.get("noise_var") is not None:
+            self.noise_var = out["noise_var"]
+        self._mstep_diag = {k: out.get(k) for k in ("R_perp", "R_post", "g_iso", "aniso")}
         if h.learn_obs:
             self.C_cur, self.d_cur = out["C_cur"], out["d_cur"]
         return out
@@ -268,6 +295,8 @@ class ZakaiFilterModule(pl.LightningModule):
             "hparams": dict(self.hparams),                              # MODEL hparams (data_size, latent_dim, ...)
             "data_hparams": dict(dm.hparams),                           # DATAMODULE hparams (mat_path, worm, window, ...)
             "g_cur": float(self.g_cur),
+            "L_cur": None if self.L_cur is None else self.L_cur.detach().cpu(),
+            "noise_var": None if self.noise_var is None else self.noise_var.detach().cpu(),
             "C_cur": None if self.C_cur is None else self.C_cur.detach().cpu(),
             "d_cur": None if self.d_cur is None else self.d_cur.detach().cpu(),
             "obs_mean": None if getattr(dm, "obs_mean", None) is None else dm.obs_mean.detach().cpu(),
@@ -343,6 +372,16 @@ class ZakaiFilterModule(pl.LightningModule):
         x, mask, filt = batch
         d = self.model.latent_dim
         logs = {"g": float(self.g_cur)}
+        if h.diffusion_cov and self.L_cur is not None and d > 1:     # anisotropy of the learned Sigma = L L^T
+            from opssm.models.mstep import chol_summary
+            _, g_iso, aniso = chol_summary(self.L_cur)
+            logs["g_iso"], logs["g_aniso"] = g_iso, aniso
+        if h.learn_obs_noise and self.noise_var is not None:         # learned obs noise vs its fixed prior
+            logs["obs_noise"] = float(self.noise_var.mean().sqrt())
+            for tag, k in (("obs_noise_perp", "R_perp"), ("obs_noise_post", "R_post")):
+                v = getattr(self, "_mstep_diag", {}).get(k)          # log BOTH estimators (NaN-safe)
+                if v is not None and v == v:
+                    logs[tag] = float(v) ** 0.5
         log_pi = None
         if d == 1:                                                   # 1-D GRID metrics (kl, drift_l2 on the grid)
             log_pi = self.model.log_posterior(x, mask, self.z_grid)
