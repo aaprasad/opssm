@@ -108,6 +108,42 @@ class TestMStepRecovery(unittest.TestCase):
         self.assertAlmostEqual(g_iso, 0.6, places=5)
         self.assertAlmostEqual(aniso, 1.0, places=5)
 
+    def test_d1_covariance_equals_scalar_path(self):
+        """At d==1 the covariance M-step must agree with the scalar one to floating-point round-off, so a
+        d==1 A/B (e.g. em_highd) isolates the OTHER knobs instead of silently comparing two diffusion floors.
+        Not bit-exact: the matrix path reduces via `r^T r` and round-trips through eigh, so it differs from
+        the scalar path's `mean(r^2)` in the last ulp (~1e-7 relative). What matters is that there is no
+        SYSTEMATIC offset -- the `+ g_floor^2 I` ridge this replaced biased g^2 by a fixed 0.0025 (~0.7% on
+        this benchmark), which is a real effect an A/B could mistake for a result."""
+        from opssm.models.mstep import fit_diffusion
+        torch.manual_seed(11)
+        dn = DriftNet(8, layers=2, latent_dim=1)
+        dt = 0.1
+        r = torch.randn(60000, 1) * 0.6                               # normal regime, floor inactive
+        zc = torch.randn(60000, 1)
+        g_cov = chol_summary(fit_diffusion_cov(dn, zc, zc, r, dt, g_floor=0.05))[0]
+        g_sca = fit_diffusion(None, None, dn, zc, zc, r, None, None, dt, False, 0.0, 0)
+        self.assertAlmostEqual(g_cov, g_sca, places=6)                # round-off, no systematic offset
+        self.assertLess(abs(g_cov - g_sca) / g_sca, 1e-5)
+        r_small = torch.randn(60000, 1) * 0.01                        # floor active -> equal to float round-off
+        g_cov = chol_summary(fit_diffusion_cov(dn, zc, zc, r_small, dt, g_floor=0.05))[0]
+        g_sca = fit_diffusion(None, None, dn, zc, zc, r_small, None, None, dt, False, 0.0, 0)
+        self.assertAlmostEqual(g_cov, g_sca, places=6)
+
+    def test_floor_does_not_inflate_healthy_eigenvalues(self):
+        """A `+ g_floor^2 I` ridge would shift EVERY eigenvalue; the clamp must leave healthy ones alone."""
+        d, N, dt = 3, 200000, 0.1
+        torch.manual_seed(12)
+        Ltrue = torch.diag(torch.tensor([1.2, 0.9, 0.7]))
+        zc = torch.randn(N, d)
+        delta = (Ltrue @ torch.randn(d, N)).t() * math.sqrt(dt)
+        dn = DriftNet(8, layers=2, latent_dim=d)
+        for p_ in dn.net.parameters():
+            torch.nn.init.zeros_(p_)
+        L = fit_diffusion_cov(dn, zc, zc + delta, delta / dt, dt, g_floor=0.05)
+        ev = torch.linalg.eigvalsh(L @ L.t())
+        self.assertLess(float((ev.sort().values - torch.tensor([0.49, 0.81, 1.44])).abs().max()), 0.02)
+
     def test_recovers_diagonal_R(self):
         torch.manual_seed(4)
         T, B, K, D, dl = 40, 16, 64, 10, 3

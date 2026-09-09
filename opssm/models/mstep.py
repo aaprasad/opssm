@@ -408,7 +408,15 @@ def fit_diffusion_cov(drift_net, zc, zc_next, dz, dt, g_floor=0.05):
     r = dz - f_trap                                                  # (N,d) = Delta/dt
     d = r.shape[-1]
     Sig = (r.t() @ r) / max(r.shape[0], 1) * dt                      # E[r r^T] dt = E[Delta Delta^T]/dt
-    Sig = 0.5 * (Sig + Sig.t()) + (g_floor ** 2) * torch.eye(d, device=r.device, dtype=r.dtype)
+    Sig = 0.5 * (Sig + Sig.t())
+    # FLOOR BY EIGENVALUE CLAMP, not by a ridge. A `+ g_floor^2 I` ridge shifts EVERY eigenvalue up, which
+    # biases the whole diffusion; a clamp only lifts directions that are genuinely degenerate. It is also the
+    # exact matrix generalization of the scalar path's `.clamp_min(g_floor)`, so at d==1 this function agrees
+    # with fit_diffusion_scalar to float ROUND-OFF (~1e-7 rel; not bit-exact -- `r^T r` and the eigh
+    # round-trip reduce differently from `mean(r^2)`). The point is the absence of a SYSTEMATIC offset: the
+    # ridge this replaced added a fixed 0.0025 to g^2 (~0.7% here), which a d==1 A/B could misread as a result.
+    ev, V = torch.linalg.eigh(Sig)
+    Sig = (V * ev.clamp_min(g_floor ** 2)) @ V.t()
     return torch.linalg.cholesky(Sig)                                # (d,d) lower-triangular
 
 

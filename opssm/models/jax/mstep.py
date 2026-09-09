@@ -85,7 +85,12 @@ def fit_diffusion_cov(drift_net, zc, zc_next, dz, dt, g_floor=0.05):
     r = dz - f_trap                                                  # (N,d) = Delta/dt
     d = r.shape[-1]
     Sig = (r.T @ r) / max(r.shape[0], 1) * dt
-    Sig = 0.5 * (Sig + Sig.T) + (g_floor ** 2) * jnp.eye(d, dtype=r.dtype)
+    Sig = 0.5 * (Sig + Sig.T)
+    # eigenvalue CLAMP, not a ridge (a ridge shifts every eigenvalue up); the exact matrix generalization of
+    # the scalar path's clamp_min, so d==1 agrees with fit_diffusion_scalar to float round-off (~1e-7 rel),
+    # with no SYSTEMATIC offset (the ridge it replaced added a fixed g_floor^2 to every eigenvalue).
+    ev, V = jnp.linalg.eigh(Sig)
+    Sig = (V * jnp.maximum(ev, g_floor ** 2)) @ V.T
     return jnp.linalg.cholesky(Sig)
 
 
