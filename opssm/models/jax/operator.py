@@ -34,26 +34,24 @@ def trunk_zderivs(trunk, z):
 
 
 def trunk_zderivs_dirs(trunk, z, dirs):
-    """trunk(z) with the full GRADIENT and the directional 2nd derivatives SUMMED over `dirs`.
+    """DIRECTIONAL 1st+2nd derivatives along `dirs` in ONE fused pass (mirror of torch).
 
-    z (...,d), dirs (m,d) [row k = direction v_k] -> tau (...,p), grad (...,d,p), sec (...,p) with
-    sec = sum_k v_k^T H(tau) v_k. With dirs = L.T (rows = columns of L) this is tr(Sigma H) for
-    Sigma = L L^T -- the anisotropic-diffusion generalization of the Laplacian, at the same d-direction
-    cost. Mirror of torch OperatorFilter.trunk_zderivs_dirs."""
+    z (...,d), dirs (m,d) [row k = v_k] -> tau (...,p), dgrad (...,m,p) [v_k . grad tau],
+    sec (...,p) [sum_k v_k^T H v_k]. With dirs = L.T: dgrad = L^T grad tau and sec = tr(Sigma H).
+    One vmapped nested jvp -- same cost/memory as the isotropic trunk_zderivs. (An earlier two-pass
+    version that also took the unit-axis gradient OOM'd: the E-step backprops through both passes.)"""
     d = z.shape[-1]
     zin = z.reshape(-1, d)
-    eye = jnp.eye(d, dtype=z.dtype)
-    tau, grads = jax.vmap(lambda e: jax.jvp(trunk, (zin,), (jnp.broadcast_to(e, zin.shape),)))(eye)
 
-    def sec_along(v):
+    def along(v):
         vv = jnp.broadcast_to(v, zin.shape)
-        (_, _), (_, dvv) = jax.jvp(lambda x: jax.jvp(trunk, (x,), (vv,)), (zin,), (vv,))
-        return dvv
+        (tau, dv), (_, dvv) = jax.jvp(lambda x: jax.jvp(trunk, (x,), (vv,)), (zin,), (vv,))
+        return tau, dv, dvv
 
-    sec = jax.vmap(sec_along)(dirs)
+    tau, dgrad, sec = jax.vmap(along)(dirs)
     shp = z.shape[:-1]
     return (tau[0].reshape(*shp, -1),
-            jnp.moveaxis(grads, 0, -2).reshape(*shp, d, -1),
+            jnp.moveaxis(dgrad, 0, -2).reshape(*shp, dirs.shape[0], -1),
             sec.sum(0).reshape(*shp, -1))
 
 

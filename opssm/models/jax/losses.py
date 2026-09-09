@@ -61,10 +61,16 @@ def gauss_loglik(xs, z_col, decode, noise_var):
     return -0.5 * (resid ** 2 / noise_var).sum(-1)
 
 
-def fp_diffusion_term(b_s, grad_ell, sec_tau, L):
-    """grad ell^T Sigma grad ell + tr(Sigma H(ell)) = |L^T grad ell|^2 + sum_p b_p tr(Sigma H(tau_p))."""
-    Lg = jnp.einsum("tbskd,de->tbske", grad_ell, L)
-    return (Lg ** 2).sum(-1) + jnp.einsum("tbsp,tbkp->tbsk", b_s, sec_tau)
+def fp_matrix_rhs(b_s, Ltg_tau, sec_tau, f, div_f, L):
+    """FP rhs for a constant matrix diffusion Sigma = L L^T, from DIRECTIONAL derivatives only:
+        -(div f + f . grad ell) + 1/2 (|L^T grad ell|^2 + tr(Sigma H)),  f . grad ell = (L^-1 f).(L^T grad ell).
+    Applying L^-1 to the small drift tensor avoids ever forming grad ell, so no second autodiff pass."""
+    Lt_grad_ell = jnp.einsum("tbsp,tbkdp->tbskd", b_s, Ltg_tau)
+    quad = (Lt_grad_ell ** 2).sum(-1)
+    sec_ell = jnp.einsum("tbsp,tbkp->tbsk", b_s, sec_tau)
+    Linv = jnp.linalg.inv(L)
+    f_dot = jnp.einsum("ed,tbkd,tbske->tbsk", Linv, f, Lt_grad_ell)
+    return -(div_f[:, :, None] + f_dot) + 0.5 * (quad + sec_ell)
 
 
 def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_prior,
@@ -106,22 +112,23 @@ def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_pri
         ti = jnp.arange(T)
     b_s, ds_b = model.coeffs_dtime(ctx[ti], s_coll)              # (Ts,B,Ns,p)
     L = as_chol(sigma)                                           # (d,d) Cholesky, or None (iso / g_net)
-    if L is not None:                # anisotropic Sigma = L L^T: 2nd derivs along L's COLUMNS -> tr(Sigma H)
-        tau_s, grad_tau, sec_tau = model.trunk_zderivs_dirs(z_col[ti], L.T)
-        lap_tau = None
+    if L is not None:                # anisotropic Sigma = L L^T: ONE pass of directional derivs along L's cols
+        tau_s, Ltg_tau, sec_tau = model.trunk_zderivs_dirs(z_col[ti], L.T)
+        grad_tau = lap_tau = None
     else:
         tau_s, grad_tau, lap_tau = model.trunk_zderivs(z_col[ti])    # (Ts,B,K,p),(...,K,d,p),(...,K,p)
-    grad_ell = jnp.einsum("tbsp,tbkdp->tbskd", b_s, grad_tau)    # (Ts,B,Ns,K,d)  grad ell
-    grad_ell_sq = (grad_ell ** 2).sum(-1)                        # (Ts,B,Ns,K)    |grad ell|^2
+    grad_ell = (None if grad_tau is None else
+                jnp.einsum("tbsp,tbkdp->tbskd", b_s, grad_tau))   # (Ts,B,Ns,K,d)  grad ell
+    grad_ell_sq = None if grad_ell is None else (grad_ell ** 2).sum(-1)
     lap_ell = (None if lap_tau is None else
                jnp.einsum("tbsp,tbkp->tbsk", b_s, lap_tau))       # (Ts,B,Ns,K)    Laplacian ell
     ds_ell = jnp.einsum("tbsp,tbkp->tbsk", ds_b, tau_s)
     f, div_f = drift(z_col[ti])                                  # f (Ts,B,K,d), div f (Ts,B,K)
-    f_dot = jnp.einsum("tbskd,tbkd->tbsk", grad_ell, f)         # f . grad ell  (Ts,B,Ns,K)
-    divf = div_f[:, :, None]                                     # (Ts,B,1,K)
     if L is not None:                                            # MATRIX diffusion Sigma = L L^T (anisotropic)
-        rhs = -(divf + f_dot) + 0.5 * fp_diffusion_term(b_s, grad_ell, sec_tau, L)
+        rhs = fp_matrix_rhs(b_s, Ltg_tau, sec_tau, f, div_f, L)
     elif callable(sigma):                                        # state-dependent g^2(z) -- 1-D only (g_net)
+        f_dot = jnp.einsum("tbskd,tbkd->tbsk", grad_ell, f)      # f . grad ell  (Ts,B,Ns,K)
+        divf = div_f[:, :, None]                                 # (Ts,B,1,K)
         g2, dg2, d2g2 = sigma(z_col[ti])                        # (Ts,B,K,1) each (DiffusionNet.diffusion 1-D)
         g2 = g2[:, :, None]; dg2 = dg2[:, :, None]; d2g2 = d2g2[:, :, None]
         dz_ell = grad_ell[..., 0]                               # d==1 gradient component
@@ -129,7 +136,8 @@ def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_pri
         rhs = (-(divf + f_dot)
                + 0.5 * d2g2 + dg2 * dz_ell + 0.5 * g2 * (grad_ell_sq + lap_ell))
     else:                                                        # constant scalar g (isotropic D = g^2 I)
-        rhs = -(divf + f_dot) + 0.5 * sigma ** 2 * (grad_ell_sq + lap_ell)
+        f_dot = jnp.einsum("tbskd,tbkd->tbsk", grad_ell, f)      # f . grad ell  (Ts,B,Ns,K)
+        rhs = -(div_f[:, :, None] + f_dot) + 0.5 * sigma ** 2 * (grad_ell_sq + lap_ell)
     res2 = (ds_ell / dt - rhs) ** 2                              # (Ts,B,Ns,K)
     # SCALE-INVARIANT residual: in LOG space the FP terms scale ~1/sigma^2, so for a SHARP density the L2
     # residual EXPLODES far from the mode (biasing WIDE). "rel"/"log1p" tame the tail; "l2" = absolute.

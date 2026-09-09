@@ -47,18 +47,23 @@ def gauss_loglik(xs, z_col, decode, noise_var):
     return -0.5 * (resid.pow(2) / noise_var).sum(-1)
 
 
-def fp_diffusion_term(b_s, grad_ell, sec_tau, L):
-    """The FP diffusion term in LOG space for a constant matrix diffusion Sigma = L L^T:
+def fp_matrix_rhs(b_s, Ltg_tau, sec_tau, f, div_f, L):
+    """FP right-hand side in LOG space for a constant matrix diffusion Sigma = L L^T:
 
-        grad ell^T Sigma grad ell + tr(Sigma H(ell))  =  |L^T grad ell|^2 + sum_p b_p tr(Sigma H(tau_p))
+        -(div f + f . grad ell) + 1/2 ( grad ell^T Sigma grad ell + tr(Sigma H(ell)) )
 
-    grad_ell (Ts,B,Ns,K,d), sec_tau (Ts,B,K,p) [from trunk_zderivs_dirs with dirs = L.T],
-    b_s (Ts,B,Ns,p) -> (Ts,B,Ns,K). The quadratic form needs NO extra autodiff (it is a contraction
-    of the gradient already computed); only the weighted Hessian trace does, and that costs the same
-    d directions as the isotropic Laplacian."""
-    Lg = torch.einsum("tbskd,de->tbske", grad_ell, L)         # (L^T grad ell)_e = sum_d L_{d,e} grad_d
-    quad = Lg.pow(2).sum(-1)                                  # grad^T Sigma grad   (Ts,B,Ns,K)
-    return quad + torch.einsum("tbsp,tbkp->tbsk", b_s, sec_tau)
+    built entirely from the DIRECTIONAL derivatives along L's columns, so no separate gradient pass is
+    needed. With Lt_grad_ell = L^T grad ell (Ts,B,Ns,K,d) and Linv_f = L^-1 f (Ts,B,K,d):
+        grad ell^T Sigma grad ell = |Lt_grad_ell|^2 ,
+        f . grad ell              = (L^-1 f) . (L^T grad ell)      [exact: f^T L^-T L^T grad ell]
+    Reduces exactly to the isotropic branch when L = g I. Inputs: b_s (Ts,B,Ns,p),
+    Ltg_tau (Ts,B,K,d,p), sec_tau (Ts,B,K,p), f (Ts,B,K,d), div_f (Ts,B,K)."""
+    Lt_grad_ell = torch.einsum("tbsp,tbkdp->tbskd", b_s, Ltg_tau)    # L^T grad ell
+    quad = Lt_grad_ell.pow(2).sum(-1)                                # grad^T Sigma grad
+    sec_ell = torch.einsum("tbsp,tbkp->tbsk", b_s, sec_tau)          # tr(Sigma H(ell))
+    Linv = torch.linalg.inv(L)                                       # (d,d), tiny
+    f_dot = torch.einsum("ed,tbkd,tbske->tbsk", Linv, f, Lt_grad_ell)
+    return -(div_f.unsqueeze(2) + f_dot) + 0.5 * (quad + sec_ell)
 
 
 def sample_collocation(xs, mask, n_colloc, near_std, broad_std, center=None):
@@ -137,24 +142,23 @@ def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_pri
           else torch.arange(T, device=z_col.device))
     b_s, ds_b = model.coeffs_dtime(ctx[ti], s_coll)                   # (Ts,B,Ns,p)
     L = as_chol(sigma, z_col.shape[-1])                               # (d,d) Cholesky factor, or None (iso/g_net)
-    if L is not None:            # anisotropic Sigma = L L^T: directional 2nd derivs along L's COLUMNS
-        tau_s, grad_tau, sec_tau = model.trunk_zderivs_dirs(z_col[ti], L.t())   # sec = tr(Sigma H)
-        lap_tau = None
+    if L is not None:            # anisotropic Sigma = L L^T: ONE pass of directional derivs along L's COLUMNS
+        tau_s, Ltg_tau, sec_tau = model.trunk_zderivs_dirs(z_col[ti], L.t())    # L^T grad tau, tr(Sigma H)
+        grad_tau = lap_tau = None
     else:
         tau_s, grad_tau, lap_tau = model.trunk_zderivs(z_col[ti])     # (Ts,B,K,p),(...,K,d,p),(...,K,p)
-    grad_ell = torch.einsum("tbsp,tbkdp->tbskd", b_s, grad_tau)       # (Ts,B,Ns,K,d)  grad ell
-    grad_ell_sq = grad_ell.pow(2).sum(-1)                             # (Ts,B,Ns,K)    |grad ell|^2
+    grad_ell = (None if grad_tau is None else
+                torch.einsum("tbsp,tbkdp->tbskd", b_s, grad_tau))     # (Ts,B,Ns,K,d)  grad ell
+    grad_ell_sq = None if grad_ell is None else grad_ell.pow(2).sum(-1)   # (Ts,B,Ns,K) |grad ell|^2
     lap_ell = (None if lap_tau is None else
                torch.einsum("tbsp,tbkp->tbsk", b_s, lap_tau))         # (Ts,B,Ns,K)    Laplacian ell
     ds_ell = torch.einsum("tbsp,tbkp->tbsk", ds_b, tau_s)
     f, div_f = drift(z_col[ti])                                       # f (Ts,B,K,d), div f (Ts,B,K)
-    f_dot = torch.einsum("tbskd,tbkd->tbsk", grad_ell, f)            # f . grad ell  (Ts,B,Ns,K)
-    divf = div_f.unsqueeze(2)                                        # (Ts,B,1,K)
     if L is not None:                                               # MATRIX diffusion Sigma = L L^T (anisotropic)
-        # d-D FP in log-space: -(div f + f . grad ell) + 1/2 (grad ell^T Sigma grad ell + tr(Sigma H)).
-        # Reduces EXACTLY to the isotropic branch below when L = g I.
-        rhs = -(divf + f_dot) + 0.5 * fp_diffusion_term(b_s, grad_ell, sec_tau, L)
+        rhs = fp_matrix_rhs(b_s, Ltg_tau, sec_tau, f, div_f, L)
     elif callable(sigma):                                           # state-dependent g^2(z) -- 1-D only (g_net)
+        f_dot = torch.einsum("tbskd,tbkd->tbsk", grad_ell, f)       # f . grad ell  (Ts,B,Ns,K)
+        divf = div_f.unsqueeze(2)                                   # (Ts,B,1,K)
         g2, dg2, d2g2 = sigma(z_col[ti])                            # (Ts,B,K) each (DiffusionNet.diffusion is 1-D)
         g2 = g2.unsqueeze(2); dg2 = dg2.unsqueeze(2); d2g2 = d2g2.unsqueeze(2)
         dz_ell = grad_ell[..., 0]                                   # d==1 gradient component
@@ -163,7 +167,8 @@ def pinn_zakai_loss(model, xs, mask, z_col, log_q, s_coll, drift, sigma, log_pri
                + 0.5 * d2g2 + dg2 * dz_ell + 0.5 * g2 * (grad_ell_sq + lap_ell))
     else:                                                          # constant scalar g (isotropic D = g^2 I)
         # d-D FP in log-space: -(div f + f . grad ell) + 1/2 g^2 (|grad ell|^2 + Laplacian ell)
-        rhs = -(divf + f_dot) + 0.5 * sigma ** 2 * (grad_ell_sq + lap_ell)
+        f_dot = torch.einsum("tbskd,tbkd->tbsk", grad_ell, f)       # f . grad ell  (Ts,B,Ns,K)
+        rhs = -(div_f.unsqueeze(2) + f_dot) + 0.5 * sigma ** 2 * (grad_ell_sq + lap_ell)
     res2 = (ds_ell / dt - rhs) ** 2                                   # (Ts,B,Ns,K)
     # SCALE-INVARIANT residual (over-dispersion fix): in LOG space the FP terms scale as ~1/sigma^2,
     # so for a SHARP density the L2 residual EXPLODES at collocation samples far from the mode
@@ -261,25 +266,33 @@ def pinn_adjoint_loss(model_b, xs, mask, z_col, log_q, s_coll, drift, sigma,
           else torch.arange(T, device=z_col.device))
     b_s, ds_b = model_b.coeffs_dtime(ctx[ti], s_coll)             # (Ts,B,Ns,p)
     Lb = as_chol(sigma, z_col.shape[-1])                          # matrix diffusion (or None -> iso/g_net)
-    if Lb is not None:
-        tau_s, grad_tau, sec_tau = model_b.trunk_zderivs_dirs(z_col[ti], Lb.t())
-        lap_tau = None
+    if Lb is not None:                                            # ONE pass of directional derivs along L's cols
+        tau_s, Ltg_tau, sec_tau = model_b.trunk_zderivs_dirs(z_col[ti], Lb.t())
+        grad_tau = lap_tau = None
     else:
         tau_s, grad_tau, lap_tau = model_b.trunk_zderivs(z_col[ti])   # (Ts,B,K,p),(...,K,d,p),(...,K,p)
-    grad_lm = torch.einsum("tbsp,tbkdp->tbskd", b_s, grad_tau)   # (Ts,B,Ns,K,d)
-    grad_lm_sq = grad_lm.pow(2).sum(-1)                          # (Ts,B,Ns,K)
+    grad_lm = (None if grad_tau is None else
+               torch.einsum("tbsp,tbkdp->tbskd", b_s, grad_tau))  # (Ts,B,Ns,K,d)
+    grad_lm_sq = None if grad_lm is None else grad_lm.pow(2).sum(-1)   # (Ts,B,Ns,K)
     lap_lm = (None if lap_tau is None else
               torch.einsum("tbsp,tbkp->tbsk", b_s, lap_tau))      # (Ts,B,Ns,K)
     ds_lm = torch.einsum("tbsp,tbkp->tbsk", ds_b, tau_s)
     f, _ = drift(z_col[ti])                                       # backward GENERATOR uses f (not div f)
-    f_dot = torch.einsum("tbskd,tbkd->tbsk", grad_lm, f)         # f . grad lmsg  (Ts,B,Ns,K)
     if Lb is not None:                                           # MATRIX diffusion (adjoint GENERATOR)
-        rhs = f_dot + 0.5 * fp_diffusion_term(b_s, grad_lm, sec_tau, Lb)
-    elif callable(sigma):                                        # state-dependent g^2(z) -- 1-D only (g_net)
+        # +f.grad + 1/2 (grad^T Sigma grad + tr(Sigma H)); fp_matrix_rhs gives -(div f + f.grad) + 1/2(...),
+        # so pass div_f = 0 and add back 2*f.grad to flip the drift sign (generator, not FP adjoint).
+        Lt_grad = torch.einsum("tbsp,tbkdp->tbskd", b_s, Ltg_tau)
+        Linv = torch.linalg.inv(Lb)
+        f_dot = torch.einsum("ed,tbkd,tbske->tbsk", Linv, f, Lt_grad)
+        sec_ell = torch.einsum("tbsp,tbkp->tbsk", b_s, sec_tau)
+        rhs = f_dot + 0.5 * (Lt_grad.pow(2).sum(-1) + sec_ell)
+    elif callable(sigma):
+        f_dot = torch.einsum("tbskd,tbkd->tbsk", grad_lm, f)     # f . grad lmsg  (Ts,B,Ns,K)                                        # state-dependent g^2(z) -- 1-D only (g_net)
         g2 = sigma(z_col[ti])[0].unsqueeze(2)
         rhs = f_dot + 0.5 * g2 * (grad_lm_sq + lap_lm)           # NO d2g2/dg2 (generator, not FP adjoint)
     else:                                                        # constant scalar g (isotropic)
         # d-D backward generator: f . grad lmsg + 1/2 g^2 (|grad lmsg|^2 + Laplacian lmsg)
+        f_dot = torch.einsum("tbskd,tbkd->tbsk", grad_lm, f)     # f . grad lmsg  (Ts,B,Ns,K)
         rhs = f_dot + 0.5 * sigma ** 2 * (grad_lm_sq + lap_lm)
     res2 = (ds_lm / dt - rhs) ** 2                                # (Ts,B,Ns,K)
     if res_mode == "rel":                                         # scale-invariant residual (as forward)

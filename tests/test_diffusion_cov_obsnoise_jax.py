@@ -39,14 +39,16 @@ class TestWeightedHessianTrace(unittest.TestCase):
             op, *_ = _setup(d)
             z = jax.random.normal(jax.random.PRNGKey(7), (6, d))
             L = jnp.tril(jax.random.normal(jax.random.PRNGKey(d), (d, d))) + jnp.eye(d) * 1.5
-            _, grad, sec = op.trunk_zderivs_dirs(z, L.T)
+            _, dgrad, sec = op.trunk_zderivs_dirs(z, L.T)
             H = jnp.stack([jax.hessian(lambda x, j=j: op.trunk(x[None])[0, j])(z[0]) for j in range(6)])
             ref = jnp.einsum("ab,jab->j", L @ L.T, H)
             self.assertLess(float(jnp.abs(sec[0] - ref).max()), 1e-10)
             _, grad_ref, lap = op.trunk_zderivs(z)
-            self.assertLess(float(jnp.abs(grad - grad_ref).max()), 1e-12)
-            _, _, sec_iso = op.trunk_zderivs_dirs(z, 0.7 * jnp.eye(d))
+            # single fused pass returns DIRECTIONAL derivatives = L^T grad tau
+            self.assertLess(float(jnp.abs(dgrad - jnp.einsum("de,ndp->nep", L, grad_ref)).max()), 1e-12)
+            _, dg_iso, sec_iso = op.trunk_zderivs_dirs(z, 0.7 * jnp.eye(d))
             self.assertLess(float(jnp.abs(sec_iso - 0.49 * lap).max()), 1e-12)
+            self.assertLess(float(jnp.abs(dg_iso - 0.7 * grad_ref).max()), 1e-12)
 
 
 class TestLossReduction(unittest.TestCase):
