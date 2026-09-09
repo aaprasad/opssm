@@ -67,7 +67,7 @@ class ZakaiFilterModule(pl.LightningModule):
                  encoder="gru", encoder_kwargs=None,
                  mean_method="mala", mala_chains=64, mala_steps=30, mala_rng="stochastic",
                  anim_posterior=False, plot_samples=False, latent_dim=1, loss="zakai", train_dir="./dump/nzf",
-                 tail_std=0.0, trunk_activation='tanh'):
+                 trunk_activation='softplus'):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
@@ -76,7 +76,7 @@ class ZakaiFilterModule(pl.LightningModule):
                                     branch_hidden=h.branch_hidden, trunk_hidden=h.trunk_hidden,
                                     trunk_layers=h.trunk_layers,
                                     encoder=h.encoder, encoder_kwargs=h.encoder_kwargs, latent_dim=h.latent_dim,
-                                    tail_std=h.tail_std, trunk_activation=h.trunk_activation)
+                                    trunk_activation=h.trunk_activation)
         # backward adjoint-Zakai twin for the two-filter smoother (default off => byte-identical filter)
         self.model_b = OperatorBackward(h.data_size, h.gru_hidden, h.ctx_dim, h.p,
                                         branch_hidden=h.branch_hidden, trunk_hidden=h.trunk_hidden,
@@ -94,6 +94,13 @@ class ZakaiFilterModule(pl.LightningModule):
         self.g_cur = h.g_init
         self.C_cur = self.d_cur = None
         self.dr_opt = self.dg_opt = None
+
+    def on_load_checkpoint(self, checkpoint):
+        saved = checkpoint.get('hyper_parameters', {})
+        if saved.get('tail_std', 0.0) != 0.0:
+            raise ValueError('This checkpoint uses removed Gaussian tails; use the experiment revision to load it')
+        if saved.get('trunk_activation', 'tanh') != self.hparams.trunk_activation:
+            raise ValueError('Checkpoint trunk_activation differs from this model; construct it with the saved activation')
 
     # -- static config pulled from the datamodule + EM-state init --------------------------------
     def setup(self, stage=None):
@@ -371,7 +378,7 @@ class ZakaiFilterModule(pl.LightningModule):
             _, ctr_c = self._decode_center(x)
             z_col, log_q = sample_collocation(x, mask, h.n_colloc, h.near_std, h.broad_std, ctr_c)
             b0_c = self.model.coeffs(self.model.context(x, mask), torch.zeros(1, device=x.device))[:, :, 0]
-            tau_c = self.model.state_basis(z_col.reshape(-1, z_col.shape[-1])).reshape(*z_col.shape[:3], -1)
+            tau_c = self.model.trunk(z_col.reshape(-1, z_col.shape[-1])).reshape(*z_col.shape[:3], -1)
             ell0_c = torch.einsum("tbp,tbkp->tbk", b0_c, tau_c) + self.model.bias
             Wc = torch.softmax(ell0_c - log_q, dim=-1)               # (T,B,K) SNIS posterior weights
             logs["ess_coll"] = float((1.0 / (h.n_colloc * Wc.pow(2).sum(-1))).mean())

@@ -6,10 +6,7 @@ p: 64
 branch_hidden: 128        # branch MLP hidden width (context+time -> basis coeffs)
 trunk_hidden: 64          # trunk MLP hidden width (latent z -> state basis)
 trunk_layers: 3           # trunk MLP depth (# hidden layers)
-trunk_activation: tanh   # tanh | softplus; changes only the state basis, not branch/encoder/dynamics
-tail_std: 0.0             # 0 = no fixed tail; >0 adds -|z|²/(2 tail_std²) to the FORWARD
-                         # density, guaranteeing integrability. Try 2.0; backward likelihood messages
-                         # keep their original representation. Fixed scale, no extra learned parameters.
+trunk_activation: softplus # softplus (default) | tanh (legacy); state basis only, not branch/encoder/dynamics
 encoder: gru              # context encoder: gru | tcn | transformer | mamba | deer_gru | rno (registry key,
                           #   opssm/models/encoders.py). gru = default, byte-identical. ALL must be CAUSAL
                           #   (ctx_t <- y_{0:t}); the backward smoother twin flips it generically.

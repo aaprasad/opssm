@@ -15,8 +15,6 @@
 """OperatorFilter + OperatorBackward: DeepONet conditional log-density (the mesh-free Zakai forward
 filter, and its anti-causal backward-message twin for the smoother)."""
 
-import math
-
 import torch
 from torch import nn
 from torch.func import jvp, vmap
@@ -30,10 +28,9 @@ class OperatorFilter(nn.Module):
     observation context, mesh-free in z and CONTINUOUS in the within-interval time
     s = tau/dt in [0,1] (tau = time since the last observation):
 
-        ell_i(z, s) = bias + sum_p b_p(c_i, s) * trunk_p(z) - |z|²/(2 tail_std²)
+        ell_i(z, s) = bias + sum_p b_p(c_i, s) * trunk_p(z)
 
-    The Gaussian term is optional (tail_std=0 selects the legacy representation). When enabled,
-    it is a fixed extra state-basis feature; effective basis width is p+1 throughout the API.
+    Softplus trunk activations allow unbounded log-densities. Tanh remains available for legacy runs.
 
     The state basis trunk(z) (p functions of z) is fixed; the per-step coefficients
     b(c_i, s) FLOW with s (a Galerkin-in-z, evolve-in-time DeepONet -- the branch takes
@@ -45,15 +42,10 @@ class OperatorFilter(nn.Module):
 
     def __init__(self, data_size=1, gru_hidden=64, ctx_dim=64, p=64,
                  branch_hidden=128, trunk_hidden=64, trunk_layers=3,
-                 encoder="gru", encoder_kwargs=None, reverse=False, latent_dim=1, tail_std=0.0,
-                 trunk_activation='tanh'):
+                 encoder="gru", encoder_kwargs=None, reverse=False, latent_dim=1,
+                 trunk_activation='softplus'):
         super().__init__()
         self.latent_dim = latent_dim                                 # d: LATENT dim (separate from data_size = obs dim)
-        if not math.isfinite(tail_std) or tail_std < 0:
-            raise ValueError("tail_std must be finite and nonnegative (0 disables the fixed tail)")
-        if tail_std > 0 and trunk_layers < 1:
-            raise ValueError("Gaussian tails require at least one trunk hidden layer")
-        self.tail_std = float(tail_std)
         activations = {'tanh': nn.Tanh, 'softplus': nn.Softplus}
         if trunk_activation not in activations:
             raise ValueError('trunk_activation must be tanh or softplus')
@@ -70,26 +62,6 @@ class OperatorFilter(nn.Module):
                          act=activations[trunk_activation])  # query z (d) -> state basis
         self.bias = nn.Parameter(torch.zeros(()))
 
-    def state_basis(self, z):
-        """Learned basis, optionally augmented by -|z|²/(2 tail_std²).
-
-        The extra feature has a fixed coefficient of one. Thus exp(ell) is integrable on R^d
-        for every context (tanh is bounded; softplus grows at most linearly), while the neural
-        residual can still represent multiple modes. Keeping
-        this outside the MLP preserves parameter names and shapes for existing checkpoints.
-        All density consumers must use this basis, including losses, samplers and readouts.
-        """
-        tau = self.trunk(z)
-        if self.tail_std > 0:
-            tail = -0.5 * (z / self.tail_std).square().sum(-1, keepdim=True)
-            tau = torch.cat([tau, tail], dim=-1)
-        return tau
-
-    def _tail_coeff(self, b, value=1.0):
-        if self.tail_std > 0:
-            b = torch.cat([b, torch.full_like(b[..., :1], value)], dim=-1)
-        return b
-
     def context(self, xs, mask):
         """xs (T,B,M), mask (T,B,1) observed-indicator -> context (T,B,C). reverse=False: CAUSAL, ctx[t]
         summarizes y_{0:t}. reverse=True (backward twin): ANTI-CAUSAL via flip -> causal encoder -> flip,
@@ -101,10 +73,10 @@ class OperatorFilter(nn.Module):
         return self.encoder(inp)                           # (T,B,C); ctx[t] <- y_{0:t}
 
     def coeffs(self, ctx, s):
-        """Coefficients at s (Ns,) -> (T,B,Ns,p_eff), including a fixed tail coefficient if enabled."""
+        """Branch coefficients b(c, s) at within-interval times s (Ns,) -> (T,B,Ns,p)."""
         ce = ctx.unsqueeze(2).expand(*ctx.shape[:2], s.numel(), ctx.shape[-1])
         se = s.reshape(1, 1, -1, 1).expand(*ctx.shape[:2], s.numel(), 1)
-        return self._tail_coeff(self.branch(torch.cat([ce, se], dim=-1)))
+        return self.branch(torch.cat([ce, se], dim=-1))
 
     def coeffs_dtime(self, ctx, s):
         """b(c, s) AND d_s b(c, s) by autodiff (forward-mode jvp in the time input) ->
@@ -113,8 +85,7 @@ class OperatorFilter(nn.Module):
         se = s.reshape(1, 1, -1, 1).expand(*ctx.shape[:2], s.numel(), 1)
         inp = torch.cat([ce, se], dim=-1)                  # (T,B,Ns,C+1)
         tan = torch.zeros_like(inp); tan[..., -1] = 1.0    # tangent in the time input
-        b, db = jvp(self.branch, (inp,), (tan,))
-        return self._tail_coeff(b), self._tail_coeff(db, 0.0)
+        return jvp(self.branch, (inp,), (tan,))            # b, d_s b
 
     def trunk_zderivs(self, z):
         """State basis trunk(z) with its GRADIENT + LAPLACIAN by autodiff (mesh-free; z (...,d)) ->
@@ -128,7 +99,7 @@ class OperatorFilter(nn.Module):
 
         def along(e):                                               # e (d,) -> derivs along axis e
             v = e.expand_as(zin)                                    # (N,d) tangent
-            (tau, di), (_, dii) = jvp(lambda x: jvp(self.state_basis, (x,), (v,)), (zin,), (v,))
+            (tau, di), (_, dii) = jvp(lambda x: jvp(self.trunk, (x,), (v,)), (zin,), (v,))
             return tau, di, dii                                    # each (N,p)
 
         tau, grad, lap_ax = vmap(along)(eye)                        # (d,N,p) each; tau identical over tangents
@@ -144,7 +115,7 @@ class OperatorFilter(nn.Module):
         d = z.shape[-1]
         zin = z.reshape(-1, d)                                        # (N,d)
         eye = torch.eye(d, device=z.device, dtype=z.dtype)          # (d,d) unit tangents
-        tau, grads = vmap(lambda e: jvp(self.state_basis, (zin,), (e.expand_as(zin),)))(eye)
+        tau, grads = vmap(lambda e: jvp(self.trunk, (zin,), (e.expand_as(zin),)))(eye)   # (d,N,p) each
         shp = z.shape[:-1]
         return tau[0].reshape(*shp, -1), grads.movedim(0, -2).reshape(*shp, d, -1)
 
@@ -153,7 +124,7 @@ class OperatorFilter(nn.Module):
         s_t = torch.as_tensor([s], dtype=z.dtype, device=z.device)
         b = self.coeffs(ctx, s_t)[:, :, 0]                 # (T,B,p)
         zt = z.unsqueeze(-1) if z.dim() == 1 else z        # (Nz,d)
-        return torch.einsum("tbp,zp->tbz", b, self.state_basis(zt)) + self.bias
+        return torch.einsum("tbp,zp->tbz", b, self.trunk(zt)) + self.bias
 
     def log_posterior(self, xs, mask, z):
         """Normalized filtering log-posterior on z (post-update, s=0): (T,B,Nz)."""
@@ -174,9 +145,6 @@ class OperatorBackward(OperatorFilter):
 
     def __init__(self, *args, **kwargs):
         kwargs["reverse"] = True                           # anti-causal: context = flip -> encoder -> flip
-        # A backward likelihood message need not be integrable in z (terminal beta can be 1).
-        # The forward factor supplies the smoother's decaying tails.
-        kwargs["tail_std"] = 0.0
         super().__init__(*args, **kwargs)
 
     def log_msg(self, xs, mask, z):

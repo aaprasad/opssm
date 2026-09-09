@@ -7,8 +7,6 @@
   log_density/log_posterior. (OperatorBackward, reverse=True, deferred to the smoother stage.)
 1:1 translation of operator.py:41-146 + encoders.py GRUEncoder.
 """
-import math
-
 import jax
 import jax.numpy as jnp
 import equinox as eqx
@@ -96,18 +94,12 @@ class OperatorFilter(eqx.Module):
     bias: jax.Array
     reverse: bool = eqx.field(static=True)
     latent_dim: int = eqx.field(static=True)
-    tail_std: float = eqx.field(static=True)
 
     def __init__(self, data_size=1, gru_hidden=64, ctx_dim=64, p=64, branch_hidden=128,
                  trunk_hidden=64, trunk_layers=3, latent_dim=1, reverse=False, key=None, submodules=None,
-                 tail_std=0.0, trunk_activation='tanh'):
+                 trunk_activation='softplus'):
         self.reverse = reverse
         self.latent_dim = latent_dim
-        if not math.isfinite(tail_std) or tail_std < 0:
-            raise ValueError("tail_std must be finite and nonnegative (0 disables the fixed tail)")
-        if tail_std > 0 and trunk_layers < 1:
-            raise ValueError("Gaussian tails require at least one trunk hidden layer")
-        self.tail_std = float(tail_std)
         if submodules is not None:                               # weight-transfer/parity path
             self.encoder, self.branch, self.trunk, self.bias = submodules
             if self.trunk.activation != trunk_activation:
@@ -120,23 +112,6 @@ class OperatorFilter(eqx.Module):
                          activation=trunk_activation)
         self.bias = jnp.zeros(())
 
-    def state_basis(self, z):
-        """Learned features plus an optional Gaussian tail with fixed coefficient one.
-
-        Mirrors the Torch state_basis; derivatives and every density readout use this same basis.
-        No additional parameter leaves, so existing weights can be reused for controlled ablations.
-        """
-        tau = self.trunk(z)
-        if self.tail_std > 0:
-            tail = -0.5 * ((z / self.tail_std) ** 2).sum(-1, keepdims=True)
-            tau = jnp.concatenate([tau, tail], axis=-1)
-        return tau
-
-    def _tail_coeff(self, b, value=1.0):
-        if self.tail_std > 0:
-            b = jnp.concatenate([b, jnp.full_like(b[..., :1], value)], axis=-1)
-        return b
-
     def context(self, xs, mask):                                 # (T,B,M),(T,B,1) -> (T,B,C)
         inp = jnp.concatenate([xs * mask, mask], axis=-1)
         if self.reverse:
@@ -148,7 +123,7 @@ class OperatorFilter(eqx.Module):
         Ns = s.shape[0]
         ce = jnp.broadcast_to(ctx[:, :, None, :], (T, B, Ns, C))
         se = jnp.broadcast_to(s.reshape(1, 1, -1, 1), (T, B, Ns, 1))
-        return self._tail_coeff(self.branch(jnp.concatenate([ce, se], axis=-1)))
+        return self.branch(jnp.concatenate([ce, se], axis=-1))
 
     def coeffs_dtime(self, ctx, s):                             # (b, d_s b), each (T,B,Ns,p)
         T, B, C = ctx.shape
@@ -157,20 +132,19 @@ class OperatorFilter(eqx.Module):
         se = jnp.broadcast_to(s.reshape(1, 1, -1, 1), (T, B, Ns, 1))
         inp = jnp.concatenate([ce, se], axis=-1)
         tan = jnp.zeros_like(inp).at[..., -1].set(1.0)          # unit tangent in the time channel
-        b, db = jax.jvp(self.branch, (inp,), (tan,))
-        return self._tail_coeff(b), self._tail_coeff(db, 0.0)
+        return jax.jvp(self.branch, (inp,), (tan,))
 
     def log_density(self, ctx, z, s=0.0):                       # ctx (T,B,C), z (Nz,) or (Nz,d) -> (T,B,Nz)
         b = self.coeffs(ctx, jnp.asarray([s], dtype=z.dtype))[:, :, 0]   # (T,B,p)
         zt = z[..., None] if z.ndim == 1 else z
-        return jnp.einsum("tbp,zp->tbz", b, self.state_basis(zt)) + self.bias
+        return jnp.einsum("tbp,zp->tbz", b, self.trunk(zt)) + self.bias
 
     def log_posterior(self, xs, mask, z):                      # normalized filtering posterior (s=0)
         ell = self.log_density(self.context(xs, mask), z, 0.0)
         return ell - logsumexp(ell, axis=-1, keepdims=True)
 
     def trunk_zderivs(self, z):
-        return trunk_zderivs(self.state_basis, z)
+        return trunk_zderivs(self.trunk, z)
 
     def trunk_grad(self, z):
-        return trunk_grad(self.state_basis, z)
+        return trunk_grad(self.trunk, z)
