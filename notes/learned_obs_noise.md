@@ -73,3 +73,38 @@ while having the **worst drift** (1.06 = essentially no usable drift). It scores
 observation noise. This is direct evidence for the concern `docs/grid_search.md` already flags as an
 "objective caveat": the Optuna sweep maximizes `recon_r2`, so it can actively PREFER a model whose dynamics
 are destroyed. Selecting on reconstruction is not safe; a forward-simulation k-step prediction metric is.
+
+
+## REAL DATA (Kato, WT_NoStim worm 0, N=109, d=10) -- the case this was built for
+
+`noise_std` on Kato is a genuine GUESS. Same worm, same data, 14k steps; only the ASSUMED noise differs:
+
+| run | whole-trace recon | val recon | learned R | g |
+|---|---|---|---|---|
+| noise_std=0.1 (tuned), fixed | **0.8340** | 0.1922 | - | 0.064 |
+| noise_std=0.5 (bad), fixed | **0.4141** | -0.3458 | - | 0.223 |
+| noise_std=0.5 (bad), LEARNED | **0.8323** | 0.1952 | 0.1690 | 0.085 |
+| noise_std=0.1 (tuned), LEARNED | 0.8256 | 0.1691 | 0.1700 | 0.086 |
+| learned R + covariance | 0.8290 | 0.1981 | 0.1698 | 0.078 |
+
+**Getting `noise_std` wrong is far more damaging than the config comment claims.** It says 0.5 "silently
+degrades" whole-trace recon to ~0.77; measured here it HALVES it (0.834 -> 0.414) and drives held-out val
+recon NEGATIVE (-0.346, i.e. worse than predicting the mean). Worth fixing that comment.
+
+**Learning R removes 99.6% of that damage** (0.4141 -> 0.8323 vs a 0.8340 tuned reference), converging to
+R ~ 0.169 from EITHER starting point (0.1 or 0.5). It MATCHES hand tuning (0.826-0.832 vs 0.834; two
+nominally-similar learned arms differ from each other by 0.007, so all sensible-R runs are within noise) --
+it does not beat it. The win is that the hand-tuned value is no longer needed, and a wrong guess no longer
+costs half the reconstruction.
+
+**`est="perp"` is what makes it work at d=10.** At the first M-step of the bad-prior run the posterior
+estimator read **0.6468** -- ~4x too high, because the wrong prior produced a badly over-wide posterior that
+would then confirm its own inflated R -- while `perp` read 0.1706 and stayed flat. Shipping the textbook
+estimator as the default would have left this run stuck at ~0.65 and broken.
+
+**Covariance at d=10 does NOT misbehave here** (unlike Lorenz): `g_aniso` CONVERGES 3.46 -> 2.70 rather than
+running away, whole-trace is unchanged (0.8290) and val recon is the best of any arm (0.1981, within noise).
+Consistent with the diagnostic in `notes/diffusion_gauge.md`: Kato is well-observed (109 sensors / 10
+latents) so drift error contributes proportionally less to Sigma. The default stays FALSE because the Lorenz
+failure is severe, but the flag is safe on well-observed data and the anisotropy trajectory tells you which
+regime you are in.

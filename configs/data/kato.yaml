@@ -5,8 +5,11 @@ worm: 0
 window: 200            # window length (timesteps) -> the operator's T
 stride: 100            # window stride (< window = overlapping windows)
 val_frac: 0.2          # late fraction of the trace held out for val (recon_r2)
-noise_std: 0.1         # ASSUMED calcium obs-noise (standardized units) -- a real hyperparameter. 0.1 is the
-                       #   publication-validated value (whole-trace recon_r2 0.84); 0.5 silently degrades it to ~0.77.
+noise_std: 0.1         # ASSUMED calcium obs-noise (standardized units). 0.1 is the publication-validated
+                       #   value (whole-trace recon_r2 0.84). MEASURED 2026-09-10 on WT_NoStim worm 0: 0.5 does
+                       #   NOT merely degrade this to ~0.77 -- it HALVES whole-trace recon to 0.41 and drives
+                       #   held-out val recon NEGATIVE (-0.35). Prefer model.learn_obs_noise=true, which
+                       #   converges to R~0.169 from either 0.1 or 0.5 and recovers 99.6% of that damage.
 clip_negative: true    # clip dF/F negatives -> 0 (as in dLDS preprocessing)
 subsample: 1           # temporal subsample factor (>1 shortens T, dt *= subsample)
 latent_dim: 10         # must match model.latent_dim (used for the obs-scale SVD)
