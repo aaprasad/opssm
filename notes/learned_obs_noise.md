@@ -51,11 +51,20 @@ samples) is contaminated exactly as predicted: it read 0.1932 at step 2000 of th
 inflated by the over-wide posterior, and only crept to 0.1601 as the operator sharpened. Correct-if-q-were-exact
 is not good enough when q is known to be 1.5-2x too wide (`notes/overdispersion.md`).
 
-**Open: the EMA damping is the bottleneck on recovery.** `obs_noise_damp=0.5` halves the gap per M-step, so R
+**RESOLVED: the EMA damping WAS the bottleneck; default is now 0.** `obs_noise_damp=0.5` halves the gap per M-step, so R
 crawled 0.4695 -> 0.3499 -> ... -> 0.1611 over 7 M-steps while the correct answer was available at step 2000.
-That is why the 3x case recovers only 82% on drift. The damping guards against the posterior-estimator
-feedback loop, which provably does not exist for `perp` (constant estimate) -- so the default damping should
-probably depend on the estimator. A 2x2 (perp/posterior x damped/undamped) is queued.
+That is why the damped 3x case recovers only 82% on drift. The 2x2 settles it -- damage removed on drift_rel:
+
+| estimator | damp 0.5 | damp 0 |
+|---|---|---|
+| perp (default) | 82.3% | **101.2%** |
+| posterior | - | 89% |
+
+Undamped `perp` jumps to 0.1563 at the FIRST M-step and finishes at drift_rel 0.2098 vs the correctly-
+specified 0.2171 -- a 3x misspecification becomes essentially INVISIBLE. And the feedback loop the damping
+guarded against does not materialize even for `posterior`, which self-corrects 0.1935 -> 0.1595 (true
+0.1565) rather than latching on: the D-d directions orthogonal to C anchor it, so the gain is only ~d/D
+(~0.1 here), exactly as predicted up front. **`obs_noise_damp` now defaults to 0.0.**
 
 ## `recon_r2` is ANTI-correlated with dynamics quality here
 

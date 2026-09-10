@@ -182,7 +182,7 @@ def mstep(model, x, mask, dt, drift_net, dr_opt, dr_state, key, *,
           n_mean=256, near_std=0.3, broad_std=1.6, mean_method="mala", mala=None,
           drift_target="det_mid", bootstrap=False, diffusion_cov=False, g_floor=0.05,
           learn_obs_noise=False, obs_noise_mode="diag", obs_noise_est="perp", noise_var_in=None,
-          obs_noise_damp=0.5):
+          obs_noise_damp=0.0):
     """One EM M-step (em_highd active path). Order: filter-mean (MALA) increments -> Stiefel obs-map + cstab ->
     drift GATED on cstab<c_stable_tol (det_mid RK2-midpoint input shift) -> scalar diffusion. Returns
     (info dict {g_cur,C_cur,d_cur,cstab,accept}, drift_net, dr_state)."""

@@ -509,7 +509,7 @@ def mstep(model, x, mask, z_grid, dt, drift_net, dr_opt, diff_net, dg_opt, z_reg
           joint_g=False, noise_std=None, g_cur_in=None, drift_target="forward", bootstrap=False,
           diffusion_cov=False, g_floor=0.05,
           learn_obs_noise=False, obs_noise_mode="diag", obs_noise_est="perp", noise_var_in=None,
-          obs_noise_damp=0.5):
+          obs_noise_damp=0.0):
     """One EM M-step. Order: posterior-mean increments -> (high-D) Stiefel obs-map + cstab ->
     drift GATED on `cstab < c_stable_tol` -> diffusion. In 1-D (learn_obs=False) cstab==0, so the
     gate is always open and this reduces to the plain f,g M-step. `meshfree_mean` replaces the grid

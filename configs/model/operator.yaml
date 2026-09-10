@@ -134,8 +134,16 @@ learn_obs_noise: true    # fit the observation noise R in the M-step instead of 
                          #   posterior SAMPLES (not at the mean): the mean-only estimator drops Var_q[Cz] and
                          #   runs to zero, while the sample estimator is anchored from below by the D-d
                          #   observation directions orthogonal to span(C), which no z can explain.
-obs_noise_damp: 0.5      # EMA on the R update (new = damp*old + (1-damp)*fit). R feeds back into the
-                         #   likelihood sharpness, so this bounds how far one M-step can move it.
+obs_noise_damp: 0.0      # EMA on the R update (new = damp*old + (1-damp)*fit). 0 = take the fit directly.
+                         # Was 0.5 as a guard against an R -> wider posterior -> larger R feedback loop.
+                         # MEASURED: that loop does not materialize, and the guard was the single largest
+                         # cost to recovery. On a 3x-misspecified prior, damage removed on drift_rel:
+                         #   perp damp 0.5 -> 82%,  perp damp 0 -> 101%,  posterior damp 0 -> 89%.
+                         # The default `perp` estimate is CONSTANT (it never touches the posterior), so
+                         # damping only delays the correct answer -- and at ~7 M-steps per run that delay
+                         # eats most of the recovery. Even the `posterior` estimator self-corrects rather
+                         # than running away (0.1935 -> 0.1595 vs a true 0.1565), because the D-d
+                         # observation directions orthogonal to C anchor it: the feedback gain is ~d/D.
 obs_noise_est: perp      # WHICH estimator. perp (default) = residual on the D-d observation directions
                          #   ORTHOGONAL to span(C), where no latent can contribute: immune both to the
                          #   operator's known posterior over-dispersion and to the R->wider-posterior->larger-R

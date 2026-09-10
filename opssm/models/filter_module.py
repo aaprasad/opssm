@@ -69,7 +69,7 @@ class ZakaiFilterModule(pl.LightningModule):
                  anim_posterior=False, plot_samples=False, latent_dim=1, loss="zakai", train_dir="./dump/nzf",
                  trunk_activation='softplus',
                  diffusion_cov=False, g_floor=0.05, learn_obs_noise=True, obs_noise_mode="diag",
-                 obs_noise_est="perp", obs_noise_damp=0.5):
+                 obs_noise_est="perp", obs_noise_damp=0.0):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
