@@ -105,3 +105,35 @@ completely -- it constrains BOTH `C` (Stiefel) and `Sigma` (scalar), which over-
 
 Not built. If a head-to-head against those baselines needs it, add it as a switch rather than replacing the
 above; see `notes/TODO.md`.
+
+## VERDICT: default OFF. The gauge is real, but Sigma also eats anisotropic DRIFT error.
+
+Full factorials, frozen dataset, model seed 0, 14k steps (deltas vs the base arm):
+
+| | em_vdp (d=2, sensor anisotropy 1.16) | em_lorenz (d=3, sensor anisotropy 4.43) |
+|---|---|---|
+| learned `g_aniso` | **1.136** (as predicted) | **6.93** (predicted 4.43 -- way OVER) |
+| drift_rel final / best | -0.023 / -0.003 | **+0.024 / +0.061** |
+| lat_rel | -0.002 | **+0.047** |
+| g_rel | -0.012 (-> 0.9999) | -1.54 |
+| recon_r2 | +0.000 | -0.003 |
+
+**The diagnostic is `g_aniso` vs the sensor's PREDICTED anisotropy.** When they match (VdP) `Sigma` has
+captured the gauge and the change mildly HELPS. When the learned value OVERSHOOTS (Lorenz, 6.93 vs 4.43)
+the excess is absorbed anisotropic DRIFT error, and the change HURTS: latent +0.047, best drift +0.061.
+The Lorenz `g_rel` improvement of 1.54 is COSMETIC -- `det(Sigma)^(1/2d)` is a geometric mean, so it
+discounts exactly the anisotropy the drift error injected. Better number, worse model.
+
+The Lorenz trajectory looks like a FEEDBACK LOOP, not a fixed point: `g_aniso` climbs 4.59 -> 9.54 over
+training while `lat_rel` degrades 0.175 -> 0.214 in lockstep. Anisotropic drift error inflates Sigma's
+anisotropy -> the FP residual diffuses anisotropically -> the filter degrades -> more drift error.
+
+This is the SAME failure shape as [[sde-matching-mstep-helps]]: estimators that conflate filter uncertainty
+with process noise are fine on well-observed systems and break on under-observed/rotational ones. Caveats:
+one seed per arm; Lorenz ran at reduced `n_colloc=256 n_tcoll=12` (the default OOMs on JAX, see TODO), and
+its `c_cos` is pinned at 0.810, so the gauge relation's `span(C_model)=span(C_true)` assumption is violated
+there -- which compromises the PREDICTION test but not the measured latent/drift degradation.
+
+**Status: `diffusion_cov` defaults FALSE.** The representational argument stands (Stiefel C + scalar g
+genuinely cannot express the DGP at d>1), so the code stays behind the flag. Untried mitigation: shrink
+toward isotropy, `Sigma <- (1-a) Sigma + a (tr(Sigma)/d) I`, one knob interpolating the two regimes.

@@ -46,7 +46,7 @@ DEFAULTS = dict(  # em_highd resolved hparams; the bridge overrides per-experime
     near_std=0.3, broad_std=1.6, warmup=0, m_every=2000, m_inner=400, reg_lambda=3e-4,
     g_init=1.0, w_res=0.4, res_mode="rel", learn_obs=True, learn_g=True, c_stable_tol=0.05,
     n_mean=256, mean_method="mala", mala_chains=64, mala_steps=30, mala_rng="stochastic",
-    drift_target="det_mid", diffusion_cov=True, g_floor=0.05,
+    drift_target="det_mid", diffusion_cov=False, g_floor=0.05,
     learn_obs_noise=True, obs_noise_mode="diag", obs_noise_est="perp", obs_noise_damp=0.5,
 )
 

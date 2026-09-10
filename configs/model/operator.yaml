@@ -105,14 +105,26 @@ drift_target: det_mid     # drift M-step increment target. DEFAULT det_mid (robu
                           #   |f| -- that zeros it at fixed points) -> ito's precision where the correction is small
                           #   + det_mid stability where it's large. Recovers the dw 0.207->0.157 gap, but adds a clip
                           #   hyperparameter, so not worth it unless the last bit of drift accuracy matters.
-diffusion_cov: true      # diffusion as a FULL covariance Sigma = L L^T (L lower-triangular, fit in closed
-                         #   form from the increment second moment) instead of an isotropic scalar g. The FP
-                         #   term becomes grad ell^T Sigma grad ell + tr(Sigma H), computed at the SAME cost as
-                         #   the Laplacian by taking the directional 2nd derivatives along L's COLUMNS. Exactly
-                         #   equivalent to the scalar path when L = g I, so d==1 is unchanged; it only bites at
-                         #   latent d>1, where the Stiefel C forces all amplitude anisotropy into the latent
-                         #   while one scalar g would impose a single noise scale on every direction.
-                         #   Reported `g` stays comparable: it is det(Sigma)^(1/2d), which equals g when isotropic.
+diffusion_cov: false     # diffusion as a FULL covariance Sigma = L L^T instead of an isotropic scalar g.
+                         # DEFAULT OFF -- measured mixed, and NEGATIVE where it matters most.
+                         # Motivation (sound): the Stiefel M-step makes C orthonormal, so the model's latent
+                         #   is a linear image z_model = M z_true of the true one, and an isotropic true
+                         #   diffusion appears in the model frame as Sigma = sigma^2 M M^T -- anisotropic,
+                         #   with eigenvalue ratio = the squared singular-value ratio of C_true. So Stiefel C
+                         #   + scalar g CANNOT represent the generative process at d>1. Verified by oracle:
+                         #   scalar g over-reads by 12.7% with every other error source removed, while
+                         #   det(Sigma)^(1/2d) recovers sigma exactly. See notes/diffusion_gauge.md.
+                         # Why it is still OFF: Sigma ALSO absorbs anisotropic DRIFT error, and that
+                         #   dominates on stiff/under-observed systems. Full factorials, frozen data:
+                         #     em_vdp   (sensor anisotropy 1.16): learned 1.136 = as predicted -> mildly
+                         #       HELPS (drift -0.023, lat -0.002, g_rel -> 0.9999).
+                         #     em_lorenz(sensor anisotropy 4.43): learned 6.93, way OVER -> HURTS
+                         #       (lat +0.047, best drift +0.061). g_rel "improves" 1.54 only because a
+                         #       geometric mean discounts the absorbed drift error -- cosmetic, not real.
+                         #   g_aniso vs the sensor's predicted anisotropy is the DIAGNOSTIC: matching means
+                         #   Sigma captured the gauge; overshooting means it is eating drift error, and the
+                         #   trajectory then runs away (Lorenz g_aniso 4.6 -> 9.5 while lat_rel degrades).
+                         # Untried mitigation: shrink toward isotropy, Sigma <- (1-a)Sigma + a(tr/d)I.
 g_floor: 0.05            # ridge added to Sigma before the Cholesky (and the old scalar-g clamp): keeps the
                          #   factorization well-conditioned when a latent direction is nearly deterministic.
 learn_obs_noise: true    # fit the observation noise R in the M-step instead of trusting the configured

@@ -68,7 +68,7 @@ class ZakaiFilterModule(pl.LightningModule):
                  mean_method="mala", mala_chains=64, mala_steps=30, mala_rng="stochastic",
                  anim_posterior=False, plot_samples=False, latent_dim=1, loss="zakai", train_dir="./dump/nzf",
                  trunk_activation='softplus',
-                 diffusion_cov=True, g_floor=0.05, learn_obs_noise=True, obs_noise_mode="diag",
+                 diffusion_cov=False, g_floor=0.05, learn_obs_noise=True, obs_noise_mode="diag",
                  obs_noise_est="perp", obs_noise_damp=0.5):
         super().__init__()
         self.save_hyperparameters()
