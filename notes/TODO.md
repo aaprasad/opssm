@@ -48,24 +48,23 @@ physics-`g` beat increment-`g`") vs the regression M-step. If it wins at d=1 (it
 d=3 (Lorenz) where the rotational-gauge question decides residual-only vs hybrid. Subsumes the deferred drift
 work (higher-order increment / finer dt below stay as complementary levers for the rotational part).
 
-## Port the E-step batch CHUNKING to the JAX backend (memory parity with torch)
+## Do NOT set `XLA_PYTHON_CLIENT_PREALLOCATE=false` for large JAX runs (docs footgun)
 
-The torch E-step splits the batch and accumulates gradients per chunk (`losses.accumulate_pinn_grads`,
-`chunk_size=16`), so peak memory tracks the chunk, not the batch. The JAX `estep` (`models/jax/train.py`,
-`make_estep`) is ONE whole-batch `eqx.filter_jit` call with no equivalent. Consequence measured 2026-09-09
-on a 32 GB RTX 5090: **`experiment=em_lorenz` cannot run at its default config on the JAX backend at all** --
-the BASELINE arm (`diffusion_cov=false`, i.e. nothing exotic) dies with
-`RESOURCE_EXHAUSTED: ... allocate 22.00GiB` in `jit_estep`. `n_colloc=384 n_tcoll=24` OOMs;
-`n_colloc=256 n_tcoll=12` and below fit.
+`docs/em_highd_activation.md` and `docs/density_tails.md` both put `XLA_PYTHON_CLIENT_PREALLOCATE=false` in
+their example commands. That disables JAX's up-front pool and makes it allocate on demand, which FRAGMENTS:
+a single large contiguous request then fails even with plenty of free memory.
 
-So the two backends do NOT have the same reachable configuration space, and the published Lorenz settings
-are torch-only. That also silently biases any JAX grid search away from large `n_colloc` at d=3.
+Measured 2026-09-10, 32 GB RTX 5090, GPU otherwise idle (~2.2 GB used), `experiment=em_lorenz` at its
+DEFAULT `n_colloc=384 n_tcoll=24`:
+- with `XLA_PYTHON_CLIENT_PREALLOCATE=false`  -> `RESOURCE_EXHAUSTED: ... allocate 22.00GiB` in `jit_estep`
+- with it UNSET (JAX default preallocation)   -> runs fine
 
-Fix: chunk the JAX E-step over the batch axis and sum the gradients (a `lax.scan`/`fori_loop` over chunks
-accumulating into a grad pytree, or `jax.checkpoint` on the residual path). The residual is per-point and the
-recursion is per-trajectory -- both independent across the batch -- so the chunked result is EXACT, exactly as
-in torch. Cheap correctness check: chunked vs unchunked gradients must match to float tolerance on a small
-config.
+Confirmed not to be code: the pre-change commit `a844a0c` OOMs identically with the flag set, and the
+2026-09-08 run `dump/jax_port/lorenz_run` completed 14k steps at these exact settings without it.
+
+ACTION: drop the flag from the docs' example commands (or explain it is only for sharing a GPU, which the
+project forbids anyway -- one run per GPU). NB an earlier version of this file claimed the JAX E-step needs
+torch's batch chunking to run em_lorenz; that was WRONG and rested on this flag.
 
 ## Fix the `nll` gradient detach (dormant; do before enabling Stage-3 NLL training)
 
