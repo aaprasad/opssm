@@ -125,8 +125,11 @@ diffusion_cov: false     # diffusion as a FULL covariance Sigma = L L^T instead 
                          #   Sigma captured the gauge; overshooting means it is eating drift error, and the
                          #   trajectory then runs away (Lorenz g_aniso 4.6 -> 9.5 while lat_rel degrades).
                          # Untried mitigation: shrink toward isotropy, Sigma <- (1-a)Sigma + a(tr/d)I.
-g_floor: 0.05            # ridge added to Sigma before the Cholesky (and the old scalar-g clamp): keeps the
-                         #   factorization well-conditioned when a latent direction is nearly deterministic.
+g_floor: 0.05            # diffusion floor. Scalar path: clamp_min(g). Matrix path: EIGENVALUE CLAMP on Sigma
+                         # before the Cholesky -- NOT a `+ g_floor^2 I` ridge, which would shift every
+                         # eigenvalue up (it biased g^2 by a fixed 0.0025, ~0.7% on em_highd, and only on
+                         # the diffusion_cov arm, contaminating any d==1 A/B). The clamp lifts only genuinely
+                         # degenerate directions and makes d==1 agree with the scalar path to float round-off.
 learn_obs_noise: true    # fit the observation noise R in the M-step instead of trusting the configured
                          #   noise_std. R sets the likelihood sharpness in the jump, hence the posterior width,
                          #   hence g and the drift -- and on real data (Kato) it is a guessed hyperparameter that
