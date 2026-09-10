@@ -105,5 +105,55 @@ drift_target: det_mid     # drift M-step increment target. DEFAULT det_mid (robu
                           #   |f| -- that zeros it at fixed points) -> ito's precision where the correction is small
                           #   + det_mid stability where it's large. Recovers the dw 0.207->0.157 gap, but adds a clip
                           #   hyperparameter, so not worth it unless the last bit of drift accuracy matters.
+diffusion_cov: false     # diffusion as a FULL covariance Sigma = L L^T instead of an isotropic scalar g.
+                         # DEFAULT OFF -- measured mixed, and NEGATIVE where it matters most.
+                         # Motivation (sound): the Stiefel M-step makes C orthonormal, so the model's latent
+                         #   is a linear image z_model = M z_true of the true one, and an isotropic true
+                         #   diffusion appears in the model frame as Sigma = sigma^2 M M^T -- anisotropic,
+                         #   with eigenvalue ratio = the squared singular-value ratio of C_true. So Stiefel C
+                         #   + scalar g CANNOT represent the generative process at d>1. Verified by oracle:
+                         #   scalar g over-reads by 12.7% with every other error source removed, while
+                         #   det(Sigma)^(1/2d) recovers sigma exactly. See notes/diffusion_gauge.md.
+                         # Why it is still OFF: Sigma ALSO absorbs anisotropic DRIFT error, and that
+                         #   dominates on stiff/under-observed systems. Full factorials, frozen data:
+                         #     em_vdp   (sensor anisotropy 1.16): learned 1.136 = as predicted -> mildly
+                         #       HELPS (drift -0.023, lat -0.002, g_rel -> 0.9999).
+                         #     em_lorenz(sensor anisotropy 4.43): learned 6.93, way OVER -> HURTS
+                         #       (lat +0.047, best drift +0.061). g_rel "improves" 1.54 only because a
+                         #       geometric mean discounts the absorbed drift error -- cosmetic, not real.
+                         #   g_aniso vs the sensor's predicted anisotropy is the DIAGNOSTIC: matching means
+                         #   Sigma captured the gauge; overshooting means it is eating drift error, and the
+                         #   trajectory then runs away (Lorenz g_aniso 4.6 -> 9.5 while lat_rel degrades).
+                         # Untried mitigation: shrink toward isotropy, Sigma <- (1-a)Sigma + a(tr/d)I.
+g_floor: 0.05            # diffusion floor. Scalar path: clamp_min(g). Matrix path: EIGENVALUE CLAMP on Sigma
+                         # before the Cholesky -- NOT a `+ g_floor^2 I` ridge, which would shift every
+                         # eigenvalue up (it biased g^2 by a fixed 0.0025, ~0.7% on em_highd, and only on
+                         # the diffusion_cov arm, contaminating any d==1 A/B). The clamp lifts only genuinely
+                         # degenerate directions and makes d==1 agree with the scalar path to float round-off.
+learn_obs_noise: true    # fit the observation noise R in the M-step instead of trusting the configured
+                         #   noise_std. R sets the likelihood sharpness in the jump, hence the posterior width,
+                         #   hence g and the drift -- and on real data (Kato) it is a guessed hyperparameter that
+                         #   swings whole-trace recon 0.84 <-> 0.77. Estimated as E_q[(y-Cz-d)^2] over the MALA
+                         #   posterior SAMPLES (not at the mean): the mean-only estimator drops Var_q[Cz] and
+                         #   runs to zero, while the sample estimator is anchored from below by the D-d
+                         #   observation directions orthogonal to span(C), which no z can explain.
+obs_noise_damp: 0.0      # EMA on the R update (new = damp*old + (1-damp)*fit). 0 = take the fit directly.
+                         # Was 0.5 as a guard against an R -> wider posterior -> larger R feedback loop.
+                         # MEASURED: that loop does not materialize, and the guard was the single largest
+                         # cost to recovery. On a 3x-misspecified prior, damage removed on drift_rel:
+                         #   perp damp 0.5 -> 82%,  perp damp 0 -> 101%,  posterior damp 0 -> 89%.
+                         # The default `perp` estimate is CONSTANT (it never touches the posterior), so
+                         # damping only delays the correct answer -- and at ~7 M-steps per run that delay
+                         # eats most of the recovery. Even the `posterior` estimator self-corrects rather
+                         # than running away (0.1935 -> 0.1595 vs a true 0.1565), because the D-d
+                         # observation directions orthogonal to C anchor it: the feedback gain is ~d/D.
+obs_noise_est: perp      # WHICH estimator. perp (default) = residual on the D-d observation directions
+                         #   ORTHOGONAL to span(C), where no latent can contribute: immune both to the
+                         #   operator's known posterior over-dispersion and to the R->wider-posterior->larger-R
+                         #   feedback. posterior = textbook EM over MALA samples, correct if q were exact but
+                         #   it inherits the over-dispersion bias and reads high. Both are always logged
+                         #   (obs_noise_perp / obs_noise_post) so the gap is visible.
+obs_noise_mode: diag     # diag = one variance per observation dim (what real sensors/neurons need);
+                         #   scalar = pooled isotropic R.
 loss: zakai
 train_dir: ${train_dir}

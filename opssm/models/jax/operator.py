@@ -33,6 +33,28 @@ def trunk_zderivs(trunk, z):
             lap_ax.sum(0).reshape(*shp, -1))
 
 
+def trunk_zderivs_dirs(trunk, z, dirs):
+    """DIRECTIONAL 1st+2nd derivatives along `dirs` in ONE fused pass (mirror of torch).
+
+    z (...,d), dirs (m,d) [row k = v_k] -> tau (...,p), dgrad (...,m,p) [v_k . grad tau],
+    sec (...,p) [sum_k v_k^T H v_k]. With dirs = L.T: dgrad = L^T grad tau and sec = tr(Sigma H).
+    One vmapped nested jvp -- same cost/memory as the isotropic trunk_zderivs. (An earlier two-pass
+    version that also took the unit-axis gradient OOM'd: the E-step backprops through both passes.)"""
+    d = z.shape[-1]
+    zin = z.reshape(-1, d)
+
+    def along(v):
+        vv = jnp.broadcast_to(v, zin.shape)
+        (tau, dv), (_, dvv) = jax.jvp(lambda x: jax.jvp(trunk, (x,), (vv,)), (zin,), (vv,))
+        return tau, dv, dvv
+
+    tau, dgrad, sec = jax.vmap(along)(dirs)
+    shp = z.shape[:-1]
+    return (tau[0].reshape(*shp, -1),
+            jnp.moveaxis(dgrad, 0, -2).reshape(*shp, dirs.shape[0], -1),
+            sec.sum(0).reshape(*shp, -1))
+
+
 def trunk_grad(trunk, z):
     """trunk(z) with GRADIENT only -> tau (...,p), grad (...,d,p) (forward-mode Jacobian; MALA readout)."""
     d = z.shape[-1]
@@ -148,3 +170,6 @@ class OperatorFilter(eqx.Module):
 
     def trunk_grad(self, z):
         return trunk_grad(self.trunk, z)
+
+    def trunk_zderivs_dirs(self, z, dirs):
+        return trunk_zderivs_dirs(self.trunk, z, dirs)

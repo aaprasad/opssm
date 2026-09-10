@@ -108,6 +108,39 @@ class OperatorFilter(nn.Module):
                 grad.movedim(0, -2).reshape(*shp, d, -1),          # (d,N,p) -> (N,d,p)
                 lap_ax.sum(0).reshape(*shp, -1))                   # sum axes -> Laplacian (N,p)
 
+    def trunk_zderivs_dirs(self, z, dirs):
+        """DIRECTIONAL first and second derivatives of the state basis along `dirs` -- ONE fused pass.
+
+        z (...,d), dirs (m,d) [ROW k = direction v_k] ->
+            tau (...,p), dgrad (...,m,p) [v_k . grad tau], sec (...,p) [sum_k v_k^T H(tau) v_k].
+
+        For a diffusion Sigma = L L^T, pass `dirs = L.T` (rows = COLUMNS of L). Then
+            sec   = sum_k (L[:,k])^T H L[:,k] = tr(Sigma H)          -- the weighted Hessian trace, and
+            dgrad = L^T grad tau                                     -- which gives grad ell^T Sigma grad ell
+                                                                        as |L^T grad ell|^2 directly.
+        The drift term f . grad ell needs NO separate gradient pass, because
+            (L^-1 f) . (L^T grad ell) = f^T L^-T L^T grad ell = f . grad ell      (exact),
+        so L^-1 is applied to the small drift tensor instead of the large derivative tensors.
+
+        Why one pass matters: an earlier version took a second vmapped pass over the UNIT axes to get the
+        full gradient. The E-step backprops through all of this, so both passes' intermediates are retained
+        and it OOM'd (15.6 GiB at d=2, K=256). This version has exactly the cost and memory of the
+        isotropic `trunk_zderivs`: d nested jvps, one vmap. With L = g I it reduces to g*grad and
+        g^2*Laplacian, recovering the isotropic path exactly."""
+        d = z.shape[-1]
+        zin = z.reshape(-1, d)                                       # (N,d)
+
+        def along(v):                                               # v (d,) -> (v.grad tau, v^T H tau v)
+            vv = v.expand_as(zin)                                   # (N,d) tangent
+            (tau, dv), (_, dvv) = jvp(lambda x: jvp(self.trunk, (x,), (vv,)), (zin,), (vv,))
+            return tau, dv, dvv                                    # each (N,p)
+
+        tau, dgrad, sec = vmap(along)(dirs)                          # (m,N,p) each
+        shp = z.shape[:-1]
+        return (tau[0].reshape(*shp, -1),                           # tau identical across directions
+                dgrad.movedim(0, -2).reshape(*shp, dirs.shape[0], -1),   # (N,m,p) = L^T grad tau
+                sec.sum(0).reshape(*shp, -1))                       # sum_k -> tr(Sigma H)  (N,p)
+
     def trunk_grad(self, z):
         """State basis trunk(z) with its GRADIENT only (no Laplacian) -> tau (...,p), grad_tau (...,d,p)
         [d_i tau]. Single forward jvp per unit tangent, VMAPPED over the d tangents (= forward-mode
