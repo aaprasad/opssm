@@ -108,32 +108,44 @@ above; see `notes/TODO.md`.
 
 ## VERDICT: default OFF. The gauge is real, but Sigma also eats anisotropic DRIFT error.
 
-Full factorials, frozen dataset, model seed 0, 14k steps (deltas vs the base arm):
+Full factorials, frozen dataset, model seed 0, 14k steps, CANONICAL settings (deltas vs the base arm):
 
 | | em_vdp (d=2, sensor anisotropy 1.16) | em_lorenz (d=3, sensor anisotropy 4.43) |
 |---|---|---|
-| learned `g_aniso` | **1.136** (as predicted) | **6.93** (predicted 4.43 -- way OVER) |
-| drift_rel final / best | -0.023 / -0.003 | **+0.024 / +0.061** |
-| lat_rel | -0.002 | **+0.047** |
-| g_rel | -0.012 (-> 0.9999) | -1.54 |
+| learned `g_aniso` | **1.136** (as predicted) | **8.74**, peaking 11.9 (predicted 4.43 -- diverges) |
+| drift_rel final / best | -0.023 / -0.003 | **+0.241 / +0.191** |
+| lat_rel | -0.002 | **+0.060** |
+| g_rel | -0.012 (-> 0.9999) | -1.15 |
 | recon_r2 | +0.000 | -0.003 |
 
+Absolute Lorenz: base drift_rel 0.3616 -> covariance 0.6028 (67% WORSE); best 0.3375 -> 0.5284. The
+learned-R arm is a null there (0.3773), and the `both` arm tracked the covariance arm (0.6492 at step 8000,
+stopped early) -- so the covariance is unambiguously the harmful factor.
+
 **The diagnostic is `g_aniso` vs the sensor's PREDICTED anisotropy.** When they match (VdP) `Sigma` has
-captured the gauge and the change mildly HELPS. When the learned value OVERSHOOTS (Lorenz, 6.93 vs 4.43)
-the excess is absorbed anisotropic DRIFT error, and the change HURTS: latent +0.047, best drift +0.061.
-The Lorenz `g_rel` improvement of 1.54 is COSMETIC -- `det(Sigma)^(1/2d)` is a geometric mean, so it
-discounts exactly the anisotropy the drift error injected. Better number, worse model.
+captured the gauge and the change mildly HELPS. When the learned value RUNS AWAY (Lorenz: 4.53 -> 6.19 ->
+7.62 -> 9.72 -> 11.90 vs a predicted 4.43) it is eating anisotropic DRIFT error, and the change HURTS --
+`lat_rel` degrades monotonically 0.1735 -> 0.2278 in lockstep with the climbing anisotropy. That is a
+DIVERGENCE, not a fixed point: anisotropic drift error inflates Sigma -> the FP residual diffuses
+anisotropically -> the filter degrades -> more drift error.
 
-The Lorenz trajectory looks like a FEEDBACK LOOP, not a fixed point: `g_aniso` climbs 4.59 -> 9.54 over
-training while `lat_rel` degrades 0.175 -> 0.214 in lockstep. Anisotropic drift error inflates Sigma's
-anisotropy -> the FP residual diffuses anisotropically -> the filter degrades -> more drift error.
+The Lorenz `g_rel` gain of 1.15 is COSMETIC: `det(Sigma)^(1/2d)` is a geometric mean, so it discounts exactly
+the anisotropy the drift error injected. Better diffusion number, worse latent AND worse drift.
 
-This is the SAME failure shape as [[sde-matching-mstep-helps]]: estimators that conflate filter uncertainty
-with process noise are fine on well-observed systems and break on under-observed/rotational ones. Caveats:
-one seed per arm; Lorenz ran at reduced `n_colloc=256 n_tcoll=12` (the default OOMs on JAX, see TODO), and
-its `c_cos` is pinned at 0.810, so the gauge relation's `span(C_model)=span(C_true)` assumption is violated
-there -- which compromises the PREDICTION test but not the measured latent/drift degradation.
+Same failure shape as [[sde-matching-mstep-helps]]: estimators that conflate filter uncertainty with process
+noise are fine on well-observed systems and break on under-observed/rotational ones.
+
+CAVEATS: one seed per arm. This em_lorenz draw is ill-conditioned (`C_true` singular values 3.70/2.50/0.84)
+and `c_cos` is pinned at 0.810 -- the sensor is essentially fixed by the subspace-ID init and never recovers,
+so the gauge relation's `span(C_model)=span(C_true)` assumption is violated. That compromises the PREDICTION
+test but not the measured latent/drift degradation. A cleaner test would use the better-conditioned draw in
+`dump/jax_port/em_lorenz.npz` (c_cos 0.93).
+
+NB an earlier version of this section reported drift deltas of +0.024/+0.061 from runs at reduced
+`n_colloc=256/n_tcoll=12`; those were discarded (the reduction worked around a phantom OOM caused by
+`XLA_PYTHON_CLIENT_PREALLOCATE=false`) and had UNDERSTATED the harm.
 
 **Status: `diffusion_cov` defaults FALSE.** The representational argument stands (Stiefel C + scalar g
-genuinely cannot express the DGP at d>1), so the code stays behind the flag. Untried mitigation: shrink
-toward isotropy, `Sigma <- (1-a) Sigma + a (tr(Sigma)/d) I`, one knob interpolating the two regimes.
+genuinely cannot express the DGP at d>1, oracle-verified), so the code stays behind the flag. Untried
+mitigation: shrink toward isotropy, `Sigma <- (1-a) Sigma + a (tr(Sigma)/d) I`, one knob interpolating the
+two regimes -- the runaway above suggests it would need to be fairly aggressive on Lorenz.
