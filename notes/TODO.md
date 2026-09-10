@@ -48,23 +48,32 @@ physics-`g` beat increment-`g`") vs the regression M-step. If it wins at d=1 (it
 d=3 (Lorenz) where the rotational-gauge question decides residual-only vs hybrid. Subsumes the deferred drift
 work (higher-order increment / finer dt below stay as complementary levers for the rotational part).
 
-## Do NOT set `XLA_PYTHON_CLIENT_PREALLOCATE=false` for large JAX runs (docs footgun)
+## Do NOT set `XLA_PYTHON_CLIENT_PREALLOCATE=false` for large JAX runs
 
-`docs/em_highd_activation.md` and `docs/density_tails.md` both put `XLA_PYTHON_CLIENT_PREALLOCATE=false` in
-their example commands. That disables JAX's up-front pool and makes it allocate on demand, which FRAGMENTS:
-a single large contiguous request then fails even with plenty of free memory.
+That flag disables JAX's up-front memory pool, so it allocates on demand and FRAGMENTS: a single large
+contiguous request then fails even with plenty of memory free.
 
 Measured 2026-09-10, 32 GB RTX 5090, GPU otherwise idle (~2.2 GB used), `experiment=em_lorenz` at its
 DEFAULT `n_colloc=384 n_tcoll=24`:
-- with `XLA_PYTHON_CLIENT_PREALLOCATE=false`  -> `RESOURCE_EXHAUSTED: ... allocate 22.00GiB` in `jit_estep`
-- with it UNSET (JAX default preallocation)   -> runs fine
 
-Confirmed not to be code: the pre-change commit `a844a0c` OOMs identically with the flag set, and the
-2026-09-08 run `dump/jax_port/lorenz_run` completed 14k steps at these exact settings without it.
+| env | result |
+|---|---|
+| `XLA_PYTHON_CLIENT_PREALLOCATE=false` | `RESOURCE_EXHAUSTED: ... allocate 22.00GiB` in `jit_estep` |
+| flag UNSET (JAX default preallocation) | runs fine |
 
-ACTION: drop the flag from the docs' example commands (or explain it is only for sharing a GPU, which the
-project forbids anyway -- one run per GPU). NB an earlier version of this file claimed the JAX E-step needs
-torch's batch chunking to run em_lorenz; that was WRONG and rested on this flag.
+Ruled out in turn before landing on the flag: concurrency (reproduced on an idle GPU), local code
+(the pre-change commit `a844a0c` OOMs identically in a `git worktree`), data (identical npz shapes and
+resolved config vs `dump/jax_port/lorenz_run`, which finished 14k steps at these settings on 2026-09-08),
+and library drift (jax 0.11.1 unchanged since 2026-08-17).
+
+PROVENANCE: the flag is NOT in the current tree. It appeared in `docs/em_highd_activation.md` and
+`docs/density_tails.md` at commit `89bb550`, which PR #7 rewrote away (`density_tails.md` no longer exists);
+it was copied from there into this experiment's run scripts. Nothing to fix in the docs today -- this note
+exists so the failure mode is recognized rather than re-diagnosed as a model/memory limit.
+
+If a JAX run OOMs on a big contiguous allocation, CHECK THIS FLAG before reducing `n_colloc`/`n_tcoll`.
+(Torch's `accumulate_pinn_grads` chunking is a genuine backend difference, but it is NOT needed to run
+em_lorenz -- an earlier version of this item wrongly claimed it was.)
 
 ## Fix the `nll` gradient detach (dormant; do before enabling Stage-3 NLL training)
 
