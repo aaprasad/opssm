@@ -1,5 +1,7 @@
 """Shared JAX fitting, validation selection, timing, and prefix-only forecasting."""
 import importlib.metadata
+import json
+import os
 import time
 
 import equinox as eqx
@@ -24,6 +26,36 @@ def forecast(model, theta, y, ts, key, samples):
     lp = -observation_nll(theta, y[cut:, None], paths, model.noise)
     return dict(forecast_mean=predictions.mean(1),
                 forecast_loglik=jax.scipy.special.logsumexp(lp, axis=1) - jnp.log(samples))
+
+
+def save_fit_checkpoint(directory, arrays, meta):
+    """Atomically persist the in-progress fit, so a preemption mid-write cannot corrupt it."""
+    arrays_path, meta_path = directory / "fit_ckpt.eqx", directory / "fit_ckpt.json"
+    temp = arrays_path.with_name(arrays_path.name + ".tmp")
+    eqx.tree_serialise_leaves(temp, arrays)
+    os.replace(temp, arrays_path)
+    temp = meta_path.with_name(meta_path.name + ".tmp")
+    temp.write_text(json.dumps(meta))
+    os.replace(temp, meta_path)
+
+
+def load_fit_checkpoint(directory, skeleton, signature):
+    """Restore a preempted fit, but only one produced by this exact configuration.
+
+    Resuming across a changed model, dataset or budget would silently mix two runs, so a
+    mismatched signature is ignored and the fit restarts rather than producing a hybrid.
+    """
+    arrays_path, meta_path = directory / "fit_ckpt.eqx", directory / "fit_ckpt.json"
+    if not (arrays_path.exists() and meta_path.exists()):
+        return None
+    try:
+        meta = json.loads(meta_path.read_text())
+    except json.JSONDecodeError:
+        return None
+    if meta.get("signature") != signature:
+        print(f"ignoring {arrays_path}: written by a different configuration", flush=True)
+        return None
+    return eqx.tree_deserialise_leaves(arrays_path, skeleton), meta
 
 
 def fit_jax(name, data, cfg, args, directory, seed):
@@ -55,11 +87,24 @@ def fit_jax(name, data, cfg, args, directory, seed):
         return eqx.apply_updates(theta, updates), state, loss, grad_finite
 
     val_loss = eqx.filter_jit(lambda th: model.loss(th, y["val"], ts, jr.PRNGKey(seed + 10000)))
-    history, best, best_step, best_theta = [], float("inf"), 0, None
+    history, best, best_step, best_theta = [], float("inf"), 0, theta
     key = jr.PRNGKey(seed + 1)
+    start_iteration, elapsed_before = 0, 0.
+    # Resume a preempted fit: SLURM requeues the task, and without this the cell restarts at step 0.
+    signature = dict(model=name, seed=seed, steps=args.steps, lr=args.lr, hidden=args.hidden,
+                     modes=args.modes, batch_size=args.batch_size, val_every=args.val_every,
+                     solver_dt=args.solver_dt, fixed_obs_noise=args.fixed_obs_noise,
+                     dataset_hash=fingerprint(data))
+    restored = load_fit_checkpoint(directory, (theta, state, theta), signature)
+    if restored is not None:
+        (theta, state, best_theta), meta = restored
+        history, best, best_step = meta["history"], meta["best"], meta["best_step"]
+        start_iteration, elapsed_before = meta["iteration"], meta["elapsed_s"]
+        key = jnp.asarray(meta["key"], dtype=jnp.uint32)
+        print(f"{cfg.name}/{name} seed={seed} resuming at step {start_iteration}", flush=True)
     started = time.perf_counter()
     first_step_s = None
-    for iteration in range(1, args.steps + 1):
+    for iteration in range(start_iteration + 1, args.steps + 1):
         key, kb, kl = jr.split(key, 3)
         idx = jr.permutation(kb, y["train"].shape[1])[:args.batch_size]
         before = time.perf_counter()
@@ -77,7 +122,11 @@ def fit_jax(name, data, cfg, args, directory, seed):
             if value < best:
                 best, best_step, best_theta = value, iteration, theta
             print(f"{cfg.name}/{name} seed={seed} step={iteration} val={value:.5g}", flush=True)
-    fit_s = time.perf_counter() - started
+            save_fit_checkpoint(directory, (theta, state, best_theta),
+                dict(signature=signature, iteration=iteration, best=best, best_step=best_step,
+                     history=history, key=[int(v) for v in jnp.asarray(key).ravel()],
+                     elapsed_s=elapsed_before + time.perf_counter() - started))
+    fit_s = elapsed_before + time.perf_counter() - started
     theta = best_theta
     eqx.tree_serialise_leaves(directory / "best.eqx", theta)
     write_json(directory / "history.json", history)

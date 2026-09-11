@@ -419,6 +419,12 @@ a per-dataset budget (lorenz defaults to 3000, since it converges by ~2000).
 
 Each job validates its resolved `DatasetConfig` before doing any work, and returns immediately if
 its cell already holds a `result.json`, so SLURM `--requeue` after preemption resumes the sweep.
+A task preempted *mid-fit* also resumes rather than restarting: OPSSM continues from `train()`'s
+rolling `ckpt.*` (every 500 steps) and the other six continue from a `fit_ckpt.*` written at each
+validation, carrying optimizer state, the best-so-far checkpoint, history, RNG key and elapsed
+time. Both are written atomically, so a kill mid-write cannot corrupt them, and both are guarded
+by a signature over the model, dataset hash and budget: a checkpoint from a different
+configuration is never resumed (OPSSM fails loudly; the others restart the fit and say so).
 `save_dataset` is atomic (unique temp name plus `os.replace`), so the jobs of a cell may race to
 write their shared `data.npz` without producing a torn file; `make_dataset` is deterministic in
 (config, seed), so the bytes are identical either way.

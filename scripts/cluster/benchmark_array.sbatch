@@ -45,6 +45,9 @@ export PYTHONPATH="${SWEEP_REPO}${PYTHONPATH:+:${PYTHONPATH}}"
 # Deliberately NOT setting XLA_PYTHON_CLIENT_PREALLOCATE=false: disabling preallocation is what
 # produced the em_lorenz OOM. Leave XLA's default allocator alone.
 unset XLA_PYTHON_CLIENT_PREALLOCATE
+# An inherited CPU binding from an enclosing allocation is applied to this job step and makes
+# srun reject it as outside the allocation.
+unset SLURM_CPU_BIND
 
 ARGS=(--datasets "${DATASET}" --models "${MODEL}" --seeds "${SEED}"
       --steps "${STEPS}" --val-every "${SWEEP_VAL_EVERY}" --samples "${SWEEP_SAMPLES}"

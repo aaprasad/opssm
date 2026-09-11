@@ -26,6 +26,11 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# Popped at import, so it applies both where the multirun is submitted and inside the task: an
+# inherited SLURM_CPU_BIND from an enclosing allocation is applied to the new job step and makes
+# srun reject the binding as outside its allocation.
+os.environ.pop("SLURM_CPU_BIND", False)
+
 
 def point_name(overrides):
     """Stable, filesystem-safe directory name for one set of data-config overrides."""

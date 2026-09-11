@@ -156,9 +156,25 @@ def run(job):
         samples=select_samples, ground_truth_free=monitor == "val_forecast_rmse",
         gt_diagnostics_logged=bool(refs.get("z_val_true") is not None)))
     write_json(out / "config_provenance.json", config_provenance)
+    # Resume a preempted run from train()'s rolling ckpt.*: SLURM requeues the task, and without
+    # this the cell restarts at step 0. Only ever resume a checkpoint this same configuration
+    # wrote -- otherwise a rerun against a changed config would silently continue a stale fit.
+    signature = dict(config_sha256=config_provenance["resolved_model_sha256"],
+                     dataset_hash=fingerprint(data), steps=job["steps"], seed=job["seed"],
+                     monitor=monitor, monitor_mode=monitor_mode, smoke=bool(job["smoke"]))
+    signature_path = out / "run_signature.json"
+    resume = False
+    if signature_path.exists() and (out / "ckpt.eqx").exists():
+        if json.loads(signature_path.read_text()) == signature:
+            resume = True
+        else:
+            raise ValueError(f"{out} holds a checkpoint from a different configuration; "
+                             "use a new results directory rather than resuming a stale fit")
+    write_json(signature_path, signature)
     started = time.perf_counter()
     state, _ = train(refs, hp, n_steps=job["steps"], key=jr.PRNGKey(job["seed"]),
-                     val_every=1 if job["smoke"] else job.get("val_every", 100), ckpt_dir=str(out), resume=False,
+                     val_every=1 if job["smoke"] else job.get("val_every", 100), ckpt_dir=str(out),
+                     resume=resume, ckpt_every=job.get("ckpt_every", 500),
                      monitor=monitor, monitor_mode=monitor_mode, return_best=True, timing=True,
                      extra_metrics=extra_metrics)
     fit_s = time.perf_counter() - started
