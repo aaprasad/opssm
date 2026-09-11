@@ -1,0 +1,76 @@
+# Benchmark comparison sweep (opssm/benchmarks) -- Hydra multirun + submitit.
+#
+# ONE multirun job = ONE (data point, dataset, seed, model) cell = ONE GPU. Concurrent training on a
+# shared GPU is not supported, so the cell is the unit of parallelism; comma lists are the sweep axes.
+#
+# Local, one cell:
+#   python scripts/benchmark_sweep.py dataset=vanderpol method=opssm seed=0
+#
+# Sweep the data configs on SLURM (one array across all partitions, preemptible -- tasks resume):
+#   python scripts/benchmark_sweep.py -m hydra/launcher=submitit_slurm \
+#       dataset=vanderpol seed=0,1,2,3,4 \
+#       method=kf,ekf,ukf,slds,latent_sde,sde_matching,opssm \
+#       dataset_config.noise_std=0.25,0.5,1.0,1.5,3.0
+#
+# Anything under `dataset_config` overrides that dataset's DatasetConfig preset, so every field is
+# sweepable. NB `model`/`data` are existing Hydra config groups in this repo, hence `method`/`dataset_config`.
+# (noise_std, num_obs, n_train, duration, diffusion, tau, mu, a, obs_dim, simulation_dt, ...).
+defaults:
+  - _self_
+  - override hydra/launcher: basic
+
+dataset: vanderpol          # doublewell | vanderpol | lorenz | lorenz_li
+method: opssm               # kf | ekf | ukf | slds | latent_sde | sde_matching | opssm
+seed: 0
+
+# DatasetConfig overrides applied to PRESETS[dataset]. Every field is listed so it can be swept
+# directly (`dataset_config.noise_std=0.25,0.5`); null means "keep the preset's value". The set of
+# non-null fields names the results subdirectory, so distinct data configs never collide.
+dataset_config:
+  noise_std: null        # observation noise SD -- the axis the SNR finding implicates
+  diffusion: null        # process noise G
+  num_obs: null          # observations per trajectory
+  duration: null         # trajectory length in physical time
+  simulation_dt: null    # data-generation step (NOT the model's)
+  obs_dim: null          # sensor channels
+  n_train: null
+  n_val: null
+  n_test: null
+  a: null                # double-well strength
+  tau: null              # Van der Pol timescale
+  mu: null               # Van der Pol rho
+  initial_scale: null
+
+# Results tree, SHARED across all multirun jobs (not the per-job Hydra dir): every model in a cell
+# must read the same data.npz for the comparison to mean anything.
+results_root: ./dump/benchmark_sweep
+
+steps: 10000
+steps_per_dataset:          # per-dataset budget; lorenz converges by ~2000
+  lorenz: 3000
+val_every: 100
+samples: 128
+solver_dt: 0.01
+batch_size: 16
+hidden: 64
+modes: 3
+lr: 0.001
+fixed_obs_noise: false
+smoke: false
+
+opssm:
+  monitor: val_forecast_rmse   # ground-truth-free; recon_r2 saturates and selects far too early
+  monitor_mode: null           # inferred from the metric
+  select_samples: 16
+  gt_diagnostics: true         # log drift/latent GT metrics each validation -- DIAGNOSTIC ONLY, never monitored
+  experiment: null             # Hydra experiment for OPSSM; default: matching duncker_*/kato
+  config_dir: null             # frozen config tree; default: repository configs/
+
+hydra:
+  run:
+    dir: ${results_root}/.hydra/${dataset}_seed${seed}_${method}
+  sweep:
+    dir: ${results_root}/.hydra
+    subdir: ${dataset}_seed${seed}_${method}_${hydra.job.num}
+  job:
+    chdir: false

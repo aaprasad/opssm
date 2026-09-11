@@ -30,6 +30,13 @@ for legacy baselines and checkpoints. See the [activation comparison](docs/em_hi
 for JAX commands, checkpoint compatibility, and double-well results.
 
 ## Package layout
+
+For KF/EKF/UKF, switching LDS, Diffrax latent SDE, SDE Matching, and OPSSM
+comparisons on double-well, Van der Pol, Lorenz, and Kato 2015 neural recordings,
+see the [baseline protocol and commands](docs/baselines.md). Synthetic trajectories
+are split independently; Kato uses separate temporal blocks and includes linear
+behavior-state decoding. The protocol documents differences from published setups.
+
 ```
 opssm/
   data/doublewell/   sde.py (generative model) · oracle.py (exact grid filter) · datamodule.py (LightningDataModule)

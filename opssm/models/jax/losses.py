@@ -8,9 +8,49 @@ precomputed time index `ti`, so the loss is a deterministic jittable function of
 """
 import math
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jax.scipy.special import logsumexp
+
+
+def pinn_zakai_value_and_grad(model, xs, mask, z_col, log_q, s_coll, drift, sigma,
+                             log_prior, noise_var, dt, ti, *, w_res, res_mode, decode,
+                             chunk_size=None):
+    """Accumulate the exact full-batch gradient, releasing each chunk's AD buffers.
+
+    All chunks use the same pre-drawn collocation samples and time indices. There
+    is one optimizer update after accumulation, including a size-weighted tail.
+    Differentiation happens INSIDE the loop; no full-batch reverse tape is kept.
+    """
+    B = xs.shape[1]
+    size = B if chunk_size is None else min(int(chunk_size), B)
+    if size < 1:
+        raise ValueError("chunk_size must be positive")
+
+    def objective(op, x, m, z, q):
+        res, jump, ic, _ = pinn_zakai_loss(op, x, m, z, q, s_coll, drift, sigma,
+            log_prior, noise_var, dt, ti=ti, res_mode=res_mode, decode=decode)
+        return w_res * res + jump + ic, (res, jump, ic)
+
+    value_grad = eqx.filter_value_and_grad(objective, has_aux=True)
+    arrays = (xs, mask, z_col, log_q)
+    result = value_grad(model, *(x[:, :size] for x in arrays))
+    if size == B:
+        return result
+    carry = jax.tree.map(lambda x: x * (size / B), result)
+
+    def accumulate(i, total):
+        parts = [jax.lax.dynamic_slice_in_dim(x, i * size, size, axis=1) for x in arrays]
+        result = value_grad(model, *parts)
+        return jax.tree.map(lambda a, b: a + (size / B) * b, total, result)
+
+    carry = jax.lax.fori_loop(1, B // size, accumulate, carry)
+    remainder = B % size
+    if remainder:
+        tail = value_grad(model, *(x[:, -remainder:] for x in arrays))
+        carry = jax.tree.map(lambda a, b: a + (remainder / B) * b, carry, tail)
+    return carry
 
 
 def kl_target_pred(target, log_pred, eps=1e-12):

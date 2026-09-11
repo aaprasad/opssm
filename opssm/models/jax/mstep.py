@@ -15,7 +15,7 @@ import equinox as eqx
 from opssm.models.jax.obs import zhat_from_obs
 
 
-def _mala_chains(model, x, mask, center, n_chains, n_steps, broad_std, key,
+def _mala_chains_full(model, x, mask, center, n_chains, n_steps, broad_std, key,
                  rng="stochastic", step_size=0.1, burn_in=None, init_std=0.0, adapt=True):
     """T*B independent d-dim MALA chains on the per-time filter marginal pi_t ~ exp(ell_t). ell_t from
     b0=coeffs(ctx,s=0); grad via trunk_grad. Per-site step adapts toward the 0.574 MALA optimum during
@@ -68,12 +68,40 @@ def _mala_chains(model, x, mask, center, n_chains, n_steps, broad_std, key,
 
     carry = (z, ell, grad, eps, key, jnp.zeros_like(center), jnp.array(0, jnp.int32), jnp.array(0.0, center.dtype))
     (z, ell, grad, eps, key, zsum, ncol, acc_sum), _ = jax.lax.scan(body, carry, jnp.arange(n_steps))
-    return z, zsum / jnp.maximum(ncol, 1), float(acc_sum) / max(n_steps, 1)
+    return z, zsum / jnp.maximum(ncol, 1), acc_sum / max(n_steps, 1)
 
 
-def posterior_mean_mala(model, x, mask, center, broad_std, key, n_chains=64, n_steps=30, rng="stochastic"):
+_mala_compiled = eqx.filter_jit(_mala_chains_full)
+
+
+def _mala_chains(model, x, mask, center, n_chains, n_steps, broad_std, key,
+                 rng="stochastic", step_size=0.1, burn_in=None, init_std=0.0, adapt=True,
+                 chunk_size=None):
+    """Bound MALA derivative buffers by trajectory chunks, retaining every site.
+
+    Independent chunk RNG streams are deterministic for a fixed chunk size; this
+    preserves the sampler's law, not bitwise equality across different chunk sizes.
+    """
+    size = x.shape[1] if chunk_size is None else min(int(chunk_size), x.shape[1])
+    if size < 1:
+        raise ValueError("chunk_size must be positive")
+    options = dict(rng=rng, step_size=step_size, burn_in=burn_in, init_std=init_std, adapt=adapt)
+    if size == x.shape[1]:
+        z, mean, acc = _mala_chains_full(model, x, mask, center, n_chains, n_steps, broad_std, key, **options)
+        return z, mean, float(acc)
+    samples, means, accept = [], [], 0.0
+    for start in range(0, x.shape[1], size):
+        stop = min(start + size, x.shape[1])
+        z, mean, acc = _mala_compiled(model, x[:, start:stop], mask[:, start:stop], center[:, start:stop],
+            n_chains, n_steps, broad_std, jax.random.fold_in(key, start), **options)
+        samples.append(z); means.append(mean)
+        accept += float(acc) * (stop - start) / x.shape[1]
+    return jnp.concatenate(samples, axis=1), jnp.concatenate(means, axis=1), accept
+
+
+def posterior_mean_mala(model, x, mask, center, broad_std, key, n_chains=64, n_steps=30, rng="stochastic", chunk_size=None):
     """MALA readout of the per-time filter mean E[z_t|y_{0:t}] -> (z_hat (T,B,d), accept)."""
-    _, z_mean, acc = _mala_chains(model, x, mask, center, n_chains, n_steps, broad_std, key, rng=rng)
+    _, z_mean, acc = _mala_chains(model, x, mask, center, n_chains, n_steps, broad_std, key, rng=rng, chunk_size=chunk_size)
     return z_mean, acc
 
 

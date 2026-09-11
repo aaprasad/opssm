@@ -22,7 +22,7 @@ import optax
 from opssm.models.jax.operator import OperatorFilter
 from opssm.models.jax.dynamics import DriftNet
 from opssm.models.jax.obs import zhat_from_obs, make_decode
-from opssm.models.jax.losses import pinn_zakai_loss, sample_collocation, kl_target_pred
+from opssm.models.jax.losses import pinn_zakai_loss, pinn_zakai_value_and_grad, sample_collocation, kl_target_pred
 from opssm.models.jax import mstep as M
 from opssm.models.jax.init import subspace_id, warmstart_drift, linear_dynamics
 from opssm.models.jax.obs import zhat_from_obs as _zhat
@@ -52,7 +52,8 @@ DEFAULTS = dict(  # em_highd resolved hparams; the bridge overrides per-experime
 
 
 def _mala_cfg(hp):
-    return dict(n_chains=hp["mala_chains"], n_steps=hp["mala_steps"], rng=hp["mala_rng"])
+    return dict(n_chains=hp["mala_chains"], n_steps=hp["mala_steps"], rng=hp["mala_rng"],
+                chunk_size=hp.get("chunk_size"))
 
 
 def _run_mstep(op, xs, mask, drift_net, dr_opt, dr_state, C, d, g, hp, key, bootstrap=False,
@@ -93,13 +94,9 @@ def make_estep(xs, mask, s_coll, optim, hp):
         z_col, log_q = sample_collocation(kc, xs, mask, hp["n_colloc"], hp["near_std"], hp["broad_std"], center)
         ti = jax.random.permutation(kt, T)[:hp["n_tcoll"]]
 
-        def loss_fn(op):
-            res, jump, ic, nll = pinn_zakai_loss(op, xs, mask, z_col, log_q, s_coll, drift_net.drift, g,
-                                                 _log_prior, noise_var, hp["dt"], ti=ti,
-                                                 res_mode=hp["res_mode"], decode=decode)
-            return hp["w_res"] * res + jump + ic, (res, jump, ic)
-
-        (loss, aux), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(op)
+        (loss, aux), grads = pinn_zakai_value_and_grad(op, xs, mask, z_col, log_q, s_coll,
+            drift_net.drift, g, _log_prior, noise_var, hp["dt"], ti,
+            w_res=hp["w_res"], res_mode=hp["res_mode"], decode=decode, chunk_size=hp.get("chunk_size"))
         updates, opt_state = optim.update(grads, opt_state, eqx.filter(op, eqx.is_inexact_array))
         return eqx.apply_updates(op, updates), opt_state, aux
 
@@ -158,14 +155,15 @@ def validate(op, drift_net, g_cur, C_cur, d_cur, refs, hp, key):
         lo, hi = jnp.quantile(m_op, 0.01), jnp.quantile(m_op, 0.99)
         on = (zg >= lo) & (zg <= hi)
         fd = drift_net.net(zg[:, None])[:, 0]
-        ftrue_g = refs["true_drift"](zg[:, None])[:, 0]
-        logs["drift_l2"] = float(jnp.sqrt((((fd - ftrue_g) ** 2) * on).sum() / jnp.maximum(on.sum(), 1)))
+        if refs.get("true_drift") is not None:
+            ftrue_g = refs["true_drift"](zg[:, None])[:, 0]
+            logs["drift_l2"] = float(jnp.sqrt((((fd - ftrue_g) ** 2) * on).sum() / jnp.maximum(on.sum(), 1)))
         m_op_full = m_op[..., None]                               # (T,B,1)
     else:
         center = zhat_from_obs(xv, C_cur, d_cur)
         m_op_full, _ = M.posterior_mean_mala(op, xv, mv, center, hp["broad_std"], key,
                                              n_chains=hp["mala_chains"], n_steps=hp["mala_steps"],
-                                             rng=hp["mala_rng"])   # (T,B,d)
+                                             rng=hp["mala_rng"], chunk_size=hp.get("chunk_size"))   # (T,B,d)
     if has_ct:
         Cn = refs["C_true"] / jnp.linalg.norm(refs["C_true"], axis=0, keepdims=True)
         logs["c_cos"] = float(jnp.minimum(jnp.linalg.svd(C_cur.T @ Cn, compute_uv=False), 1.0).mean())
@@ -236,13 +234,21 @@ def _write_metrics(ckpt_dir, history):
 
 
 def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, timing=False,
-          ckpt_dir=None, ckpt_every=1000, resume=True, monitor="recon_r2", monitor_mode="max"):
+          ckpt_dir=None, ckpt_every=1000, resume=True, monitor="recon_r2", monitor_mode="max",
+          return_best=False, extra_metrics=None):
     """Run EM training in JAX (any d). refs: bridged arrays (jnp) + 'true_drift'. Returns (state, history).
     timing=True blocks each phase (block_until_ready) + records per-phase wall-clock into state['timing'].
     ckpt_dir: if set, checkpoint the EM state every ckpt_every steps and, when resume, restart from
     <ckpt_dir>/ckpt.* if present (skips the warmstart+bootstrap init). Preemption-safe via SLURM --requeue +
     resume: we do NOT catch signals -- submitit bypasses SIGTERM and won't requeue non-checkpointable jobs, so
-    the requeue is SLURM's and we simply resume from the last periodic checkpoint on rerun."""
+    the requeue is SLURM's and we simply resume from the last periodic checkpoint on rerun.
+    return_best: restore the validation-selected checkpoint before returning inference state;
+    requires ckpt_dir. Default False preserves the existing final-state behavior.
+    extra_metrics: optional fn(op, drift_net, g_cur, C_cur, d_cur, noise_var, L_cur, m_op_full, key)
+    -> dict of extra validation scalars, merged into the logged metrics and hence monitorable. Used by
+    the benchmark adapter for a ground-truth-free validation forecast score; None keeps validate() alone."""
+    if return_best and ckpt_dir is None:
+        raise ValueError("return_best requires ckpt_dir for validation-selected checkpoint restoration")
     if hp.get('tail_std', 0.0) != 0.0:
         raise ValueError('Gaussian tails have been removed; remove the tail_std setting')
     t_train0 = time.perf_counter()
@@ -333,6 +339,10 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
                 v = mstep_diag.get(k)                              # log BOTH estimators (NaN-safe)
                 if v is not None and v == v:
                     m[tag] = float(v) ** 0.5
+        if extra_metrics is not None:                              # adapter-supplied scalars (e.g. val forecast)
+            key, ek = jax.random.split(key)
+            m.update(extra_metrics(op, drift_net, g_cur, jnp.asarray(C_cur), d_cur,
+                                   noise_var, L_cur, m_op, ek))
         tm["val"].append(time.perf_counter() - tv)
         if _plot is not None:
             tf = time.perf_counter()
@@ -388,7 +398,14 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
     report = _timing_report(tm, init_s, total_s, n_steps)
     if timing:
         log_fn(_fmt_timing(report))
-    return dict(op=op, drift_net=drift_net, g_cur=g_cur, C_cur=C_cur, d_cur=d_cur, timing=report), history
+    selected_step = n_steps
+    if return_best and _has_ckpt(ckpt_dir, "best"):
+        arrays, meta = _load_ckpt(ckpt_dir,
+            (op, op_opt_state, drift_net, dr_state, C_cur, d_cur, L_cur, noise_var), "best")
+        op, op_opt_state, drift_net, dr_state, C_cur, d_cur, L_cur, noise_var = arrays
+        g_cur, selected_step = meta["g_cur"], meta["step"]
+    return dict(op=op, drift_net=drift_net, g_cur=g_cur, C_cur=C_cur, d_cur=d_cur,
+                L_cur=L_cur, noise_var=noise_var, selected_step=selected_step, timing=report), history
 
 
 def _timing_report(tm, init_s, total_s, n_steps):

@@ -21,6 +21,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Synthetic and Kato comparisons. CPU JAX is intentional; select a GPU JAX wheel separately
+# on accelerators. Does not install Torch or its conflicting CUDA runtime.
+benchmarks = [
+    "jax>=0.6",
+    "dynamax>=1.0.2,<1.1",
+    "diffrax>=0.7.2,<0.8",
+    "equinox>=0.13",
+    "optax>=0.2",
+]
 # Torch backend (the reference implementation): Lightning training loop + torch operator/filter_module.
 #   pip install -e '.[torch]'
 # For a specific CUDA build (e.g. cu130) point pip at the pytorch index:
