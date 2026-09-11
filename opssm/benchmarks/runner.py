@@ -2,7 +2,9 @@
 import argparse
 import csv
 from dataclasses import replace
+from datetime import datetime, timezone
 import json
+import os
 import platform
 from pathlib import Path
 import subprocess
@@ -13,6 +15,33 @@ import numpy as np
 
 from .data import PRESETS, fingerprint, make_dataset, save_dataset, smoke_config
 from .metrics import aggregate
+
+# SLURM_RESTART_COUNT is the one that answers "was this preempted?": SLURM increments it each time
+# it requeues the task, so a nonzero value means this attempt follows a preemption or a timeout.
+SLURM_KEYS = {"SLURM_JOB_ID": "job_id", "SLURM_ARRAY_JOB_ID": "array_job_id",
+              "SLURM_ARRAY_TASK_ID": "array_task_id", "SLURM_RESTART_COUNT": "restart_count",
+              "SLURM_JOB_PARTITION": "partition", "SLURMD_NODENAME": "node",
+              "SLURM_CLUSTER_NAME": "cluster", "SLURM_JOB_QOS": "qos"}
+
+
+def slurm_info():
+    """SLURM identifiers for this attempt; empty off-cluster."""
+    return {name: os.environ[key] for key, name in SLURM_KEYS.items() if key in os.environ}
+
+
+def record_attempt(directory, **fields):
+    """Append one line per attempt, BEFORE the work starts.
+
+    A preempted task is killed without writing result.json, so this is the only durable trace
+    that the cell was ever tried: the line names the SLURM job, node and restart count, which is
+    what `sacct -j <job_id>` needs to say whether it was preempted, timed out or failed.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    entry = dict(started_at=datetime.now(timezone.utc).isoformat(), pid=os.getpid(),
+                 host=platform.node(), **fields, slurm=slurm_info())
+    with (directory / "attempts.jsonl").open("a") as handle:
+        handle.write(json.dumps(entry) + "\n")
+    return entry
 
 MODELS = ("kf", "ekf", "ukf", "slds", "latent_sde", "sde_matching", "opssm")
 
@@ -113,8 +142,11 @@ def main(argv=None):
                         print(f"skip existing: {directory}", flush=True)
                         continue
                     raise FileExistsError(f"Run exists: {directory}. Choose a new --out directory.")
+                attempt = record_attempt(directory, dataset=cfg.name, model=name, seed=seed)
                 row = dict(dataset=cfg.name, model=name, seed=seed, steps=args.steps, smoke=args.smoke,
-                           dataset_hash=fingerprint(data), settings=settings)
+                           dataset_hash=fingerprint(data), settings=settings,
+                           started_at=attempt["started_at"], host=attempt["host"], **(
+                               {f"slurm_{k}": v for k, v in attempt["slurm"].items()}))
                 try:
                     if name == "opssm":
                         job = dict(data=str((root / "data.npz").resolve()), out=str(directory.resolve()),
@@ -128,7 +160,20 @@ def main(argv=None):
                                    gt_diagnostics=args.opssm_gt_diagnostics)
                         write_json(directory / "job.json", job)
                         command = [args.opssm_python, "-m", "opssm.benchmarks.opssm_worker", str(directory / "job.json")]
-                        subprocess.run(command, check=True)
+                        # Capture stderr so a crash reports WHY, not just an exit status. stdout is
+                        # left attached, so training progress still streams into the job log live.
+                        completed = subprocess.run(command, stderr=subprocess.PIPE, text=True)
+                        if completed.returncode:
+                            detail = (completed.stderr or "").strip()
+                            if detail:
+                                (directory / "worker_stderr.txt").write_text(detail + "\n")
+                                print(detail, file=sys.stderr, flush=True)
+                            cause = detail.splitlines()[-1] if detail else "no stderr captured"
+                            raise RuntimeError(
+                                f"OPSSM worker exited {completed.returncode}: {cause}"
+                                + (f" (full traceback in {directory / 'worker_stderr.txt'})" if detail else "")
+                                + f"; reproduce with: {args.opssm_python} -m opssm.benchmarks.opssm_worker "
+                                  f"{directory / 'job.json'}")
                         metrics = json.loads((directory / "worker_metrics.json").read_text())
                     else:
                         from .train import fit_jax

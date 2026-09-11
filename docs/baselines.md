@@ -349,7 +349,17 @@ Each run writes `data.npz`, model checkpoints, `history.json`, `predictions.npz`
 and `result.json`. The root contains `metrics.csv` and `summary.json` (across-seed
 means and sample standard deviations, grouped by model and posterior type).
 Failures have explicit status/error files and cause a nonzero exit; they are
-excluded from successful-run aggregates. Existing results and mismatched datasets
+excluded from successful-run aggregates. OPSSM trains in a separate process, so its stderr is
+captured: a crash records the actual exception in `result.json`, the full traceback in
+`worker_stderr.txt`, and the command to reproduce that single cell from its saved `job.json`.
+
+Every attempt appends a line to the cell's `attempts.jsonl` **before** the work starts, carrying
+the timestamp, host and SLURM job/array/node identifiers. A preempted task is killed without
+writing `result.json`, so this is the only durable record that the cell was tried at all. The
+same identifiers are copied into `result.json` as `slurm_*` columns, so `metrics.csv` shows which
+node produced each number. `slurm_restart_count` is the preemption signal: SLURM increments it on
+every requeue, so a nonzero value means the attempt followed a preemption or a timeout, and
+`sacct -j <slurm_job_id>` then gives the reason. Existing results and mismatched datasets
 are not silently overwritten.
 
 ## Verification of this implementation

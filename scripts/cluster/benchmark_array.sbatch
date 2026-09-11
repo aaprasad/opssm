@@ -57,9 +57,12 @@ ARGS=(--datasets "${DATASET}" --models "${MODEL}" --seeds "${SEED}"
 # An empty overrides file means the unmodified preset; passing it would be a no-op either way.
 [ -s "${CONFIG}" ] && [ "$(tr -d '[:space:]' < "${CONFIG}")" != "{}" ] && ARGS+=(--dataset-config "${CONFIG}")
 
-echo "[$(date -u +%FT%TZ)] task ${IDX}: ${POINT} ${DATASET} seed=${SEED} ${MODEL} steps=${STEPS} node=$(hostname)" | tee -a "${LOG}"
+# SLURM_RESTART_COUNT is nonzero when SLURM requeued this task, i.e. a preemption or timeout.
+echo "[$(date -u +%FT%TZ)] task ${IDX}: ${POINT} ${DATASET} seed=${SEED} ${MODEL} steps=${STEPS}" \
+     "job=${SLURM_JOB_ID:-none} array=${SLURM_ARRAY_JOB_ID:-none}_${SLURM_ARRAY_TASK_ID:-none}" \
+     "restart=${SLURM_RESTART_COUNT:-0} node=$(hostname)" | tee -a "${LOG}"
 cd "${SWEEP_REPO}"
 "${SWEEP_PYTHON}" -u -m opssm.benchmarks.runner "${ARGS[@]}" >> "${LOG}" 2>&1
 CODE=$?
-echo "[$(date -u +%FT%TZ)] task ${IDX} exit=${CODE}" | tee -a "${LOG}"
+echo "[$(date -u +%FT%TZ)] task ${IDX} exit=${CODE} job=${SLURM_JOB_ID:-none} restart=${SLURM_RESTART_COUNT:-0}" | tee -a "${LOG}"
 exit ${CODE}
