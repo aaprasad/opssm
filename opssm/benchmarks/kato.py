@@ -48,9 +48,19 @@ def prepare_recording(recording, cfg, smoke=False, source_sha256=None):
     cfg = replace(cfg, name=f"kato_{recording['name']}", obs_dim=y.shape[1])
     a, b = int(len(y) * cfg.train_fraction), int(len(y) * (cfg.train_fraction + cfg.val_fraction))
     bounds = {"train": (0, a), "val": (a + cfg.gap_frames, b), "test": (b + cfg.gap_frames, len(y))}
-    # Per-neuron standardization uses only the raw training block. No clipping,
-    # interpolation, derivatives, smoothing, or extra observation noise is added.
-    mean, scale = y[:a].mean(0), y[:a].std(0).clip(1e-6)
+    # Standardization uses only the raw training block. No clipping, interpolation,
+    # derivatives, smoothing, or extra observation noise is added.
+    #
+    # Per-neuron mean, then ONE global signal scale from the top-latent_dim singular values --
+    # the same rule as the synthetic presets and opssm/data/kato/datamodule.py, so that
+    # zhat = C^T (y - d) is O(1). Dividing each neuron by its own SD instead whitens the
+    # observations, destroying the relative amplitude structure that fixes the scale of the
+    # top-d subspace; the latent scale is then unidentified and the learned diffusion absorbs
+    # the mismatch, which diverges (g and obs_noise run away, recon R2 goes sharply negative).
+    mean = y[:a].mean(0)
+    singular = np.linalg.svd(y[:a] - mean, compute_uv=False)[:cfg.latent_dim]
+    scale = np.array(max(float(np.exp(np.log(np.clip(singular, 1e-12, None)).mean())
+                               / np.sqrt(a)), 1e-6))
     data = dict(ts=np.arange(cfg.window) * dt, obs_mean=mean, obs_scale=scale,
                 noise_std_eff=np.array(cfg.noise_std), neuron_ids=np.asarray(recording["neuron_ids"], dtype=str))
     dropped = {}
@@ -71,7 +81,7 @@ def prepare_recording(recording, cfg, smoke=False, source_sha256=None):
                     source="https://osf.io/2395t/", source_sha256=source_sha256,
                     fps=float(recording["fps"]), n_frames=len(y), split_frame_bounds=bounds,
                     unused_tail_frames=dropped, state_names=recording["state_names"],
-                    preprocessing="train-only per-neuron mean/std; corrected fluorescence; native fps",
+                    preprocessing="train-only per-neuron mean + global top-d SVD signal scale; corrected fluorescence; native fps",
                     ground_truth_available=False, noise_std_is_initialization=True)
     data["metadata"] = np.array(json.dumps(metadata, sort_keys=True))
     return cfg, data
