@@ -24,7 +24,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from opssm.benchmarks.data import PRESETS, DatasetConfig
-from opssm.benchmarks.runner import MODELS
+from opssm.benchmarks.runner import DEFAULT_MODELS, MODELS
 
 
 def parse_axis(text):
@@ -54,7 +54,7 @@ def main(argv=None):
                     help="Data-config axis to sweep; repeatable. Multiple axes take the product.")
     ap.add_argument("--datasets", nargs="+", default=["doublewell", "vanderpol", "lorenz"],
                     choices=sorted(PRESETS), help="Datasets to fit at every sweep point")
-    ap.add_argument("--models", nargs="+", default=list(MODELS), choices=MODELS)
+    ap.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS), choices=MODELS)
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     ap.add_argument("--steps", type=int, default=10000)
     ap.add_argument("--steps-override", action="append", default=[], metavar="DATASET=N",

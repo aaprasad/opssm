@@ -28,11 +28,11 @@ COLUMNS = [
 ]
 COVERAGE_GOAL = .95
 SMOOTHERS = {"latent_sde", "sde_matching"}
-DISPLAY = {"kf": "KF", "ekf": "EKF", "ukf": "UKF", "slds": "SLDS",
+DISPLAY = {"kf": "KF", "ekf": "EKF", "ukf": "UKF", "slds": "SLDS", "rslds": "rSLDS",
            "latent_sde": "latent-SDE", "sde_matching": "SDE-match"}
 DATASET_DISPLAY = {"doublewell": "double-well", "vanderpol": "van der Pol", "lorenz": "Lorenz",
                    "kato_WT_NoStim_worm0": "Kato no-stim w0"}
-ORDER = ["kf", "ekf", "ukf", "slds", "latent_sde", "sde_matching"]
+ORDER = ["kf", "ekf", "ukf", "slds", "rslds", "latent_sde", "sde_matching"]
 
 # Trivial references a method must beat before "best in column" means anything. Without these a
 # table happily stars a negative R^2, or a forecast worse than repeating the last observation.

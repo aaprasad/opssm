@@ -9,7 +9,7 @@
 # Sweep the data configs on SLURM (one array across all partitions, preemptible -- tasks resume):
 #   python scripts/benchmark_sweep.py -m hydra/launcher=submitit_slurm \
 #       dataset=vanderpol seed=0,1,2,3,4 \
-#       method=kf,ekf,ukf,slds,latent_sde,sde_matching,opssm \
+#       method=kf,ekf,ukf,rslds,latent_sde,sde_matching,opssm \
 #       dataset_config.noise_std=0.25,0.5,1.0,1.5,3.0
 #
 # Anything under `dataset_config` overrides that dataset's DatasetConfig preset, so every field is
@@ -20,7 +20,7 @@ defaults:
   - override hydra/launcher: basic
 
 dataset: vanderpol          # doublewell | vanderpol | lorenz | lorenz_li
-method: opssm               # kf | ekf | ukf | slds | latent_sde | sde_matching | opssm
+method: opssm               # kf | ekf | ukf | rslds | latent_sde | sde_matching | opssm (legacy: slds)
 seed: 0
 
 # DatasetConfig overrides applied to PRESETS[dataset]. Every field is listed so it can be swept

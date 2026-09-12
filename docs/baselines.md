@@ -80,17 +80,42 @@ true latent paths or true sensor coefficients during training.
 | `ekf` | Dynamax EKF; learn neural drift and constant diagonal diffusion by approximate likelihood gradients | First-order Gaussian filter |
 | `ukf` | Identical generative model to EKF; Dynamax UKF, α=1, β=2, κ=0 | Sigma-point Gaussian filter |
 | `slds` | Dynamax SLDS parameter types and `lgssm_filter` updates; learn Markov transitions and regime-specific affine dynamics using an IMM likelihood | Approximate switching filter |
+| `rslds` (default switching baseline) | Learn latent-state-dependent softmax transitions and regime-specific affine dynamics; positive-weight cubature mixture reduction and Dynamax `lgssm_filter` updates | Approximate recurrent switching filter |
 | `latent_sde` | Diffrax Ito Euler solver, reverse-mode differentiation with recursive checkpointing, Girsanov path KL | Simulated variational smoother |
 | `sde_matching` | JAX Gaussian posterior marginals and analytical posterior drift; no solver during training | Gaussian variational smoother |
 | `opssm` | Existing JAX operator/EM training, with the same saved data | Operator filter |
 
 The [Dynamax API](https://probml.github.io/dynamax/api.html) supplies the Gaussian
-filters. The switching implementation is a **Markov SLDS with IMM approximation**,
-not rSLDS, not a deterministic mixture of drifts, and not an exact SLDS likelihood.
-It retains a Gaussian per regime and includes between-regime covariance during
-mixing. There is no built-in Dynamax IMM fitting API; this small orchestration
-layer is implemented here and tested to reduce to Dynamax KF at one regime.
+filters. The default switching baseline is now **rSLDS**, under the distinct
+`rslds` result name; `--models slds` retains the original Markov SLDS. Existing
+SLDS checkpoints and scores remain SLDS and cannot be relabeled as rSLDS.
 Default regime count is 3; tune `--modes` on validation data.
+
+For continuous state `z` and discrete regime `s`, the recurrent gate is
+`p(s[t+1]=j | s[t]=i, z[t]) = softmax_j(L[i,j] + R[j] @ z[t])`.
+This uses the multinomial-logistic form in
+[lindermanlab/ssm's RecurrentTransitions](https://github.com/lindermanlab/ssm/blob/master/ssm/transitions.py).
+The gate starts with `R=0` and learns through the observation likelihood, alongside
+the regime dynamics, covariance, and shared affine emission. No true states enter
+training. This belongs to the [recurrent SLDS model class](https://proceedings.mlr.press/v54/linderman17a.html),
+but uses an approximate likelihood filter instead of the paper's Bayesian smoother
+and stick-breaking inference scheme.
+
+The rSLDS filter retains a Gaussian per regime. At prediction, it integrates both
+gate probabilities and gate-weighted first/second state moments using `2*d`
+positive spherical-radial cubature points per source Gaussian. It moment-matches
+the resulting mixtures, propagates each through its destination regime's affine
+dynamics, and applies Dynamax measurement updates. This captures the dependence
+between the selected regime and continuous state, approximately; it is not an
+exact switching likelihood. Zero recurrence reduces to the original IMM, and one
+regime reduces to the Dynamax KF. Forecasts sample the gate at each simulated
+continuous state. Dynamics scoring uses the same gate at the aligned query state,
+averaging over filtered previous-regime probabilities and reporting the expected
+observation-interval increment divided by `dt`.
+
+Run a replacement with `--models rslds`; the ordinary runner and cluster sweep
+generator now use rSLDS in their default model lists. Previously generated sweep
+manifests remain unchanged and must be regenerated or explicitly use `rslds`.
 
 OPSSM resolves the repository's Hydra model configuration, including inherited
 `configs/model/operator.yaml` defaults, using this mapping:
@@ -127,7 +152,7 @@ pooled with the corrected experiment-config runs.
 
 EKF/UKF use the conventional observation-step approximation
 `z_next = z + Δt f(z) + Normal(0, Δt diag(g²))`. This approximation is distinct
-from the finer data simulation. KF/SLDS learn a discrete transition directly.
+from the finer data simulation. KF/SLDS/rSLDS learn a discrete transition directly.
 The [Diffrax solver](https://docs.kidger.site/diffrax/usage/getting-started/)
 uses steps at most `--solver-dt` (default 0.01), with every observation time
 included in the step grid. Check discretization sensitivity using smaller
@@ -193,18 +218,19 @@ and record this implementation as a reference, without copying its code.
   This evaluates the analytic true drift, not finite differences of noisy SDE
   paths. The query states and both drift arrays are saved with predictions.
 * `dynamics_kind` distinguishes continuous drift (OPSSM, EKF/UKF, both latent
-  SDEs) from the **observation-interval effective drift** of KF/SLDS. For KF this
+  SDEs) from the **observation-interval effective drift** of KF/SLDS/rSLDS. For KF this
   is `(A_discrete z + b_discrete − z)/Δt`. For SLDS, the next-regime probabilities
   are the test filter's regime probabilities multiplied by its transition
   matrix; these weight the regime-specific affine increments at the query state.
-  This SLDS diagnostic is conditioned on observation history and is not an
+  For rSLDS, that transition matrix also depends on the continuous query state.
+  This switching diagnostic is conditioned on observation history and is not an
   autonomous field. Finite-interval approximation error contributes to the
   discrete models' comparison with the instantaneous true drift. A singular
   alignment or condition number above 1e10 yields an explicit dynamics status
   and null RMSE rather than an arbitrary pseudoinverse comparison.
 * Clean reconstruction R²/RMSE compare against the noiseless sensor signal.
   Marginal 95% coverage uses Gaussian moment intervals (including mixture moments
-  for SLDS), not exact mixture quantiles. OPSSM uses grid moments in 1D and MALA
+  for SLDS/rSLDS), not exact mixture quantiles. OPSSM uses grid moments in 1D and MALA
   moments in higher dimensions. Its forecast starts from Gaussian moment fits.
 * Each baseline selects its best checkpoint using its own **validation observation
   objective** (likelihood or ELBO); OPSSM uses validation observation reconstruction
@@ -315,7 +341,7 @@ python -m opssm.benchmarks.runner --generate-only --seeds 0 1 2 3 4 --out dump/c
 python -m opssm.benchmarks.runner --seeds 0 1 2 3 4 --out dump/comparison
 
 # A focused run; use a new directory for a different model/hyperparameter run.
-python -m opssm.benchmarks.runner --datasets vanderpol --models kf ekf ukf slds \
+python -m opssm.benchmarks.runner --datasets vanderpol --models kf ekf ukf rslds \
   --seeds 0 1 2 3 4 --steps 2000 --modes 4 --out dump/vdp_four_modes
 
 # Optional multiplicative Lorenz reference, outside current OPSSM's model class.
@@ -413,7 +439,7 @@ python scripts/benchmark_sweep.py dataset=vanderpol method=opssm seed=0
 python scripts/benchmark_sweep.py -m hydra/launcher=submitit_slurm \
     hydra.launcher.partition=<gpu-partition> hydra.launcher.mem_gb=32 \
     dataset=vanderpol seed=0,1,2,3,4 \
-    method=kf,ekf,ukf,slds,latent_sde,sde_matching,opssm \
+    method=kf,ekf,ukf,rslds,latent_sde,sde_matching,opssm \
     dataset_config.noise_std=0.25,0.5,1.0,1.5,3.0 \
     results_root=dump/noise_sweep
 

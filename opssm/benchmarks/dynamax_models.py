@@ -1,10 +1,13 @@
-"""Dynamax KF/EKF/UKF and a differentiable IMM for Dynamax SLDS parameters.
+"""Dynamax KF/EKF/UKF and differentiable switching Gaussian filters.
 
 The KF is a learned linear Gaussian LDS. EKF/UKF learn the same neural nonlinear
 Gaussian SSM using Dynamax's public inference functions. Their transition is
 Euler z'=z+dt*f(z), Q=dt*diag(g²), the conventional additive-noise discretization.
 The SLDS uses Dynamax's linear filter for every regime's measurement update and
 custom Gaussian mixture reduction, since Dynamax has no IMM fitting API.
+The rSLDS adds softmax(logits[i,j] + R[j] @ z) recurrent transitions and
+positive-weight cubature for state-dependent mixture reduction. This is an
+approximate likelihood filter, not the original rSLDS Bayesian smoother.
 """
 import jax
 import jax.numpy as jnp
@@ -30,6 +33,8 @@ def linear_params(theta, noise, m, p, A, b, Q):
 
 class DynamaxBaseline:
     def __init__(self, kind, d, dt, noise, hidden=64, modes=3, fixed_noise=False):
+        if kind not in ("kf", "ekf", "ukf", "slds", "rslds"):
+            raise ValueError(f"Unknown Dynamax baseline {kind!r}")
         self.kind, self.d, self.dt, self.noise = kind, d, dt, noise
         self.hidden, self.modes, self.fixed_noise = hidden, modes, fixed_noise
 
@@ -37,16 +42,51 @@ class DynamaxBaseline:
         common_key, a_key, b_key = jr.split(key, 3)
         theta = init_common(y, self.d, self.hidden, common_key, nonlinear=self.kind in ("ekf", "ukf"))
         theta = init_noise(theta, self.noise, y.shape[-1], self.fixed_noise)
-        if self.kind in ("kf", "slds"):
+        if self.kind in ("kf", "slds", "rslds"):
             theta.pop("raw_g")
             theta.update(A=.98 * jnp.eye(self.d), b=jnp.zeros(self.d), raw_q=jnp.full(self.d, -3.))
-        if self.kind == "slds":
+        if self.kind in ("slds", "rslds"):
             K, d = self.modes, self.d
             theta.update(A=jnp.broadcast_to(theta["A"], (K, d, d)) + .02 * jr.normal(a_key, (K, d, d)),
                          b=.02 * jr.normal(b_key, (K, d)), raw_q=jnp.full((K, d), -3.),
                          m0=jnp.zeros((K, d)), raw_s0=jnp.zeros((K, d)),
                          initial_logits=jnp.zeros(K), transition_logits=3. * jnp.eye(K))
+            if self.kind == "rslds":
+                # Start at the Markov SLDS; likelihood gradients learn recurrence.
+                theta["recurrent_weights"] = jnp.zeros((K, d))
         return theta
+
+    def transition_log_probs(self, th, z):
+        """(..., source regime, destination regime) at continuous state z.
+
+        Multinomial-logistic recurrence as in lindermanlab/ssm RecurrentTransitions:
+        p(s[t+1]=j | s[t]=i, z[t]) = softmax_j(logits[i,j] + R[j] @ z[t]).
+        """
+        logits = jnp.broadcast_to(th["transition_logits"], (*z.shape[:-1], self.modes, self.modes))
+        if self.kind == "rslds":
+            logits = logits + (z @ th["recurrent_weights"].T)[..., None, :]
+        return jax.nn.log_softmax(logits, axis=-1)
+
+    def _recurrent_mix(self, th, m, p, prob):
+        """Approximate p(z[t], s[t+1] | y[:t]) with one Gaussian per new mode.
+
+        Integrate gates and gate-weighted first/second moments using 2*d positive
+        spherical-radial cubature points per source Gaussian. Conditioning on the
+        new mode changes its continuous-state moments; evaluating a gate only at
+        the old mode mean would miss that correlation. Constant gates recover IMM.
+        """
+        root = jnp.linalg.cholesky((p + jnp.swapaxes(p, -1, -2)) / 2)
+        offsets = jnp.sqrt(float(self.d)) * jnp.swapaxes(root, -1, -2)
+        points = m[:, None, :] + jnp.concatenate([offsets, -offsets], axis=1)
+        logits = th["transition_logits"][:, None, :] + points @ th["recurrent_weights"].T
+        log_joint = (jnp.log(jnp.maximum(prob, 1e-30))[:, None, None]
+                     + jax.nn.log_softmax(logits, -1) - jnp.log(2. * self.d))
+        log_dest = jax.scipy.special.logsumexp(log_joint, axis=(0, 1))
+        weights = jnp.exp(log_joint - log_dest[None, None, :])
+        mixed_mean = jnp.einsum("iqj,iqd->jd", weights, points)
+        delta = points[:, :, None, :] - mixed_mean[None, None, :, :]
+        mixed_cov = jnp.einsum("iqj,iqjd,iqje->jde", weights, delta, delta)
+        return mixed_mean, mixed_cov, jax.nn.softmax(log_dest)
 
     def params(self, th):
         P = jnp.diag(positive(th["raw_s0"]) ** 2)
@@ -78,12 +118,15 @@ class DynamaxBaseline:
 
             def predict(carry):
                 m, p, prob = carry
-                joint = prob[:, None] * discrete.transition_matrix
-                dest = joint.sum(0)
-                weights = joint / jnp.maximum(dest[None], 1e-30)
-                mixed_mean = jnp.einsum("ij,id->jd", weights, m)
-                delta = m[:, None] - mixed_mean[None]
-                mixed_cov = jnp.einsum("ij,ijde->jde", weights, p[:, None] + delta[..., :, None] * delta[..., None, :])
+                if self.kind == "rslds":
+                    mixed_mean, mixed_cov, dest = self._recurrent_mix(th, m, p, prob)
+                else:
+                    joint = prob[:, None] * discrete.transition_matrix
+                    dest = joint.sum(0)
+                    weights = joint / jnp.maximum(dest[None], 1e-30)
+                    mixed_mean = jnp.einsum("ij,id->jd", weights, m)
+                    delta = m[:, None] - mixed_mean[None]
+                    mixed_cov = jnp.einsum("ij,ijde->jde", weights, p[:, None] + delta[..., :, None] * delta[..., None, :])
                 return (jnp.einsum("kij,kj->ki", lg.dynamics_weights, mixed_mean) + lg.dynamics_bias,
                         lg.dynamics_weights @ mixed_cov @ jnp.swapaxes(lg.dynamics_weights, -1, -2) + lg.dynamics_cov, dest)
 
@@ -109,7 +152,7 @@ class DynamaxBaseline:
                     final_mode_mean=m, final_mode_cov=p)
 
     def one_filter(self, theta, y):
-        if self.kind == "slds":
+        if self.kind in ("slds", "rslds"):
             return self._imm(theta, y)
         params = self.params(theta)
         if self.kind == "kf":
@@ -130,16 +173,17 @@ class DynamaxBaseline:
 
     @property
     def dynamics_kind(self):
-        return "observation_interval_effective_drift" if self.kind in ("kf", "slds") else "continuous_drift"
+        return "observation_interval_effective_drift" if self.kind in ("kf", "slds", "rslds") else "continuous_drift"
 
     def drift_values(self, theta, z, regime_prob=None):
         if self.kind == "kf":
             return (z @ theta["A"].T + theta["b"] - z) / self.dt
-        if self.kind == "slds":
+        if self.kind in ("slds", "rslds"):
             if regime_prob is None or regime_prob.shape != (*z.shape[:-1], self.modes):
-                raise ValueError("SLDS dynamics evaluation requires filtered regime probabilities at each query")
+                raise ValueError("Switching dynamics evaluation requires filtered regime probabilities at each query")
             # Regime j determines the NEXT transition, so advance weights with P.
-            weights = regime_prob @ jax.nn.softmax(theta["transition_logits"], -1)
+            weights = jnp.einsum("...i,...ij->...j", regime_prob,
+                                 jnp.exp(self.transition_log_probs(theta, z)))
             next_z = jnp.einsum("kij,...j->...ki", theta["A"], z) + theta["b"]
             return (jnp.sum(weights[..., None] * next_z, axis=-2) - z) / self.dt
         return jax.vmap(theta["drift"])(z.reshape(-1, self.d)).reshape(z.shape)
@@ -147,7 +191,7 @@ class DynamaxBaseline:
     def forecast_samples(self, theta, post, times, key, samples):
         key, ki, ke = jr.split(key, 3)
         B, d = post["mean"].shape[1:]
-        if self.kind == "slds":
+        if self.kind in ("slds", "rslds"):
             prob = post["regime_prob"][-1]
             modes = jr.categorical(ki, jnp.log(prob)[None], shape=(samples, B))
             batch = jnp.broadcast_to(jnp.arange(B), (samples, B))
@@ -161,8 +205,11 @@ class DynamaxBaseline:
             z, modes = carry
             k1, k2 = jr.split(key)
             eps = jr.normal(k2, z.shape)
-            if self.kind == "slds":
-                modes = jr.categorical(k1, theta["transition_logits"][modes])
+            if self.kind in ("slds", "rslds"):
+                logits = theta["transition_logits"][modes]
+                if self.kind == "rslds":
+                    logits = logits + z @ theta["recurrent_weights"].T
+                modes = jr.categorical(k1, logits)
                 z = jnp.einsum("...ij,...j->...i", theta["A"][modes], z) + theta["b"][modes] + positive(theta["raw_q"][modes]) * eps
             elif self.kind == "kf":
                 z = z @ theta["A"].T + theta["b"] + positive(theta["raw_q"]) * eps

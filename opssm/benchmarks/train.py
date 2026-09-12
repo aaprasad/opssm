@@ -161,6 +161,10 @@ def fit_jax(name, data, cfg, args, directory, seed):
                    library_versions={p: importlib.metadata.version(p) for p in ("jax", "dynamax", "diffrax", "equinox", "optax")})
     if "loglik" in test:
         metrics["filter_predictive_nll"] = float(-test["loglik"].mean() / (len(ts) * cfg.obs_dim))
+    if name in ("slds", "rslds"):
+        metrics.update(modes=args.modes,
+                       switching_transition="latent_softmax" if name == "rslds" else "markov",
+                       switching_inference="cubature_gaussian_mixture" if name == "rslds" else "imm")
     np.savez_compressed(directory / "predictions.npz", **test, **ahead, **evaluation_arrays,
                         forecast_cutoff=np.array(cut), dataset_hash=np.array(fingerprint(data)))
     return metrics

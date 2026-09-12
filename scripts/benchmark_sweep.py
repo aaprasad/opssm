@@ -9,7 +9,7 @@ DatasetConfig, so `dataset_config.noise_std=0.25,0.5,1.0` is a three-point sweep
 (`model`/`data` are existing Hydra groups in this repo, hence the names `method`/`dataset_config`.)
 
     python scripts/benchmark_sweep.py -m hydra/launcher=submitit_slurm \
-        dataset=vanderpol seed=0,1,2,3,4 method=kf,ekf,ukf,slds,latent_sde,sde_matching,opssm \
+        dataset=vanderpol seed=0,1,2,3,4 method=kf,ekf,ukf,rslds,latent_sde,sde_matching,opssm \
         dataset_config.noise_std=0.25,0.5,1.0,1.5,3.0
 
 Jobs are idempotent: a cell that already holds a result.json returns immediately, so SLURM

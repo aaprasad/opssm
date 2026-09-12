@@ -44,7 +44,8 @@ def record_attempt(directory, **fields):
         handle.write(json.dumps(entry) + "\n")
     return entry
 
-MODELS = ("kf", "ekf", "ukf", "slds", "latent_sde", "sde_matching", "opssm")
+DEFAULT_MODELS = ("kf", "ekf", "ukf", "rslds", "latent_sde", "sde_matching", "opssm")
+MODELS = (*DEFAULT_MODELS, "slds")  # Keep legacy SLDS explicit and results identifiable.
 
 
 def write_json(path, value):
@@ -63,7 +64,7 @@ def main(argv=None):
     ap.add_argument("--kato-window", type=int, default=200)
     ap.add_argument("--kato-stride", type=int, default=100, help="Training stride; evaluation uses disjoint windows")
     ap.add_argument("--kato-gap", type=int, default=30, help="Unused frames after each temporal split boundary")
-    ap.add_argument("--models", nargs="+", choices=MODELS, default=list(MODELS))
+    ap.add_argument("--models", nargs="+", choices=MODELS, default=list(DEFAULT_MODELS))
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     ap.add_argument("--out", type=Path, default=Path("dump/benchmarks"))
     ap.add_argument("--steps", type=int, default=2000)
