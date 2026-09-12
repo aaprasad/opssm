@@ -13,7 +13,8 @@ import traceback
 
 import numpy as np
 
-from .data import PRESETS, fingerprint, make_dataset, save_dataset, smoke_config
+from .data import (PRESETS, config_from_data, fingerprint, make_dataset, save_dataset,
+                   smoke_config)
 from .metrics import aggregate
 
 # SLURM_RESTART_COUNT is the one that answers "was this preempted?": SLURM increments it each time
@@ -135,6 +136,7 @@ def main(argv=None):
         for seed in args.seeds:
             root = args.out / cfg.name / f"seed_{seed}"
             existing = root / "data.npz"
+            cell_cfg = cfg
             if args.reuse_data and fixed_data is None and existing.is_file():
                 # Adopting the file makes it the source of truth: every downstream consumer, and the
                 # dataset_hash recorded in the row, then describes the bytes actually trained on. The
@@ -142,6 +144,13 @@ def main(argv=None):
                 # paths diverge while still reporting one hash.
                 with np.load(existing, allow_pickle=False) as loaded:
                     data = dict(loaded)
+                # The file's stored config governs the cell too, not just its arrays: fit_jax takes
+                # latent_dim, diffusion_type and obs_dim from here, so leaving the preset in place
+                # would configure the baselines for data they are not training on. The OPSSM worker
+                # already derives its config this way, and the two must not disagree.
+                cell_cfg = config_from_data(data)
+                if cell_cfg.name != cfg.name:
+                    raise ValueError(f"{existing} holds dataset {cell_cfg.name!r}, not {cfg.name!r}")
                 generated = fingerprint(make_dataset(cfg, seed))
                 if fingerprint(data) != generated:
                     print(f"reusing existing dataset {existing} (hash {fingerprint(data)[:12]}); the current "
@@ -196,7 +205,7 @@ def main(argv=None):
                         metrics = json.loads((directory / "worker_metrics.json").read_text())
                     else:
                         from .train import fit_jax
-                        metrics = fit_jax(name, data, cfg, args, directory, seed)
+                        metrics = fit_jax(name, data, cell_cfg, args, directory, seed)
                     row.update(metrics, status="ok")
                 except Exception as exc:
                     failed = True
