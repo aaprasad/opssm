@@ -84,6 +84,8 @@ def main(cfg):
         argv += ["--opssm-experiment", str(cfg.opssm.experiment)]
     if cfg.opssm.config_dir:
         argv += ["--opssm-config-dir", str(cfg.opssm.config_dir)]
+    if cfg.get("reuse_data", False):
+        argv += ["--reuse-data"]
     if cfg.fixed_obs_noise:
         argv += ["--fixed-obs-noise"]
     if cfg.smoke:

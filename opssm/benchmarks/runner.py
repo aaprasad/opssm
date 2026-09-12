@@ -79,6 +79,11 @@ def main(argv=None):
     ap.add_argument("--skip-existing", action="store_true",
                     help="Skip cells that already hold a result.json instead of failing. Required for "
                          "SLURM --requeue: a preempted array task reruns and must resume, not abort.")
+    ap.add_argument("--reuse-data", action="store_true",
+                    help="Adopt an existing data.npz instead of regenerating from the preset. Use this to "
+                         "add a model to a cell whose other models have already finished: the new run then "
+                         "trains on the SAME bytes they did, which is what makes the cell comparable. "
+                         "Without it, a data.npz that disagrees with the current preset/code is a hard error.")
     ap.add_argument("--dataset-config", type=Path, help="JSON mapping preset names to DatasetConfig overrides")
     ap.add_argument("--opssm-python", default=sys.executable, help="Python in the separate JAX environment")
     ap.add_argument("--opssm-config", type=Path, help="JSON overrides for OPSSM hyperparameters")
@@ -128,8 +133,22 @@ def main(argv=None):
             datasets.append((smoke_config(cfg) if args.smoke else cfg, None))
     for cfg, fixed_data in datasets:
         for seed in args.seeds:
-            data = make_dataset(cfg, seed) if fixed_data is None else fixed_data
             root = args.out / cfg.name / f"seed_{seed}"
+            existing = root / "data.npz"
+            if args.reuse_data and fixed_data is None and existing.is_file():
+                # Adopting the file makes it the source of truth: every downstream consumer, and the
+                # dataset_hash recorded in the row, then describes the bytes actually trained on. The
+                # OPSSM worker reads this path directly, so regenerating instead would let the two
+                # paths diverge while still reporting one hash.
+                with np.load(existing, allow_pickle=False) as loaded:
+                    data = dict(loaded)
+                generated = fingerprint(make_dataset(cfg, seed))
+                if fingerprint(data) != generated:
+                    print(f"reusing existing dataset {existing} (hash {fingerprint(data)[:12]}); the current "
+                          f"preset/code would generate {generated[:12]} -- results are tied to the file, "
+                          f"not to this checkout's config", flush=True)
+            else:
+                data = make_dataset(cfg, seed) if fixed_data is None else fixed_data
             save_dataset(root / "data.npz", data)
             if args.generate_only:
                 continue

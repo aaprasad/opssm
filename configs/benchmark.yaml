@@ -58,6 +58,11 @@ lr: 0.001
 fixed_obs_noise: false
 smoke: false
 
+# Adopt an existing data.npz rather than regenerating it from the preset. Set this to add a model to
+# a cell whose other models already finished, so the new run trains on exactly the bytes they did.
+# Off by default: a data.npz that disagrees with the current preset should fail loudly, not silently.
+reuse_data: false
+
 opssm:
   monitor: val_forecast_rmse   # ground-truth-free; recon_r2 saturates and selects far too early
   monitor_mode: null           # inferred from the metric
