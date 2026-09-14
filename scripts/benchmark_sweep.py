@@ -48,15 +48,30 @@ def main(cfg):
     # null means "keep the preset's value", so only non-null entries become overrides.
     overrides = {k: v for k, v in (OmegaConf.to_container(cfg.dataset_config, resolve=True) or {}).items()
                  if v is not None}
-    if cfg.dataset not in PRESETS:
-        raise SystemExit(f"Unknown dataset {cfg.dataset!r}; choose from {sorted(PRESETS)}")
-    # Validate the resolved config here, so a bad sweep point fails this job rather than
-    # surfacing halfway through training.
-    replace(PRESETS[cfg.dataset], **overrides).validate()
+    kato = cfg.dataset == "kato"
+    if kato:
+        # Kato is a real recording, not a generator: it has no DatasetConfig to override or validate,
+        # and its sweep axes live under `kato` instead. The runner derives the dataset directory name
+        # from the file stem, worm and fold, so reproduce it here to find this job's cell.
+        if not cfg.kato.mat:
+            raise SystemExit("dataset=kato requires kato.mat=/path/to/WT_NoStim.mat")
+        if not Path(cfg.kato.mat).is_file():
+            raise SystemExit(f"kato.mat not found: {cfg.kato.mat}")
+        if overrides:
+            raise SystemExit("dataset_config does not apply to kato; sweep the kato.* knobs instead")
+        suffix = "" if cfg.kato.folds <= 1 else f"_fold{cfg.kato.fold}of{cfg.kato.folds}"
+        dataset_dir = f"kato_{Path(cfg.kato.mat).stem}_worm{cfg.kato.worm}{suffix}"
+    elif cfg.dataset not in PRESETS:
+        raise SystemExit(f"Unknown dataset {cfg.dataset!r}; choose from {[*sorted(PRESETS), 'kato']}")
+    else:
+        # Validate the resolved config here, so a bad sweep point fails this job rather than
+        # surfacing halfway through training.
+        replace(PRESETS[cfg.dataset], **overrides).validate()
+        dataset_dir = cfg.dataset
 
     point = point_name(overrides)
     out = Path(cfg.results_root).resolve() / point
-    cell = out / cfg.dataset / f"seed_{cfg.seed}" / cfg.method
+    cell = out / dataset_dir / f"seed_{cfg.seed}" / cfg.method
     if (cell / "result.json").exists():
         print(f"already complete: {cell}", flush=True)
         return 0
@@ -76,6 +91,11 @@ def main(cfg):
             "--opssm-select-samples", str(cfg.opssm.select_samples)]
     if overrides:
         argv += ["--dataset-config", str(config_path)]
+    if kato:
+        argv += ["--kato-mat", str(cfg.kato.mat), "--kato-worms", str(cfg.kato.worm),
+                 "--kato-folds", str(cfg.kato.folds), "--kato-fold", str(cfg.kato.fold),
+                 "--kato-latent-dim", str(cfg.kato.latent_dim), "--kato-window", str(cfg.kato.window),
+                 "--kato-stride", str(cfg.kato.stride), "--kato-gap", str(cfg.kato.gap)]
     if cfg.opssm.monitor_mode:
         argv += ["--opssm-monitor-mode", str(cfg.opssm.monitor_mode)]
     if cfg.opssm.gt_diagnostics:
@@ -94,7 +114,7 @@ def main(cfg):
     # Disabling preallocation is what caused the em_lorenz OOM; leave XLA's allocator alone.
     os.environ.pop("XLA_PYTHON_CLIENT_PREALLOCATE", None)
     os.environ.setdefault("JAX_PLATFORMS", "cuda")
-    print(f"[{point}] {cfg.dataset} seed={cfg.seed} {cfg.method} steps={steps} -> {cell}", flush=True)
+    print(f"[{point}] {dataset_dir} seed={cfg.seed} {cfg.method} steps={steps} -> {cell}", flush=True)
     return run_benchmarks(argv)
 
 

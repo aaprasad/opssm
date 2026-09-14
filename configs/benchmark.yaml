@@ -19,7 +19,7 @@ defaults:
   - _self_
   - override hydra/launcher: basic
 
-dataset: vanderpol          # doublewell | vanderpol | lorenz | lorenz_li
+dataset: vanderpol          # doublewell | vanderpol | lorenz | lorenz_li | kato
 method: opssm               # kf | ekf | ukf | rslds | latent_sde | sde_matching | opssm (legacy: slds)
 seed: 0
 
@@ -57,6 +57,20 @@ modes: 3
 lr: 0.001
 fixed_obs_noise: false
 smoke: false
+
+# Kato 2015 real recordings (dataset=kato). Kato has no generator, so `dataset_config` does not
+# apply to it: these protocol knobs are its sweep axes instead (e.g. kato.worm=0,1,2,3,4).
+# Folds are rotating blocked CV over time -- test rotates over `folds` contiguous blocks, so
+# sweeping kato.fold=0,1,2,3,4 holds out every region of the recording exactly once.
+kato:
+  mat: null              # REQUIRED when dataset=kato, e.g. /path/to/WT_NoStim.mat
+  worm: 0                # zero-based index within that file (NoStim has 5, Stim has 7)
+  folds: 5               # 1 = legacy single 60/20/20 split
+  fold: 0
+  latent_dim: 10
+  window: 200
+  stride: 100            # training stride; val/test windows are disjoint
+  gap: 100               # frames trimmed off held-out blocks; >= the ~34-111 frame autocorrelation
 
 # Adopt an existing data.npz rather than regenerating it from the preset. Set this to add a model to
 # a cell whose other models already finished, so the new run trains on exactly the bytes they did.

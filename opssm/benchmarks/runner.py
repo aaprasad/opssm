@@ -63,7 +63,15 @@ def main(argv=None):
     ap.add_argument("--kato-latent-dim", type=int, default=10)
     ap.add_argument("--kato-window", type=int, default=200)
     ap.add_argument("--kato-stride", type=int, default=100, help="Training stride; evaluation uses disjoint windows")
-    ap.add_argument("--kato-gap", type=int, default=30, help="Unused frames after each temporal split boundary")
+    ap.add_argument("--kato-gap", type=int, default=100,
+                    help="Frames trimmed off each held-out block at a training seam. Kato traces stay "
+                         "autocorrelated for 34-111 frames (12-36 s), so the old default of 30 left "
+                         "validation correlated with training and inflated the selection metric.")
+    ap.add_argument("--kato-folds", type=int, default=5,
+                    help="Rotating blocked CV over time: K contiguous blocks, test rotates over them "
+                         "so every region is held out exactly once. 1 keeps the legacy 60/20/20 split.")
+    ap.add_argument("--kato-fold", nargs="+", type=int,
+                    help="Which fold(s) to run; default: all of them")
     ap.add_argument("--models", nargs="+", choices=MODELS, default=list(DEFAULT_MODELS))
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     ap.add_argument("--out", type=Path, default=Path("dump/benchmarks"))
@@ -125,11 +133,15 @@ def main(argv=None):
             from .kato import KatoConfig, make_kato_dataset
             from opssm.data.kato.load import n_worms
             worms = args.kato_worms if args.kato_worms is not None else range(n_worms(args.kato_mat))
+            folds = (args.kato_fold if args.kato_fold is not None
+                     else range(max(args.kato_folds, 1) if args.kato_folds > 1 else 1))
             for worm in worms:
-                cfg, data = make_kato_dataset(KatoConfig(str(args.kato_mat), worm=worm,
-                    latent_dim=args.kato_latent_dim, window=args.kato_window,
-                    train_stride=args.kato_stride, gap_frames=args.kato_gap), smoke=args.smoke)
-                datasets.append((cfg, data))
+                for fold in folds:
+                    cfg, data = make_kato_dataset(KatoConfig(str(args.kato_mat), worm=worm,
+                        latent_dim=args.kato_latent_dim, window=args.kato_window,
+                        train_stride=args.kato_stride, gap_frames=args.kato_gap,
+                        folds=args.kato_folds, fold=fold), smoke=args.smoke)
+                    datasets.append((cfg, data))
         else:
             cfg = replace(PRESETS[dataset], **overrides.get(dataset, {}))
             datasets.append((smoke_config(cfg) if args.smoke else cfg, None))

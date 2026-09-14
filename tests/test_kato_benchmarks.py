@@ -20,7 +20,7 @@ def recording():
 
 def test_kato_split_before_window_and_train_only_standardization():
     rec = recording()
-    cfg = KatoConfig("fixture.mat", latent_dim=2, window=20, train_stride=10, gap_frames=5)
+    cfg = KatoConfig("fixture.mat", latent_dim=2, window=20, train_stride=10, gap_frames=5, folds=1)
     resolved, data = prepare_recording(rec, cfg)
     changed = {**rec, "traces": rec["traces"].copy()}
     changed["traces"][360:] += 100
@@ -105,3 +105,27 @@ def test_real_data_scoring_does_not_invent_latents_or_drift():
     assert metrics["dynamics_rmse"] is None and metrics["latent_rmse"] is None
     assert "alignment" not in arrays and "forecast_clean_rmse" not in metrics
     assert metrics["linear_decode_status"] == "ok"
+
+
+def test_rotating_folds_cover_the_trace_without_leakage():
+    """Every fold tests a different region, and no held-out frame sits within gap of training."""
+    rec = recording()
+    base = dict(latent_dim=2, window=20, train_stride=10, gap_frames=5, folds=5)
+    tested = []
+    for fold in range(base["folds"]):
+        cfg = KatoConfig("fixture.mat", fold=fold, **base)
+        resolved, data = prepare_recording(rec, cfg)
+        frames = {s: np.unique(data[f"frame_indices_{s}"]) for s in ("train", "val", "test")}
+        train = set(frames["train"].tolist())
+        for split in ("val", "test"):
+            held = set(frames[split].tolist())
+            assert not (train & held), f"fold {fold}: {split} overlaps training"
+            # the gap must actually separate them in time, not merely make them disjoint
+            assert min(abs(h - t) for h in held for t in train) > cfg.gap_frames
+        # standardization must not see a held-out frame
+        fit = np.concatenate([rec["traces"][s:e] for s, e in
+                              json.loads(str(data["metadata"]))["split_frame_bounds"]["train"]])
+        np.testing.assert_allclose(data["obs_mean"], fit.mean(0))
+        assert resolved.name.endswith(f"_fold{fold}of5")
+        tested.append(frames["test"].min())
+    assert len(set(tested)) == base["folds"], "folds must test different regions"
