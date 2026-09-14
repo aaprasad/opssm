@@ -73,8 +73,8 @@ def pca_ceiling(worm, mat_dir, latent_dim, cache={}):
     return cache[worm]
 
 
-def load(pattern, mat_dir, latent_dim):
-    """Tidy frame of successful runs, plus the failures, which are never plotted."""
+def load(pattern, mat_dir, latent_dim, max_forecast_ratio):
+    """Tidy frame of usable runs, plus the failures and exclusions, neither of which is plotted."""
     paths = sorted(glob.glob(pattern))
     if not paths:
         raise SystemExit(f"No result CSV matched {pattern!r}")
@@ -93,7 +93,15 @@ def load(pattern, mat_dir, latent_dim):
     frame["behavior_decoding"] = frame["linear_decode_balanced_accuracy"].astype(float)
     frame["n_classes"] = frame["linear_decode_train_classes"].map(lambda v: len(json.loads(v)))
     frame["chance"] = 1.0 / frame["n_classes"]
-    return frame, failures
+    # A rollout that diverges is not a forecast score, it is a broken integration: rslds leaves
+    # the ratio at 1e2-1e5 on some worms while reconstructing normally. Drop the whole run rather
+    # than one metric, so every panel and summary.csv describe the same set of runs, and record
+    # it -- an exclusion that only lives in the plotting code is an undocumented result.
+    diverged = frame["forecast_vs_persistence"] > max_forecast_ratio
+    excluded = [dict(worm=r.worm, model=r.model, forecast_vs_persistence=float(r.forecast_vs_persistence),
+                     reason=f"forecast rollout diverged (ratio > {max_forecast_ratio})")
+                for r in frame[diverged].itertuples()]
+    return frame[~diverged].copy(), failures, excluded
 
 
 def strip(ax, frame, order, metric):
@@ -109,6 +117,9 @@ def strip(ax, frame, order, metric):
             ax.hlines(means[model], index - .3, index + .3, color=REFERENCE, lw=2.2, zorder=4)
     ax.set_xlabel("")
     ax.set_ylabel(PANELS[metric], fontsize=10)
+    ax.tick_params(axis="x", labelrotation=18)
+    for label in ax.get_xticklabels():
+        label.set_horizontalalignment("right")
     ax.grid(axis="y", alpha=.25, lw=.6)
     ax.set_axisbelow(True)
     sns.despine(ax=ax)
@@ -134,6 +145,7 @@ def draw_reconstruction_r2(ax, frame, order):
 def draw_forecast_vs_persistence(ax, frame, order):
     strip(ax, frame, order, "forecast_vs_persistence")
     ax.axhline(1.0, ls="--", lw=1.6, color=REFERENCE, zorder=1)
+
 
 
 def draw_behavior_decoding(ax, frame, order):
@@ -188,15 +200,20 @@ def main(argv=None):
                         help="Directory holding WT_NoStim.mat / WT_Stim.mat, for the PCA ceiling")
     parser.add_argument("--latent-dim", type=int, default=10,
                         help="Latent dimension the runs used; sets the PCA ceiling rank")
+    parser.add_argument("--max-forecast-ratio", type=float, default=10.0,
+                        help="Drop runs whose forecast/persistence exceeds this: a diverged "
+                             "rollout is a broken integration, not a forecast score. Recorded "
+                             "in provenance.json as an exclusion.")
     args = parser.parse_args(argv)
 
     sns.set_theme(style="ticks", context="notebook")
-    frame, failures = load(args.sources, args.mat_dir, args.latent_dim)
+    frame, failures, excluded = load(args.sources, args.mat_dir, args.latent_dim,
+                                     args.max_forecast_ratio)
     order = sorted(frame["model"].unique(), key=lambda m: (m != "opssm", m))
     args.out.mkdir(parents=True, exist_ok=True)
     written = []
 
-    figure, axes = plt.subplots(1, 3, figsize=(14, 4.4))
+    figure, axes = plt.subplots(1, 3, figsize=(15, 4.6))
     for ax, metric in zip(axes, PANELS):
         DRAW[metric](ax, frame, order)
     combined = handles(frame, "reconstruction_r2")[:3]
@@ -232,6 +249,8 @@ def main(argv=None):
         successful_runs=int(len(frame)),
         failed_runs=failures,
         worms_per_model={m: sorted(frame.loc[frame["model"] == m, "worm"]) for m in order},
+        excluded_runs=sorted(excluded, key=lambda d: -d["forecast_vs_persistence"]),
+        exclusion_rule=f"forecast_vs_persistence > {args.max_forecast_ratio}",
         points="one point per worm; bar is the unweighted per-method mean, no error bars "
                "(coverage is uneven, so methods are not measured on the same worms)",
         reference_lines=dict(
@@ -252,6 +271,9 @@ def main(argv=None):
 
     for path in written:
         print(path)
+    for item in excluded:
+        print(f"\nexcluded {item['worm']} {item['model']}: ratio={item['forecast_vs_persistence']:.4g} "
+              f"({item['reason']})")
     if failures:
         print(f"\n{len(failures)} failed run(s) excluded:")
         for failure in failures:
