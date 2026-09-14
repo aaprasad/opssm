@@ -42,7 +42,10 @@ import seaborn as sns
 
 EXTENSIONS = ("png", "pdf", "svg")
 CONDITIONS = ("NoStim", "Stim")
-PALETTE = {"NoStim": "#1864ab", "Stim": "#c1272d"}
+MARKERS = {"NoStim": "o", "Stim": "^"}          # condition is shape only, so colour is free
+MODEL_COLORS = {"opssm": "#c1272d", "ekf": "#5f3dc4", "ukf": "#f59f00", "rslds": "#2b8a3e",
+                "sde_matching": "#0b7285", "kf": "#862e9c", "latent_sde": "#1864ab"}
+POINT = "black"
 REFERENCE = "#495057"
 PANELS = {"reconstruction_r2": r"observation recon $R^2$ (in-sample)",
           "forecast_vs_persistence": "forecast RMSE / persistence RMSE",
@@ -105,18 +108,25 @@ def load(pattern, mat_dir, latent_dim, max_forecast_ratio):
 
 
 def strip(ax, frame, order, metric):
-    """Box over the per-worm distribution, with every worm drawn on top.
+    """Box per model (colour = model), with every worm on top (shape = condition, black).
 
     n is 4-9 per method, so a box alone would hide the sample it summarises; the points are
     the data and the box is the summary, not the other way round.
     """
-    sns.boxplot(data=frame, x="model", y=metric, order=order, ax=ax, showfliers=False,
-                width=.55, linewidth=1.2, boxprops=dict(facecolor="white", edgecolor=REFERENCE),
-                medianprops=dict(color=REFERENCE, linewidth=1.8),
+    sns.boxplot(data=frame, x="model", y=metric, order=order, hue="model", hue_order=order,
+                palette=[MODEL_COLORS.get(m, "#868e96") for m in order], legend=False,
+                ax=ax, showfliers=False, width=.6, linewidth=1.2,
+                boxprops=dict(alpha=.35), medianprops=dict(color=REFERENCE, linewidth=1.9),
                 whiskerprops=dict(color=REFERENCE), capprops=dict(color=REFERENCE))
-    sns.stripplot(data=frame, x="model", y=metric, hue="condition", order=order,
-                  hue_order=CONDITIONS, palette=PALETTE, jitter=.16, size=8, alpha=.95,
-                  edgecolor="white", linewidth=1.0, dodge=False, ax=ax, legend=False)
+    # One stripplot per condition: seaborn maps hue to colour, not marker, so the shapes have
+    # to come from separate calls -- which is what keeps every point black.
+    for condition in CONDITIONS:
+        subset = frame[frame["condition"] == condition]
+        if subset.empty:
+            continue
+        sns.stripplot(data=subset, x="model", y=metric, order=order, ax=ax, color=POINT,
+                      marker=MARKERS[condition], jitter=.16, size=6.5, alpha=.85,
+                      linewidth=0, legend=False)
     ax.set_xlabel("")
     ax.set_ylabel(PANELS[metric], fontsize=10)
     ax.tick_params(axis="x", labelrotation=18)
@@ -145,10 +155,13 @@ DRAW = {"reconstruction_r2": draw_reconstruction_r2,
         "behavior_decoding": draw_behavior_decoding}
 
 
-def handles(frame, metric=None):
-    """Point colour is the only encoding left; the box is a neutral summary."""
-    return [plt.Line2D([], [], marker="o", ls="", color=PALETTE[c], markersize=8,
-                       markeredgecolor="white", label=c) for c in CONDITIONS]
+def handles(frame, order):
+    """Shape carries condition, fill carries model; both are needed to read a panel alone."""
+    items = [plt.Line2D([], [], marker=MARKERS[c], ls="", color=POINT, markersize=7, label=c)
+             for c in CONDITIONS]
+    return items + [plt.Line2D([], [], marker="s", ls="", markersize=9, label=m,
+                               color=MODEL_COLORS.get(m, "#868e96"), alpha=.55)
+                    for m in order]
 
 
 def save(figure, stem):
@@ -189,16 +202,16 @@ def main(argv=None):
     figure, axes = plt.subplots(1, 3, figsize=(15, 4.6))
     for ax, metric in zip(axes, PANELS):
         DRAW[metric](ax, frame, order)
-    figure.legend(handles=handles(frame), loc="lower center", ncol=2, frameon=False,
-                  fontsize=9, bbox_to_anchor=(.5, -.08))
+    figure.legend(handles=handles(frame, order), loc="lower center", ncol=7, frameon=False,
+                  fontsize=9, bbox_to_anchor=(.5, -.1))
     figure.tight_layout()
     written += save(figure, args.out / "combined")
 
     for metric in PANELS:                        # standalone, legend included so it stands alone
         single, ax = plt.subplots(figsize=(5.2, 4.4))
         DRAW[metric](ax, frame, order)
-        single.legend(handles=handles(frame), loc="lower center", ncol=2, frameon=False,
-                      fontsize=8.5, bbox_to_anchor=(.5, -.16))
+        single.legend(handles=handles(frame, order), loc="lower center", ncol=4, frameon=False,
+                      fontsize=8, bbox_to_anchor=(.5, -.2))
         single.tight_layout()
         written += save(single, args.out / metric)
 
