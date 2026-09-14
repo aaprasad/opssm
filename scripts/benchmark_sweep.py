@@ -59,7 +59,8 @@ def main(cfg):
             raise SystemExit(f"kato.mat not found: {cfg.kato.mat}")
         if overrides:
             raise SystemExit("dataset_config does not apply to kato; sweep the kato.* knobs instead")
-        suffix = "" if cfg.kato.folds <= 1 else f"_fold{cfg.kato.fold}of{cfg.kato.folds}"
+        suffix = ("_full" if cfg.kato.fold < 0 else
+                  "" if cfg.kato.folds <= 1 else f"_fold{cfg.kato.fold}of{cfg.kato.folds}")
         dataset_dir = f"kato_{Path(cfg.kato.mat).stem}_worm{cfg.kato.worm}{suffix}"
     elif cfg.dataset not in PRESETS:
         raise SystemExit(f"Unknown dataset {cfg.dataset!r}; choose from {[*sorted(PRESETS), 'kato']}")

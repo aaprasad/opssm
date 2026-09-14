@@ -66,7 +66,9 @@ kato:
   mat: null              # REQUIRED when dataset=kato, e.g. /path/to/WT_NoStim.mat
   worm: 0                # zero-based index within that file (NoStim has 5, Stim has 7)
   folds: 5               # 1 = legacy single 60/20/20 split
-  fold: 0
+  fold: 0                # -1 = NO SPLIT: fit and score every frame (dLDS Table 1 protocol).
+                         #   Those scores are IN-SAMPLE. Whole-trace recon R2 is also bounded
+                         #   above by rank-latent_dim PCA, so report it against that ceiling.
   latent_dim: 10
   window: 200
   stride: 100            # training stride; val/test windows are disjoint

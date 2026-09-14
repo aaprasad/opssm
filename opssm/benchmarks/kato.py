@@ -21,7 +21,9 @@ class KatoConfig:
     train_fraction: float = .6   # Used only by the legacy single-split protocol (folds <= 1).
     val_fraction: float = .2
     folds: int = 5               # Rotating blocked CV: K contiguous blocks, test rotates over them.
-    fold: int = 0                # Which block is the test block, 0-based.
+    fold: int = 0                # Which block is the test block, 0-based. -1 = no split at all
+                                 #   (train == val == test == the whole trace), the dLDS Table 1
+                                 #   protocol. Scores from it are IN-SAMPLE, not held out.
     # Kato traces stay autocorrelated for 34-111 frames (12-36 s, 1/e, WT_NoStim), so the old
     # 30-frame gap left the held-out blocks correlated with training and inflated their scores.
     gap_frames: int = 100
@@ -44,6 +46,12 @@ def split_segments(n_frames, cfg):
     held-out score from the training data, and taking it from the training side as well would cost
     scarce frames without changing the lag between the two.
     """
+    if cfg.fold < 0:
+        # No split: fit and score every frame, as dLDS does for its whole-trace R2. There is no
+        # held-out data here, so recon R2 measures fit quality, not generalization -- and with a
+        # rank-d linear observation model it is bounded above by rank-d PCA, which involves no
+        # dynamics at all. Report it against that ceiling, never on its own.
+        return {split: [(0, n_frames)] for split in ("train", "val", "test")}
     if cfg.folds <= 1:
         a = int(n_frames * cfg.train_fraction)
         b = int(n_frames * (cfg.train_fraction + cfg.val_fraction))
@@ -52,7 +60,7 @@ def split_segments(n_frames, cfg):
     if cfg.folds < 3:
         raise ValueError("Rotating Kato CV needs folds >= 3 to leave a training block")
     if not 0 <= cfg.fold < cfg.folds:
-        raise ValueError(f"fold {cfg.fold} outside 0..{cfg.folds - 1}")
+        raise ValueError(f"fold {cfg.fold} outside 0..{cfg.folds - 1} (-1 = no split)")
     edges = np.linspace(0, n_frames, cfg.folds + 1).astype(int)
     label = {k: "train" for k in range(cfg.folds)}
     label[cfg.fold] = "test"
@@ -86,7 +94,7 @@ def prepare_recording(recording, cfg, smoke=False, source_sha256=None):
         raise ValueError("Invalid recorded sampling rate")
     if smoke:
         cfg = replace(cfg, window=min(cfg.window, 12), train_stride=min(cfg.train_stride, 12))
-    suffix = "" if cfg.folds <= 1 else f"_fold{cfg.fold}of{cfg.folds}"
+    suffix = "_full" if cfg.fold < 0 else ("" if cfg.folds <= 1 else f"_fold{cfg.fold}of{cfg.folds}")
     cfg = replace(cfg, name=f"kato_{recording['name']}{suffix}", obs_dim=y.shape[1])
     segments = split_segments(len(y), cfg)
     bounds = {split: [list(s) for s in spans] for split, spans in segments.items()}
@@ -130,6 +138,8 @@ def prepare_recording(recording, cfg, smoke=False, source_sha256=None):
                     fps=float(recording["fps"]), n_frames=len(y), split_frame_bounds=bounds,
                     unused_tail_frames=dropped, state_names=recording["state_names"],
                     preprocessing="train-only per-neuron mean + global top-d SVD signal scale; corrected fluorescence; native fps",
+                    protocol="whole_trace_in_sample" if cfg.fold < 0 else "rotating_blocked_cv",
+                    held_out=cfg.fold >= 0,
                     ground_truth_available=False, noise_std_is_initialization=True)
     data["metadata"] = np.array(json.dumps(metadata, sort_keys=True))
     return cfg, data

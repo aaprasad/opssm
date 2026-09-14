@@ -1,4 +1,5 @@
 """Model-neutral evaluation. Affine gauge fitted on validation, frozen on test."""
+import json
 import numpy as np
 
 
@@ -90,9 +91,15 @@ def score_benchmark(val, test, ahead, data, cfg, learned_drift, kind="continuous
         from .decoding import score_linear_decoding
         if train_mean is None:
             raise ValueError("Behavior decoding requires latents from the frozen model on training data")
-        decoding, probe = score_linear_decoding(dict(train=train_mean, val=val["mean"], test=test["mean"]), data)
-        metrics.update(decoding)
-        arrays.update(probe)
+        # The in-sample protocol (kato fold=-1) deliberately puts every frame in every split, so a
+        # behavior decoder would be fit and tested on the same frames. Report it as unavailable
+        # rather than as a score, and leave the decoder's leakage guard intact for every other run.
+        if json.loads(str(data["metadata"])).get("held_out", True) is False:
+            metrics.update(linear_decode_status="unavailable_in_sample_protocol")
+        else:
+            decoding, probe = score_linear_decoding(dict(train=train_mean, val=val["mean"], test=test["mean"]), data)
+            metrics.update(decoding)
+            arrays.update(probe)
     metrics["forecast_marginal_nll"] = float(-ahead["forecast_loglik"].mean() / cfg.obs_dim)
     return metrics, arrays
 

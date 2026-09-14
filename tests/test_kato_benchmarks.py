@@ -129,3 +129,21 @@ def test_rotating_folds_cover_the_trace_without_leakage():
         assert resolved.name.endswith(f"_fold{fold}of5")
         tested.append(frames["test"].min())
     assert len(set(tested)) == base["folds"], "folds must test different regions"
+
+
+def test_fold_minus_one_fits_and_scores_the_whole_trace():
+    """fold=-1 is the dLDS protocol: no split, every frame in every split, flagged in-sample."""
+    rec = recording()
+    cfg = KatoConfig("fixture.mat", latent_dim=2, window=20, train_stride=10, gap_frames=5, fold=-1)
+    resolved, data = prepare_recording(rec, cfg)
+    frames = {s: np.unique(data[f"frame_indices_{s}"]) for s in ("train", "val", "test")}
+    n = len(rec["traces"])
+    for split in ("train", "val", "test"):
+        assert frames[split].min() == 0 and frames[split].max() >= n - cfg.window
+    # test frames are a subset of training frames -- that is the point, and why it is in-sample
+    assert set(frames["test"].tolist()) <= set(frames["train"].tolist())
+    meta = json.loads(str(data["metadata"]))
+    assert meta["protocol"] == "whole_trace_in_sample" and meta["held_out"] is False
+    assert resolved.name.endswith("_full")
+    # standardization sees the whole trace, as dLDS does
+    np.testing.assert_allclose(data["obs_mean"], np.asarray(rec["traces"], float).mean(0))
