@@ -105,16 +105,18 @@ def load(pattern, mat_dir, latent_dim, max_forecast_ratio):
 
 
 def strip(ax, frame, order, metric):
-    """One point per worm, coloured by condition; the bar is the per-method mean."""
-    before = len(ax.collections)
+    """Box over the per-worm distribution, with every worm drawn on top.
+
+    n is 4-9 per method, so a box alone would hide the sample it summarises; the points are
+    the data and the box is the summary, not the other way round.
+    """
+    sns.boxplot(data=frame, x="model", y=metric, order=order, ax=ax, showfliers=False,
+                width=.55, linewidth=1.2, boxprops=dict(facecolor="white", edgecolor=REFERENCE),
+                medianprops=dict(color=REFERENCE, linewidth=1.8),
+                whiskerprops=dict(color=REFERENCE), capprops=dict(color=REFERENCE))
     sns.stripplot(data=frame, x="model", y=metric, hue="condition", order=order,
-                  hue_order=CONDITIONS, palette=PALETTE, jitter=.16, size=9, alpha=.95,
-                  edgecolor="white", linewidth=1.1, dodge=False, ax=ax, legend=False)
-    points = list(ax.collections[before:])        # only the stripplot's, not the mean hlines below
-    means = frame.groupby("model")[metric].mean()
-    for index, model in enumerate(order):
-        if model in means.index and np.isfinite(means[model]):
-            ax.hlines(means[model], index - .3, index + .3, color=REFERENCE, lw=2.2, zorder=4)
+                  hue_order=CONDITIONS, palette=PALETTE, jitter=.16, size=8, alpha=.95,
+                  edgecolor="white", linewidth=1.0, dodge=False, ax=ax, legend=False)
     ax.set_xlabel("")
     ax.set_ylabel(PANELS[metric], fontsize=10)
     ax.tick_params(axis="x", labelrotation=18)
@@ -123,36 +125,18 @@ def strip(ax, frame, order, metric):
     ax.grid(axis="y", alpha=.25, lw=.6)
     ax.set_axisbelow(True)
     sns.despine(ax=ax)
-    return points
 
 
 def draw_reconstruction_r2(ax, frame, order):
-    # The ceiling is per worm, so draw each point's own: a shared band would suggest a high
-    # scorer is at its ceiling when its worm's ceiling may be far above. seaborn jitters with
-    # its own RNG, so read the plotted positions back rather than re-jittering, or the bars
-    # land beside their points instead of on them.
-    points = strip(ax, frame, order, "reconstruction_r2")
-    plotted = np.concatenate([c.get_offsets() for c in points if len(c.get_offsets())])
-    lookup = frame.set_index("reconstruction_r2")["ceiling"].to_dict()
-    for x, y in plotted:
-        ceiling = min(lookup, key=lambda v: abs(v - y))
-        ceiling = lookup[ceiling]
-        if np.isfinite(ceiling):
-            ax.vlines(x, y, ceiling, color="#adb5bd", lw=1.1, zorder=1)
-            ax.scatter(x, ceiling, s=44, marker="_", color=REFERENCE, zorder=2)
+    strip(ax, frame, order, "reconstruction_r2")
 
 
 def draw_forecast_vs_persistence(ax, frame, order):
     strip(ax, frame, order, "forecast_vs_persistence")
-    ax.axhline(1.0, ls="--", lw=1.6, color=REFERENCE, zorder=1)
-
 
 
 def draw_behavior_decoding(ax, frame, order):
     strip(ax, frame, order, "behavior_decoding")
-    for condition in CONDITIONS:
-        for chance in sorted(set(frame.loc[frame["condition"] == condition, "chance"].dropna())):
-            ax.axhline(chance, ls="--", lw=1.5, color=PALETTE[condition], zorder=1)
     ax.set_ylim(0, 1)
 
 
@@ -161,21 +145,10 @@ DRAW = {"reconstruction_r2": draw_reconstruction_r2,
         "behavior_decoding": draw_behavior_decoding}
 
 
-def handles(frame, metric):
-    """Every legend entry the panel needs, so each standalone asset reads on its own."""
-    items = [plt.Line2D([], [], marker="o", ls="", color=PALETTE[c], markersize=8,
-                        markeredgecolor="white", label=c) for c in CONDITIONS]
-    items.append(plt.Line2D([], [], color=REFERENCE, lw=2.2, label="method mean"))
-    if metric == "reconstruction_r2":
-        items.append(plt.Line2D([], [], color="#adb5bd", lw=1.1, marker="_",
-                                markeredgecolor=REFERENCE, label="rank-10 PCA ceiling (per worm)"))
-    elif metric == "forecast_vs_persistence":
-        items.append(plt.Line2D([], [], color=REFERENCE, ls="--", lw=1.6, label="persistence"))
-    else:
-        items += [plt.Line2D([], [], color=PALETTE[c], ls="--", lw=1.5,
-                             label=f"chance {c} (1/{k})")
-                  for c, k in zip(CONDITIONS, (7, 4))]
-    return items
+def handles(frame, metric=None):
+    """Point colour is the only encoding left; the box is a neutral summary."""
+    return [plt.Line2D([], [], marker="o", ls="", color=PALETTE[c], markersize=8,
+                       markeredgecolor="white", label=c) for c in CONDITIONS]
 
 
 def save(figure, stem):
@@ -216,18 +189,16 @@ def main(argv=None):
     figure, axes = plt.subplots(1, 3, figsize=(15, 4.6))
     for ax, metric in zip(axes, PANELS):
         DRAW[metric](ax, frame, order)
-    combined = handles(frame, "reconstruction_r2")[:3]
-    combined += [h for m in PANELS for h in handles(frame, m)[3:]]
-    figure.legend(handles=combined, loc="lower center", ncol=4, frameon=False, fontsize=9,
-                  bbox_to_anchor=(.5, -.13))
+    figure.legend(handles=handles(frame), loc="lower center", ncol=2, frameon=False,
+                  fontsize=9, bbox_to_anchor=(.5, -.08))
     figure.tight_layout()
     written += save(figure, args.out / "combined")
 
     for metric in PANELS:                        # standalone, legend included so it stands alone
         single, ax = plt.subplots(figsize=(5.2, 4.4))
         DRAW[metric](ax, frame, order)
-        single.legend(handles=handles(frame, metric), loc="lower center", ncol=2, frameon=False,
-                      fontsize=8.5, bbox_to_anchor=(.5, -.22))
+        single.legend(handles=handles(frame), loc="lower center", ncol=2, frameon=False,
+                      fontsize=8.5, bbox_to_anchor=(.5, -.16))
         single.tight_layout()
         written += save(single, args.out / metric)
 
@@ -253,7 +224,10 @@ def main(argv=None):
         exclusion_rule=f"forecast_vs_persistence > {args.max_forecast_ratio}",
         points="one point per worm; bar is the unweighted per-method mean, no error bars "
                "(coverage is uneven, so methods are not measured on the same worms)",
-        reference_lines=dict(
+        boxes="box = median and IQR over worms, whiskers 1.5*IQR, no fliers (every worm is "
+              "drawn as a point); reference lines below are NOT drawn on the figure but are "
+              "what the values are measured against, so they belong in the caption",
+        reference_values=dict(
             reconstruction_r2=f"rank-{args.latent_dim} PCA R2 on the mean-centred trace, PER WORM; "
                               "y = C z is rank d so Eckart-Young bounds recon R2 by it",
             forecast_vs_persistence="each worm's own persistence RMSE (repeat the last observed "
