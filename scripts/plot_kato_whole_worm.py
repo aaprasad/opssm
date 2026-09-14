@@ -35,6 +35,7 @@ from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -107,26 +108,53 @@ def load(pattern, mat_dir, latent_dim, max_forecast_ratio):
     return frame[~diverged].copy(), failures, excluded
 
 
-def strip(ax, frame, order, metric):
+def strip(ax, frame, order, metric, by_condition=False):
     """Box per model (colour = model), with every worm on top (shape = condition, black).
 
     n is 4-9 per method, so a box alone would hide the sample it summarises; the points are
     the data and the box is the summary, not the other way round.
     """
-    sns.boxplot(data=frame, x="model", y=metric, order=order, hue="model", hue_order=order,
-                palette=[MODEL_COLORS.get(m, "#868e96") for m in order], legend=False,
-                ax=ax, showfliers=False, width=.6, linewidth=1.2,
-                boxprops=dict(alpha=.35), medianprops=dict(color=REFERENCE, linewidth=1.9),
-                whiskerprops=dict(color=REFERENCE), capprops=dict(color=REFERENCE))
-    # One stripplot per condition: seaborn maps hue to colour, not marker, so the shapes have
-    # to come from separate calls -- which is what keeps every point black.
-    for condition in CONDITIONS:
-        subset = frame[frame["condition"] == condition]
-        if subset.empty:
-            continue
-        sns.stripplot(data=subset, x="model", y=metric, order=order, ax=ax, color=POINT,
-                      marker=MARKERS[condition], jitter=.16, size=6.5, alpha=.85,
-                      linewidth=0, legend=False)
+    common = dict(showfliers=False, linewidth=1.2, medianprops=dict(color=REFERENCE, linewidth=1.9),
+                  whiskerprops=dict(color=REFERENCE), capprops=dict(color=REFERENCE))
+    if by_condition:
+        # Dodge by condition, keeping model in the fill: hatching separates the two so the
+        # colour channel still means model and nothing has to be read off a shared scale.
+        sns.boxplot(data=frame, x="model", y=metric, order=order, hue="condition",
+                    hue_order=CONDITIONS, legend=False, ax=ax, width=.7,
+                    palette=["white", "white"], boxprops=dict(alpha=.35), **common)
+        # Colour from each box's actual x centre: with dodge on, seaborn's patch order is not
+        # model-major, so indexing into `order` silently paints every box the same grey.
+        for patch in ax.patches:
+            vertices = patch.get_path().vertices
+            centre = float(np.mean(vertices[:, 0]))
+            index = int(round(centre))
+            if not 0 <= index < len(order):
+                continue
+            patch.set_facecolor(MODEL_COLORS.get(order[index], "#868e96"))
+            patch.set_alpha(.35)
+            if centre > index:                      # right-hand box of the pair is Stim
+                patch.set_hatch("///")
+        for condition in CONDITIONS:
+            subset = frame[frame["condition"] == condition]
+            if subset.empty:
+                continue
+            sns.stripplot(data=subset, x="model", y=metric, order=order, ax=ax, color=POINT,
+                          hue="condition", hue_order=CONDITIONS, palette=[POINT, POINT],
+                          dodge=True, marker=MARKERS[condition], jitter=.12, size=6,
+                          alpha=.85, linewidth=0, legend=False)
+    else:
+        sns.boxplot(data=frame, x="model", y=metric, order=order, hue="model", hue_order=order,
+                    palette=[MODEL_COLORS.get(m, "#868e96") for m in order], legend=False,
+                    ax=ax, width=.6, boxprops=dict(alpha=.35), **common)
+        # One stripplot per condition: seaborn maps hue to colour, not marker, so the shapes
+        # have to come from separate calls -- which is what keeps every point black.
+        for condition in CONDITIONS:
+            subset = frame[frame["condition"] == condition]
+            if subset.empty:
+                continue
+            sns.stripplot(data=subset, x="model", y=metric, order=order, ax=ax, color=POINT,
+                          marker=MARKERS[condition], jitter=.16, size=6.5, alpha=.85,
+                          linewidth=0, legend=False)
     ax.set_xlabel("")
     ax.set_ylabel(PANELS[metric], fontsize=10)
     ax.tick_params(axis="x", labelrotation=18)
@@ -137,16 +165,16 @@ def strip(ax, frame, order, metric):
     sns.despine(ax=ax)
 
 
-def draw_reconstruction_r2(ax, frame, order):
-    strip(ax, frame, order, "reconstruction_r2")
+def draw_reconstruction_r2(ax, frame, order, by_condition=False):
+    strip(ax, frame, order, "reconstruction_r2", by_condition)
 
 
-def draw_forecast_vs_persistence(ax, frame, order):
-    strip(ax, frame, order, "forecast_vs_persistence")
+def draw_forecast_vs_persistence(ax, frame, order, by_condition=False):
+    strip(ax, frame, order, "forecast_vs_persistence", by_condition)
 
 
-def draw_behavior_decoding(ax, frame, order):
-    strip(ax, frame, order, "behavior_decoding")
+def draw_behavior_decoding(ax, frame, order, by_condition=False):
+    strip(ax, frame, order, "behavior_decoding", by_condition)
     ax.set_ylim(0, 1)
 
 
@@ -155,10 +183,12 @@ DRAW = {"reconstruction_r2": draw_reconstruction_r2,
         "behavior_decoding": draw_behavior_decoding}
 
 
-def handles(frame, order):
+def handles(frame, order, by_condition=False):
     """Shape carries condition, fill carries model; both are needed to read a panel alone."""
     items = [plt.Line2D([], [], marker=MARKERS[c], ls="", color=POINT, markersize=7, label=c)
              for c in CONDITIONS]
+    if by_condition:
+        items.append(mpatches.Patch(facecolor="#868e96", alpha=.35, hatch="///", label="Stim (hatched)"))
     return items + [plt.Line2D([], [], marker="s", ls="", markersize=9, label=m,
                                color=MODEL_COLORS.get(m, "#868e96"), alpha=.55)
                     for m in order]
@@ -186,6 +216,10 @@ def main(argv=None):
                         help="Directory holding WT_NoStim.mat / WT_Stim.mat, for the PCA ceiling")
     parser.add_argument("--latent-dim", type=int, default=10,
                         help="Latent dimension the runs used; sets the PCA ceiling rank")
+    parser.add_argument("--by-condition", action="store_true",
+                        help="Dodge NoStim vs Stim within each model. NOT stacked: these are R2, "
+                             "a ratio and an accuracy, which do not sum, so a stacked bar would "
+                             "show a height that is not a quantity. Check n per cell first.")
     parser.add_argument("--max-forecast-ratio", type=float, default=10.0,
                         help="Drop runs whose forecast/persistence exceeds this: a diverged "
                              "rollout is a broken integration, not a forecast score. Recorded "
@@ -201,16 +235,16 @@ def main(argv=None):
 
     figure, axes = plt.subplots(1, 3, figsize=(15, 4.6))
     for ax, metric in zip(axes, PANELS):
-        DRAW[metric](ax, frame, order)
-    figure.legend(handles=handles(frame, order), loc="lower center", ncol=7, frameon=False,
+        DRAW[metric](ax, frame, order, args.by_condition)
+    figure.legend(handles=handles(frame, order, args.by_condition), loc="lower center", ncol=7, frameon=False,
                   fontsize=9, bbox_to_anchor=(.5, -.1))
     figure.tight_layout()
     written += save(figure, args.out / "combined")
 
     for metric in PANELS:                        # standalone, legend included so it stands alone
         single, ax = plt.subplots(figsize=(5.2, 4.4))
-        DRAW[metric](ax, frame, order)
-        single.legend(handles=handles(frame, order), loc="lower center", ncol=4, frameon=False,
+        DRAW[metric](ax, frame, order, args.by_condition)
+        single.legend(handles=handles(frame, order, args.by_condition), loc="lower center", ncol=4, frameon=False,
                       fontsize=8, bbox_to_anchor=(.5, -.2))
         single.tight_layout()
         written += save(single, args.out / metric)
@@ -235,6 +269,9 @@ def main(argv=None):
         worms_per_model={m: sorted(frame.loc[frame["model"] == m, "worm"]) for m in order},
         excluded_runs=sorted(excluded, key=lambda d: -d["forecast_vs_persistence"]),
         exclusion_rule=f"forecast_vs_persistence > {args.max_forecast_ratio}",
+        split_by_condition=args.by_condition,
+        runs_per_model_condition={f"{m}/{c}": int(((frame["model"] == m) & (frame["condition"] == c)).sum())
+                                  for m in order for c in CONDITIONS},
         points="one point per worm; bar is the unweighted per-method mean, no error bars "
                "(coverage is uneven, so methods are not measured on the same worms)",
         boxes="box = median and IQR over worms, whiskers 1.5*IQR, no fliers (every worm is "
