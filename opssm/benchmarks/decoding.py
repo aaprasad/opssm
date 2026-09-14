@@ -37,6 +37,20 @@ def score_linear_decoding(means, data, c_grid=(.001, .01, .1, 1., 10., 100.)):
     excluded = [i for i, name in enumerate(meta["state_names"]) if name.upper() == "NOSTATE"]
     splits = {s: _unique_frames(means[s], data[f"states_{s}"], data[f"frame_indices_{s}"], excluded)
               for s in ("train", "val", "test")}
+    in_sample_latents = meta.get("held_out", True) is False
+    if in_sample_latents:
+        # The whole-trace protocol puts every frame in every split, so the probe must carve out its
+        # own held-out frames or it would be fit and scored on the same ones. Partition the recording
+        # chronologically with the same gap the CV protocol uses -- the decoding score then measures
+        # generalization to frames the DECODER never saw. The latents remain in-sample with respect
+        # to the dynamical model, which is what the status records.
+        features_all, target_all, frames_all = splits["train"]
+        gap = int(meta["config"]["gap_frames"])
+        lo, hi = np.quantile(frames_all, .6), np.quantile(frames_all, .8)
+        masks = {"train": frames_all <= lo,
+                 "val": (frames_all >= lo + gap) & (frames_all <= hi),
+                 "test": frames_all >= hi + gap}
+        splits = {s: (features_all[m], target_all[m], frames_all[m]) for s, m in masks.items()}
     for a, b in (("train", "val"), ("train", "test"), ("val", "test")):
         if np.intersect1d(splits[a][2], splits[b][2]).size:
             raise ValueError("Behavior decoder splits share recording frames")
@@ -61,7 +75,8 @@ def score_linear_decoding(means, data, c_grid=(.001, .01, .1, 1., 10., 100.)):
     pred = best.predict(features["test"])
     metrics.update({f"linear_decode_{k}": v for k, v in _scores(target, pred).items()})
     majority = np.unique(ytrain)[np.argmax(np.unique(ytrain, return_counts=True)[1])]
-    metrics.update(linear_decode_status="ok", linear_decode_C=selected_c,
+    metrics.update(linear_decode_status="ok_in_sample_latents" if in_sample_latents else "ok",
+                   linear_decode_C=selected_c,
                    linear_decode_val_balanced_accuracy=best_score,
                    linear_decode_train_classes=best.classes_.tolist(),
                    linear_decode_unseen_test_fraction=float(np.mean(~np.isin(target, best.classes_))),

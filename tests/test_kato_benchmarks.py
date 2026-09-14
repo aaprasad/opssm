@@ -147,3 +147,19 @@ def test_fold_minus_one_fits_and_scores_the_whole_trace():
     assert resolved.name.endswith("_full")
     # standardization sees the whole trace, as dLDS does
     np.testing.assert_allclose(data["obs_mean"], np.asarray(rec["traces"], float).mean(0))
+
+
+def test_in_sample_protocol_still_holds_out_decoder_frames():
+    """fold=-1 gives the probe its own split, so decoding is never fit and scored on one frame."""
+    from opssm.benchmarks.decoding import score_linear_decoding
+    rec = recording()
+    cfg = KatoConfig("fixture.mat", latent_dim=2, window=20, train_stride=10, gap_frames=5, fold=-1)
+    _, data = prepare_recording(rec, cfg)
+    means = {s: np.random.default_rng(0).normal(size=(*data[f"states_{s}"].shape, 2))
+             for s in ("train", "val", "test")}
+    metrics, arrays = score_linear_decoding(means, data)
+    assert metrics["linear_decode_status"] == "ok_in_sample_latents"
+    # the probe's own splits must be disjoint even though the dataset's are identical
+    assert metrics["linear_decode_n_train"] > 0 and metrics["linear_decode_n_test"] > 0
+    total = sum(metrics[f"linear_decode_n_{s}"] for s in ("train", "val", "test"))
+    assert total < data["frame_indices_train"].max() + 1, "gap frames must be dropped"
