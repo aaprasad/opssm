@@ -163,3 +163,20 @@ def test_in_sample_protocol_still_holds_out_decoder_frames():
     assert metrics["linear_decode_n_train"] > 0 and metrics["linear_decode_n_test"] > 0
     total = sum(metrics[f"linear_decode_n_{s}"] for s in ("train", "val", "test"))
     assert total < data["frame_indices_train"].max() + 1, "gap frames must be dropped"
+
+
+def test_reuse_data_applies_to_kato(tmp_path):
+    """Kato arrives pre-built, which must not exclude it from --reuse-data."""
+    from opssm.benchmarks.data import fingerprint, save_dataset
+    rec = recording()
+    base = dict(latent_dim=2, window=20, train_stride=10, fold=-1)
+    _, first = prepare_recording(rec, KatoConfig("fixture.mat", gap_frames=30, **base))
+    _, second = prepare_recording(rec, KatoConfig("fixture.mat", gap_frames=100, **base))
+    # Same frames, different recorded config -> different fingerprint, which is the collision
+    # that --reuse-data exists to resolve.
+    assert fingerprint(first) != fingerprint(second)
+    np.testing.assert_array_equal(first["y_train"], second["y_train"])
+    path = tmp_path / "data.npz"
+    save_dataset(path, first)
+    with pytest.raises(FileExistsError):
+        save_dataset(path, second)

@@ -150,7 +150,7 @@ def main(argv=None):
             root = args.out / cfg.name / f"seed_{seed}"
             existing = root / "data.npz"
             cell_cfg = cfg
-            if args.reuse_data and fixed_data is None and existing.is_file():
+            if args.reuse_data and existing.is_file():
                 # Adopting the file makes it the source of truth: every downstream consumer, and the
                 # dataset_hash recorded in the row, then describes the bytes actually trained on. The
                 # OPSSM worker reads this path directly, so regenerating instead would let the two
@@ -164,7 +164,12 @@ def main(argv=None):
                 cell_cfg = config_from_data(data)
                 if cell_cfg.name != cfg.name:
                     raise ValueError(f"{existing} holds dataset {cell_cfg.name!r}, not {cfg.name!r}")
-                generated = fingerprint(make_dataset(cfg, seed))
+                # Kato arrives already built (it is read from a recording, not generated from a
+                # preset), so compare against that rather than calling make_dataset, which only
+                # knows the synthetic presets. Guarding on `fixed_data is None` instead -- as this
+                # did -- skipped the whole reuse branch for kato and left it raising FileExistsError.
+                generated = fingerprint(fixed_data if fixed_data is not None
+                                        else make_dataset(cfg, seed))
                 if fingerprint(data) != generated:
                     print(f"reusing existing dataset {existing} (hash {fingerprint(data)[:12]}); the current "
                           f"preset/code would generate {generated[:12]} -- results are tied to the file, "
