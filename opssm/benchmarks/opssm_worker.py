@@ -21,7 +21,6 @@ import numpy as np
 from .data import config_from_data, fingerprint
 from .metrics import score_benchmark
 from .runner import write_json
-from .sde_models import solve_prior
 
 
 def load_benchmark_checkpoint(directory, hp, checkpoint_name="best"):
@@ -73,6 +72,7 @@ def forecast_from_prefix(op, drift_net, g_cur, C, offset, L_cur, obs, ts, hp, la
     forecast, so the metric that selects a checkpoint is the one it is later scored on.
     """
     from .common import chol
+    from .sde_models import solve_prior          # local: pulls in diffrax, which loading a checkpoint does not need
     cut = obs.shape[0] // 2
     k_post, k_z0, k_path = jr.split(key, 3)
     prefix = posterior_moments(op, obs[:cut], C, offset, hp, latent_dim, z_grid, samples, k_post)
