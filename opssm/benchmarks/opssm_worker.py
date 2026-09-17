@@ -35,7 +35,8 @@ def load_benchmark_checkpoint(directory, hp, checkpoint_name="best"):
                         key=jr.PRNGKey(0), branch_hidden=hp.get("branch_hidden", 128),
                         trunk_hidden=hp.get("trunk_hidden", 64), trunk_layers=hp.get("trunk_layers", 3),
                         trunk_activation=hp.get("trunk_activation", "softplus"))
-    drift_net = DriftNet(hp["drift_hidden"], layers=hp.get("drift_layers", 3), latent_dim=d, key=jr.PRNGKey(1))
+    drift_net = DriftNet(hp["drift_hidden"], layers=hp.get("drift_layers", 3), latent_dim=d,
+                         key=jr.PRNGKey(1), activation=hp.get("drift_activation", "tanh"))
     schedule = optax.exponential_decay(hp["lr"], transition_steps=1, decay_rate=hp["sched_gamma"])
     op_state = optax.adam(schedule).init(eqx.filter(op, eqx.is_inexact_array))
     drift_state = optax.adam(hp["drift_lr"]).init(eqx.filter(drift_net.net, eqx.is_inexact_array))

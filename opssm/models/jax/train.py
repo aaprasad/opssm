@@ -282,7 +282,8 @@ def train(refs, hp, n_steps, key, val_every=2000, log_fn=print, fig_dir=None, ti
         C_cur = Vt[:d].T
     else:                                                          # random Stiefel
         C_cur = jnp.linalg.qr(jax.random.normal(kc, (D_obs, d)))[0]
-    drift_net = DriftNet(hp["drift_hidden"], layers=hp.get("drift_layers", 3), latent_dim=d, key=kd)
+    drift_net = DriftNet(hp["drift_hidden"], layers=hp.get("drift_layers", 3), latent_dim=d, key=kd,
+                         activation=hp.get("drift_activation", "tanh"))
     g_cur = hp["g_init"]
     # matrix diffusion Sigma = L L^T, seeded isotropic at g_init (so a fresh run starts exactly where the
     # scalar path starts, and d==1 stays numerically identical to it)

@@ -32,12 +32,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.pop("SLURM_CPU_BIND", False)
 
 
-def point_name(overrides):
-    """Stable, filesystem-safe directory name for one set of data-config overrides."""
-    if not overrides:
-        return "baseline"
-    parts = [f"{k}{str(v).replace('.', 'p').replace('-', 'm')}" for k, v in sorted(overrides.items())]
-    return "_".join(parts)
+def _parts(overrides, prefix=""):
+    return [f"{prefix}{k}{str(v).replace('.', 'p').replace('-', 'm')}"
+            for k, v in sorted(overrides.items())]
+
+
+def point_name(overrides, model_overrides=None):
+    """Stable, filesystem-safe directory name for one set of config overrides.
+
+    Model overrides are prefixed and folded into the SAME name as the data overrides: a point is a
+    configuration, not just a dataset, so two activations must not share a results directory and
+    silently skip each other through the `already complete` check.
+    """
+    parts = _parts(overrides) + _parts(model_overrides or {}, prefix="opssm_")
+    return "_".join(parts) if parts else "baseline"
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="benchmark")
@@ -48,6 +56,18 @@ def main(cfg):
     # null means "keep the preset's value", so only non-null entries become overrides.
     overrides = {k: v for k, v in (OmegaConf.to_container(cfg.dataset_config, resolve=True) or {}).items()
                  if v is not None}
+    # OPSSM hyperparameter overrides, merged over the resolved Hydra config by the worker. Only
+    # meaningful for method=opssm, so reject them elsewhere rather than writing a point name that
+    # claims a setting the run never applied.
+    model_overrides = {k: v for k, v in
+                       (OmegaConf.to_container(cfg.opssm.get("overrides"), resolve=True) or {}).items()
+                       if v is not None}
+    if model_overrides and cfg.method != "opssm":
+        raise SystemExit(f"opssm.overrides only applies to method=opssm, not {cfg.method!r}")
+    if "drift_activation" in model_overrides:
+        from opssm.models.activations import ACTIVATION_NAMES
+        if model_overrides["drift_activation"] not in ACTIVATION_NAMES:
+            raise SystemExit(f"drift_activation must be one of {sorted(ACTIVATION_NAMES)}")
     kato = cfg.dataset == "kato"
     if kato:
         # Kato is a real recording, not a generator: it has no DatasetConfig to override or validate,
@@ -70,7 +90,7 @@ def main(cfg):
         replace(PRESETS[cfg.dataset], **overrides).validate()
         dataset_dir = cfg.dataset
 
-    point = point_name(overrides)
+    point = point_name(overrides, model_overrides)
     out = Path(cfg.results_root).resolve() / point
     cell = out / dataset_dir / f"seed_{cfg.seed}" / cfg.method
     if (cell / "result.json").exists():
@@ -82,6 +102,9 @@ def main(cfg):
     config_path = out / f"dataset_config_{point}.json"
     if overrides and not config_path.exists():
         config_path.write_text(json.dumps({cfg.dataset: overrides}, indent=2) + "\n")
+    model_config_path = out / f"opssm_config_{point}.json"
+    if model_overrides and not model_config_path.exists():
+        model_config_path.write_text(json.dumps(model_overrides, indent=2) + "\n")
 
     argv = ["--datasets", str(cfg.dataset), "--models", str(cfg.method), "--seeds", str(cfg.seed),
             "--steps", str(steps), "--val-every", str(cfg.val_every), "--samples", str(cfg.samples),
@@ -92,6 +115,8 @@ def main(cfg):
             "--opssm-select-samples", str(cfg.opssm.select_samples)]
     if overrides:
         argv += ["--dataset-config", str(config_path)]
+    if model_overrides:
+        argv += ["--opssm-config", str(model_config_path)]
     if kato:
         argv += ["--kato-mat", str(cfg.kato.mat), "--kato-worms", str(cfg.kato.worm),
                  "--kato-folds", str(cfg.kato.folds), "--kato-fold", str(cfg.kato.fold),

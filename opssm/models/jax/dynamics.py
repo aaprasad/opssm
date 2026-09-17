@@ -14,11 +14,13 @@ from opssm.models.jax.nn import MLP
 class DriftNet(eqx.Module):
     net: MLP
 
-    def __init__(self, hidden=64, layers=3, latent_dim=1, key=None, weights=None, biases=None):
+    def __init__(self, hidden=64, layers=3, latent_dim=1, key=None, weights=None, biases=None,
+                 activation='tanh'):
         if weights is not None:
-            self.net = MLP(weights=weights, biases=biases)
+            self.net = MLP(weights=weights, biases=biases, activation=activation)
         else:
-            self.net = MLP([latent_dim] + [hidden] * layers + [latent_dim], key, zero_last=True)
+            self.net = MLP([latent_dim] + [hidden] * layers + [latent_dim], key, zero_last=True,
+                           activation=activation)
 
     def drift(self, z):                                           # z (...,d) -> f (...,d), div_f (...,)
         d = z.shape[-1]

@@ -87,6 +87,21 @@ opssm:
   experiment: null             # Hydra experiment for OPSSM; default: matching duncker_*/kato
   config_dir: null             # frozen config tree; default: repository configs/
 
+  # OPSSM hyperparameter overrides, merged over the resolved experiment config. Swept exactly like
+  # dataset_config (`opssm.overrides.drift_activation=relu,elu,silu,gelu`), and the set of non-null
+  # fields names the results subdirectory, so configurations never share a cell. opssm only.
+  overrides:
+    drift_activation: null   # tanh | softplus | relu | elu | silu | gelu. tanh (the default) SATURATES,
+                             #   so the learned field plateaus between data and cannot keep growing
+                             #   outside it; the others do not saturate on the positive side.
+    m_every: null            # optimisation steps between M-steps; 10000/m_every M-steps in total
+    m_inner: null            # inner iterations per M-step
+    drift_hidden: null
+    drift_layers: null
+    drift_lr: null
+    reg_lambda: null         # drift weight decay
+    n_colloc: null           # collocation points per M-step
+
 hydra:
   run:
     dir: ${results_root}/.hydra/${dataset}_seed${seed}_${method}
