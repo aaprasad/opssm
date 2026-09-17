@@ -61,6 +61,7 @@ def _run_mstep(op, xs, mask, drift_net, dr_opt, dr_state, C, d, g, hp, key, boot
     info, drift_net, dr_state = M.mstep(
         op, xs, mask, hp["dt"], drift_net, dr_opt, dr_state, key,
         learn_g=hp["learn_g"], reg_lambda=hp["reg_lambda"], m_inner=hp["m_inner"],
+        reg_curv=hp.get("reg_curv", 0.0),
         learn_obs=hp["learn_obs"], c_stable_tol=hp["c_stable_tol"], C_cur=C, d_cur=d,
         n_mean=hp["n_mean"], near_std=hp["near_std"], broad_std=hp["broad_std"],
         mean_method=hp["mean_method"], mala=_mala_cfg(hp), drift_target=hp["drift_target"],

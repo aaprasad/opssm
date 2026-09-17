@@ -176,22 +176,44 @@ def fit_obs_map_stiefel(z_hat, y, C_cur):
     return C_new, d_new, cstab
 
 
-def fit_drift(drift_net, dr_opt, dr_state, zc, dz, reg_lambda, m_inner):
-    """Regress f_theta(z) ~ dz with L2 weight decay via optax. Returns (drift_net, dr_state). zc,dz (N,d)."""
+def fit_drift(drift_net, dr_opt, dr_state, zc, dz, reg_lambda, m_inner, reg_curv=0.0, key=None):
+    """Regress f_theta(z) ~ dz with L2 weight decay via optax. Returns (drift_net, dr_state). zc,dz (N,d).
+
+    reg_lambda is weight DECAY, not smoothness: it shrinks the field's amplitude along with its
+    wiggles, so on a drift that has to reach the edge of the data it cannot remove oscillation
+    without also flattening the signal. reg_curv penalises the second directional derivative
+    instead, which leaves amplitude alone. There is room for it -- a fitted doublewell drift
+    carries ~200x the curvature energy of the cubic it is approximating, nearly all of it
+    oscillation in the sparsely-sampled barrier.
+
+    Curvature is estimated along ONE random unit direction per inner step: 2 extra forward passes
+    rather than the d of a full Hessian, which matters at kato's d=10, and m_inner averages the
+    direction out. Off by default, so every existing config trains exactly as before.
+    """
     net = drift_net.net
+    span = jnp.maximum(jnp.std(zc, axis=0).mean(), 1e-6)
+    offset = 0.05 * span                                          # finite-difference step, data-scaled
 
     @eqx.filter_jit
-    def step(net, state):
+    def step(net, state, subkey):
         def loss_fn(net):
             f = net(zc)
             reg = sum((w ** 2).sum() for w in net.weights) + sum((b ** 2).sum() for b in net.biases)
-            return ((f - dz) ** 2).sum(-1).mean() + reg_lambda * reg
+            loss = ((f - dz) ** 2).sum(-1).mean() + reg_lambda * reg
+            if reg_curv:
+                direction = jax.random.normal(subkey, zc.shape)
+                direction = direction / (jnp.linalg.norm(direction, axis=-1, keepdims=True) + 1e-12)
+                second = net(zc + offset * direction) - 2 * f + net(zc - offset * direction)
+                loss = loss + reg_curv * (second ** 2).sum(-1).mean() / offset ** 4
+            return loss
         grads = eqx.filter_grad(loss_fn)(net)
         updates, state = dr_opt.update(grads, state, eqx.filter(net, eqx.is_inexact_array))
         return eqx.apply_updates(net, updates), state
 
-    for _ in range(m_inner):
-        net, dr_state = step(net, dr_state)
+    keys = (jax.random.split(key, m_inner) if reg_curv and key is not None
+            else [None] * m_inner)
+    for i in range(m_inner):
+        net, dr_state = step(net, dr_state, keys[i])
     return eqx.tree_at(lambda dn: dn.net, drift_net, net), dr_state
 
 
@@ -206,7 +228,8 @@ def fit_diffusion_scalar(drift_net, zc, zc_next, dz, dt):
 
 
 def mstep(model, x, mask, dt, drift_net, dr_opt, dr_state, key, *,
-          learn_g, reg_lambda, m_inner, learn_obs=False, c_stable_tol=0.05, C_cur=None, d_cur=None,
+          learn_g, reg_lambda, m_inner, reg_curv=0.0, learn_obs=False, c_stable_tol=0.05,
+          C_cur=None, d_cur=None,
           n_mean=256, near_std=0.3, broad_std=1.6, mean_method="mala", mala=None,
           drift_target="det_mid", bootstrap=False, diffusion_cov=False, g_floor=0.05,
           learn_obs_noise=False, obs_noise_mode="diag", obs_noise_est="perp", noise_var_in=None,
@@ -242,7 +265,13 @@ def mstep(model, x, mask, dt, drift_net, dr_opt, dr_state, key, *,
             zc_fit = zc + 0.5 * dt * drift_net.net(zc)
         elif drift_target != "forward":
             raise NotImplementedError(f"drift_target={drift_target!r}: only det_mid/forward ported")
-        drift_net, dr_state = fit_drift(drift_net, dr_opt, dr_state, zc_fit, dz, reg_lambda, m_inner)
+        # Split only when the penalty is on, so reg_curv=0 leaves the RNG stream untouched and
+        # every existing run reproduces bit-identically.
+        curv_key = None
+        if reg_curv:
+            key, curv_key = jax.random.split(key)
+        drift_net, dr_state = fit_drift(drift_net, dr_opt, dr_state, zc_fit, dz, reg_lambda, m_inner,
+                                        reg_curv=reg_curv, key=curv_key)
     g_cur = L_cur = None
     g_iso = aniso = float("nan")
     if learn_g:

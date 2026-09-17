@@ -99,7 +99,10 @@ opssm:
     drift_hidden: null
     drift_layers: null
     drift_lr: null
-    reg_lambda: null         # drift weight decay
+    reg_lambda: null         # drift WEIGHT DECAY -- shrinks amplitude as well as wiggles
+    reg_curv: null           # drift CURVATURE penalty -- targets oscillation, leaves amplitude alone.
+                             #   A fitted doublewell drift carries ~200x the curvature energy of the
+                             #   cubic it approximates, so there is room before this fights the signal.
     n_colloc: null           # collocation points per M-step
 
 hydra:
