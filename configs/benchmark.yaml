@@ -20,7 +20,7 @@ defaults:
   - override hydra/launcher: basic
 
 dataset: vanderpol          # doublewell | vanderpol | lorenz | lorenz_li | kato
-method: opssm               # kf | ekf | ukf | rslds | latent_sde | sde_matching | opssm (legacy: slds)
+method: opssm               # kf | ekf | ukf | rslds | latent_sde | sde_matching | opssm | gpslds (legacy: slds)
 seed: 0
 
 # DatasetConfig overrides applied to PRESETS[dataset]. Every field is listed so it can be swept
@@ -104,6 +104,32 @@ opssm:
                              #   A fitted doublewell drift carries ~200x the curvature energy of the
                              #   cubic it approximates, so there is room before this fights the signal.
     n_colloc: null           # collocation points per M-step
+
+# gpSLDS (SING-GP with the smoothly-switching-linear kernel). method=gpslds only. Its fit is
+# variational EM over tens of iterations, NOT a 10k-step gradient descent, so `steps` does not
+# apply to it -- `iters` is its budget. `states` defaults to `modes`, so a gpSLDS and an rSLDS
+# launched in the same sweep get the same number of linear regimes unless you say otherwise.
+gpslds:
+  states: null             # linear regimes; null = use `modes`
+  sigma: 1.0               # prior SDE noise scale. SING FIXES this rather than learning it, so it
+                           #   is a real hyperparameter -- sweep it (gpslds.sigma=0.3,1.0,3.0)
+                           #   before reading a single run as the model's best.
+  iters: 50                # variational EM iterations
+  iters_e: 15              # SING natural-gradient E-steps per iteration
+  iters_m: 50              # Adam M-steps per iteration
+  iters_infer: 15          # vEM iterations for the frozen-parameter val/test inference
+  lr: 1e-4                 # M-step Adam learning rate
+  tau: 0.5                 # initial partition temperature (regime-boundary smoothness)
+  inducing_per_axis: null  # null = 16 (d=1), 8 (d=2), 4 (d=3); GP cost is O(M^3) in the TOTAL count
+  inducing_pad: 0.25       # inducing grid margin, as a fraction of the PCA-score range
+  batch_size: null         # trials per SVI minibatch; null = min(n_trials, 64) at d<=2, 16 at d=3
+                           #   (SING runs quadrature at every trial x timestep x inducing point, so
+                           #   d=3 full batch needs 35 GiB). NB trial counts
+                           #   differ hugely across presets -- doublewell/vanderpol have 20 training
+                           #   trials, LORENZ HAS 1024 -- so on lorenz one iteration sees ~1/16 of
+                           #   the data and `iters` must be raised to match (e.g. iters=400 is ~25
+                           #   epochs). Full batch on lorenz OOMs at 35 GiB.
+  infer_chunk: null        # trials per full-batch val/test inference pass; null = the batch cap
 
 hydra:
   run:

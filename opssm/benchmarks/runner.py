@@ -45,7 +45,7 @@ def record_attempt(directory, **fields):
     return entry
 
 DEFAULT_MODELS = ("kf", "ekf", "ukf", "rslds", "latent_sde", "sde_matching", "opssm")
-MODELS = (*DEFAULT_MODELS, "slds")  # Keep legacy SLDS explicit and results identifiable.
+MODELS = (*DEFAULT_MODELS, "slds", "gpslds")  # Legacy SLDS and gpSLDS stay explicit and identifiable.
 
 
 def write_json(path, value):
@@ -95,6 +95,20 @@ def main(argv=None):
                          "trains on the SAME bytes they did, which is what makes the cell comparable. "
                          "Without it, a data.npz that disagrees with the current preset/code is a hard error.")
     ap.add_argument("--dataset-config", type=Path, help="JSON mapping preset names to DatasetConfig overrides")
+    # gpSLDS (SING-GP) knobs. Its fit is variational EM over a handful of iterations, not a long
+    # gradient descent, so --steps does not apply to it; these are its budget instead.
+    ap.add_argument("--gpslds-states", type=int, help="Linear regimes; default: --modes, matching the rSLDS")
+    ap.add_argument("--gpslds-sigma", type=float, help="Prior SDE noise scale (SING fixes it; default 1.0)")
+    ap.add_argument("--gpslds-iters", type=int, help="Variational EM iterations (default 50)")
+    ap.add_argument("--gpslds-iters-e", type=int, help="SING E-steps per vEM iteration (default 15)")
+    ap.add_argument("--gpslds-iters-m", type=int, help="Adam M-steps per vEM iteration (default 50)")
+    ap.add_argument("--gpslds-iters-infer", type=int, help="vEM iterations for val/test inference (default 15)")
+    ap.add_argument("--gpslds-lr", type=float, help="M-step Adam learning rate (default 1e-4)")
+    ap.add_argument("--gpslds-tau", type=float, help="Initial partition temperature (default 0.5)")
+    ap.add_argument("--gpslds-inducing-per-axis", type=int, help="Inducing points per latent axis")
+    ap.add_argument("--gpslds-inducing-pad", type=float, help="Inducing grid margin as a fraction of the data range")
+    ap.add_argument("--gpslds-batch-size", type=int, help="Trials per SVI minibatch (default: min(n_trials, 64))")
+    ap.add_argument("--gpslds-infer-chunk", type=int, help="Trials per full-batch val/test inference pass")
     ap.add_argument("--opssm-python", default=sys.executable, help="Python in the separate JAX environment")
     ap.add_argument("--opssm-config", type=Path, help="JSON overrides for OPSSM hyperparameters")
     ap.add_argument("--opssm-experiment", help="Hydra experiment for OPSSM; default: matching duncker_*/kato")

@@ -37,14 +37,16 @@ def _parts(overrides, prefix=""):
             for k, v in sorted(overrides.items())]
 
 
-def point_name(overrides, model_overrides=None):
+def point_name(overrides, model_overrides=None, gpslds_overrides=None):
     """Stable, filesystem-safe directory name for one set of config overrides.
 
     Model overrides are prefixed and folded into the SAME name as the data overrides: a point is a
     configuration, not just a dataset, so two activations must not share a results directory and
-    silently skip each other through the `already complete` check.
+    silently skip each other through the `already complete` check. Each model's knobs carry their
+    own prefix so an OPSSM point and a gpSLDS point never read as the same configuration.
     """
-    parts = _parts(overrides) + _parts(model_overrides or {}, prefix="opssm_")
+    parts = (_parts(overrides) + _parts(model_overrides or {}, prefix="opssm_")
+             + _parts(gpslds_overrides or {}, prefix="gpslds_"))
     return "_".join(parts) if parts else "baseline"
 
 
@@ -64,6 +66,16 @@ def main(cfg):
                        if v is not None}
     if model_overrides and cfg.method != "opssm":
         raise SystemExit(f"opssm.overrides only applies to method=opssm, not {cfg.method!r}")
+    # gpSLDS knobs that differ from their defaults are folded into the point name the same way, so
+    # two gpSLDS configurations never share a results directory and silently skip each other.
+    gpslds_defaults = {"states": None, "sigma": 1.0, "iters": 50, "iters_e": 15, "iters_m": 50,
+                       "iters_infer": 15, "lr": 1e-4, "tau": 0.5,
+                       "inducing_per_axis": None, "inducing_pad": 0.25}
+    gpslds_cfg = OmegaConf.to_container(cfg.get("gpslds"), resolve=True) or {}
+    gpslds_overrides = {k: v for k, v in gpslds_cfg.items()
+                        if v is not None and v != gpslds_defaults.get(k)}
+    if gpslds_overrides and cfg.method != "gpslds":
+        raise SystemExit(f"gpslds.* only applies to method=gpslds, not {cfg.method!r}")
     if "drift_activation" in model_overrides:
         from opssm.models.activations import ACTIVATION_NAMES
         if model_overrides["drift_activation"] not in ACTIVATION_NAMES:
@@ -90,7 +102,7 @@ def main(cfg):
         replace(PRESETS[cfg.dataset], **overrides).validate()
         dataset_dir = cfg.dataset
 
-    point = point_name(overrides, model_overrides)
+    point = point_name(overrides, model_overrides, gpslds_overrides)
     out = Path(cfg.results_root).resolve() / point
     cell = out / dataset_dir / f"seed_{cfg.seed}" / cfg.method
     if (cell / "result.json").exists():
@@ -130,6 +142,10 @@ def main(cfg):
         argv += ["--opssm-experiment", str(cfg.opssm.experiment)]
     if cfg.opssm.config_dir:
         argv += ["--opssm-config-dir", str(cfg.opssm.config_dir)]
+    if cfg.method == "gpslds":
+        for key, value in gpslds_cfg.items():
+            if value is not None:
+                argv += [f"--gpslds-{key.replace('_', '-')}", str(value)]
     if cfg.get("reuse_data", False):
         argv += ["--reuse-data"]
     if cfg.fixed_obs_noise:

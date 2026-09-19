@@ -62,6 +62,11 @@ def fit_jax(name, data, cfg, args, directory, seed):
     from .dynamax_models import DynamaxBaseline
     from .sde_models import SDEBaseline
     from .runner import write_json
+    if name == "gpslds":
+        # Variational EM with its own inference routine; shares the scoring contract below but
+        # none of the minibatch-gradient machinery, so it gets its own module.
+        from .gpslds_model import fit_gpslds
+        return fit_gpslds(name, data, cfg, args, directory, seed)
     # Avoid cancellation in low-noise Kalman updates and matching second derivatives.
     jax.config.update("jax_enable_x64", True)
     y = {s: jnp.asarray(data[f"y_{s}"], dtype=jnp.float64) for s in ("train", "val", "test")}
