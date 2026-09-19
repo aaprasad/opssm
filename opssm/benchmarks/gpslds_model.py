@@ -264,6 +264,7 @@ def fit_gpslds(name, data, cfg, args, directory, seed):
     metrics, arrays = score_benchmark(val, test, ahead, data, cfg, learned, "continuous_drift")
     metrics.update(fit_s=fit_s, eval_s=time.perf_counter() - started, modes=num_states,
                    posterior_type="smoother", backend="jax", precision="float64",
+                   steps=n_iters,   # override runner's --steps: gpSLDS never reads it
                    gpslds_sigma=sigma, gpslds_iters=n_iters, gpslds_n_inducing=int(zs.shape[0]),
                    gpslds_batch_size=batch_size, gpslds_n_train_trials=n_trials,
                    gpslds_epochs=round(n_iters * batch_size / max(n_trials, 1), 2),

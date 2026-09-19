@@ -156,7 +156,10 @@ def main(cfg):
     # Disabling preallocation is what caused the em_lorenz OOM; leave XLA's allocator alone.
     os.environ.pop("XLA_PYTHON_CLIENT_PREALLOCATE", None)
     os.environ.setdefault("JAX_PLATFORMS", "cuda")
-    print(f"[{point}] {dataset_dir} seed={cfg.seed} {cfg.method} steps={steps} -> {cell}", flush=True)
+    # `steps` is the gradient-step budget. gpSLDS fits by variational EM and ignores it entirely,
+    # so announce the budget that actually applies rather than one it never reads.
+    budget = (f"iters={gpslds_cfg.get('iters')}" if cfg.method == "gpslds" else f"steps={steps}")
+    print(f"[{point}] {dataset_dir} seed={cfg.seed} {cfg.method} {budget} -> {cell}", flush=True)
     return run_benchmarks(argv)
 
 
